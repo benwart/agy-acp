@@ -4,14 +4,183 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import stat
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from agy_acp.cli import app
+
+FAKE_AGY_SCRIPT = """#!/usr/bin/env python3
+import json
+import os
+import sys
+import time
+
+args = sys.argv[1:]
+
+if args and args[0] == "models":
+    print("gemini-3.7-pro\\tGemini 3.7 Pro")
+    print("gemini-3.8-flash\\tGemini 3.8 Flash")
+    sys.exit(0)
+
+prompt = ""
+for i, arg in enumerate(args):
+    if arg in ("-p", "--print", "--prompt") and i + 1 < len(args):
+        prompt = args[i + 1]
+
+if prompt == "/usage":
+    print(json.dumps({
+        "conversation_id": "",
+        "status": "SUCCESS",
+        "command": {
+            "name": "usage",
+            "data": {
+                "groups": [
+                    {
+                        "name": "Gemini Models",
+                        "buckets": [
+                            {
+                                "id": "gemini-5h",
+                                "name": "Five Hour Limit Remaining",
+                                "window": "5h",
+                                "remaining_fraction": 0.95,
+                                "reset_time": "2026-10-24T07:52:04Z",
+                            },
+                            {
+                                "id": "gemini-weekly",
+                                "name": "Weekly Limit Remaining",
+                                "window": "weekly",
+                                "remaining_fraction": 0.39,
+                                "reset_time": "2026-10-24T12:34:28Z",
+                            },
+                        ],
+                    },
+                    {
+                        "name": "Claude and GPT models",
+                        "buckets": [
+                            {
+                                "id": "claude-gpt-5h",
+                                "name": "Five Hour Limit Remaining",
+                                "window": "5h",
+                                "remaining_fraction": 0.80,
+                                "reset_time": "2026-10-24T07:52:04Z",
+                            },
+                            {
+                                "id": "claude-gpt-weekly",
+                                "name": "Weekly Limit Remaining",
+                                "window": "weekly",
+                                "remaining_fraction": 0.72,
+                                "reset_time": "2026-10-24T12:34:28Z",
+                            },
+                        ],
+                    },
+                ]
+            },
+        },
+    }))
+    sys.exit(0)
+
+if prompt == "/credits":
+    print(json.dumps({
+        "conversation_id": "",
+        "status": "SUCCESS",
+        "command": {
+            "name": "credits",
+            "data": {
+                "remaining_credits": 1000,
+                "upgrade_uri": "https://one.google.com/ai",
+            },
+        },
+    }))
+    sys.exit(0)
+
+if os.environ.get("TEST_AGY_SLOW") == "1":
+    time.sleep(0.2)
+
+print(
+    json.dumps({"event": "init", "init": {"conversation_id": "conv-integration-001"}}),
+    flush=True,
+)
+print(json.dumps({
+    "event": "step_update",
+    "step_update": {
+        "step_index": 1,
+        "step_type": "planner_response",
+        "status": "RUNNING",
+        "thinking": "Processing prompt via agy subprocess...",
+    },
+}), flush=True)
+
+if "tool" in prompt.lower() or os.environ.get("GOOSE_MODE") == "approve":
+    print(json.dumps({
+        "event": "step_update",
+        "step_update": {
+            "step_index": 2,
+            "step_type": "run_command",
+            "status": "RUNNING",
+            "tool_name": "run_command",
+            "tool_info": {
+                "tool_name": "run_command",
+                "arguments": {"command": prompt},
+            },
+        },
+    }), flush=True)
+    print(json.dumps({
+        "event": "step_update",
+        "step_update": {
+            "step_index": 2,
+            "step_type": "run_command",
+            "status": "DONE",
+            "tool_name": "run_command",
+            "tool_info": {
+                "tool_name": "run_command",
+                "arguments": {"command": prompt},
+                "output": f"Executed: {prompt}",
+            },
+        },
+    }), flush=True)
+
+print(json.dumps({
+    "event": "step_update",
+    "step_update": {
+        "step_index": 3,
+        "step_type": "planner_response",
+        "status": "DONE",
+        "text": f"Processed: {prompt}",
+    },
+}), flush=True)
+print(json.dumps({
+    "event": "result",
+    "result": {
+        "conversation_id": "conv-integration-001",
+        "status": "SUCCESS",
+        "response": f"Processed: {prompt}",
+        "usage": {
+            "input_tokens": 12,
+            "output_tokens": 8,
+            "thinking_tokens": 2,
+            "cache_read_tokens": 0,
+            "total_tokens": 22,
+        },
+    },
+}), flush=True)
+"""
+
+
+@pytest.fixture
+def fake_agy_bin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Create a test-only fake `agy` executable in `tmp_path` and set `AGY_BIN`."""
+    bin_file = tmp_path / "fake-agy"
+    bin_file.write_text(FAKE_AGY_SCRIPT, encoding="utf-8")
+    bin_file.chmod(bin_file.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    monkeypatch.setenv("AGY_BIN", str(bin_file))
+    return bin_file
 
 
 @dataclass
@@ -44,8 +213,6 @@ class AcpBlackBoxHarness:
 
     async def start(self) -> None:
         """Spawn the agy-acp subprocess with stdio pipes."""
-        import os
-
         merged_env = {**os.environ, **self._env}
         self._proc = await asyncio.create_subprocess_exec(
             sys.executable,
@@ -135,6 +302,7 @@ class AcpBlackBoxHarness:
 class HarnessFactory:
     """Factory that tracks spawned black-box ACP harnesses and cleans them up after each test."""
 
+    default_env: dict[str, str] = field(default_factory=dict)
     _instances: list[AcpBlackBoxHarness] = field(default_factory=list)
 
     async def spawn(
@@ -143,7 +311,8 @@ class HarnessFactory:
         env: dict[str, str] | None = None,
     ) -> AcpBlackBoxHarness:
         """Start and return a black-box ACP harness process."""
-        harness = AcpBlackBoxHarness(args=args, env=env)
+        merged_env = {**self.default_env, **(env or {})}
+        harness = AcpBlackBoxHarness(args=args, env=merged_env)
         await harness.start()
         self._instances.append(harness)
         return harness
@@ -155,16 +324,20 @@ class HarnessFactory:
 
 
 @pytest.fixture
-async def acp_harness_factory() -> Any:
+async def acp_harness_factory(fake_agy_bin: Path) -> Any:
     """Provide a black-box ACP harness factory and clean up processes on teardown."""
-    factory = HarnessFactory()
+    factory = HarnessFactory(default_env={"AGY_BIN": str(fake_agy_bin)})
     yield factory
     await factory.cleanup()
 
 
 @pytest.fixture
-def run_cli(capsys: pytest.CaptureFixture[str]) -> Callable[[list[str]], CliResult]:
+def run_cli(
+    capsys: pytest.CaptureFixture[str],
+    fake_agy_bin: Path,
+) -> Callable[[list[str]], CliResult]:
     """Invoke the public agy-acp CLI with arguments and capture exit code + output."""
+    _ = fake_agy_bin
 
     def _invoke(tokens: list[str]) -> CliResult:
         exit_code = int(app(tokens, result_action="return_int_as_exit_code_else_zero"))

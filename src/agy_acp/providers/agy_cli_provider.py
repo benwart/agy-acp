@@ -1,0 +1,768 @@
+"""Async subprocess provider for driving the Antigravity CLI (`agy`) via anyio."""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import os
+import shutil
+import signal
+import tempfile
+import time
+import uuid
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+import anyio
+import anyio.abc
+from anyio.streams.text import TextReceiveStream
+
+MAX_INLINE_PROMPT_BYTES: int = 64 * 1024
+VALID_EFFORTS: frozenset[str] = frozenset({"low", "medium", "high", "xhigh", "max"})
+
+FALLBACK_MODELS: list[dict[str, str]] = [
+    {
+        "modelId": "gemini-3.7-pro",
+        "name": "Gemini 3.7 Pro",
+        "description": "Google Antigravity Pro model",
+    },
+    {
+        "modelId": "gemini-3.8-flash",
+        "name": "Gemini 3.8 Flash",
+        "description": "Google Antigravity Flash model",
+    },
+    {
+        "modelId": "gemini-3.1-pro-high",
+        "name": "Gemini 3.1 Pro (High)",
+        "description": "Gemini 3.1 Pro (High)",
+    },
+    {
+        "modelId": "claude-sonnet-4-6",
+        "name": "Claude Sonnet 4.6",
+        "description": "Claude Sonnet 4.6",
+    },
+]
+
+_MODE_TO_AGY_CLI: dict[str, str] = {
+    "auto": "auto",
+    "approve": "accept-edits",
+    "read-only": "plan",
+    "accept-edits": "accept-edits",
+    "plan": "plan",
+}
+
+
+@dataclass(frozen=True)
+class ToolCallEvent:
+    """Normalized tool call or tool call update emitted during an `agy` turn."""
+
+    tool_call_id: str
+    title: str
+    kind: str
+    status: str
+    raw_input: dict[str, Any] = field(default_factory=dict)
+    output: str = ""
+    locations: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class PromptOutcome:
+    """Result of executing a streaming prompt turn via the `agy` CLI."""
+
+    conversation_id: str
+    stop_reason: str
+    response: str
+    usage: dict[str, int]
+    raw_result: dict[str, Any] = field(default_factory=dict)
+
+
+def _pairs_to_dict(items: Any) -> dict[str, str]:
+    """Convert a list of `{"name": ..., "value": ...}` dicts or a mapping into `dict[str, str]`."""
+    if isinstance(items, dict):
+        return {str(k): str(v) for k, v in items.items()}
+    if not isinstance(items, list):
+        return {}
+    result: dict[str, str] = {}
+    for entry in items:
+        if isinstance(entry, dict) and "name" in entry and "value" in entry:
+            result[str(entry["name"])] = str(entry["value"])
+    return result
+
+
+def translate_mcp_server(raw: dict[str, Any]) -> dict[str, Any]:
+    """Translate an ACP MCP server definition into normalized stdio or HTTP config."""
+    server_type = str(raw.get("type", "stdio")).lower()
+    if server_type == "http" or "url" in raw:
+        return {
+            "type": "http",
+            "name": str(raw.get("name", "")),
+            "url": str(raw.get("url", "")),
+            "headers": _pairs_to_dict(raw.get("headers", [])),
+        }
+    return {
+        "type": "stdio",
+        "name": str(raw.get("name", "")),
+        "command": str(raw.get("command", "")),
+        "args": [str(arg) for arg in raw.get("args", [])],
+        "env": _pairs_to_dict(raw.get("env", [])),
+    }
+
+
+def resolve_agy_binary(explicit_bin: str | Path | None = None) -> str:
+    """Resolve the path to the `agy` CLI executable."""
+    if explicit_bin is not None:
+        explicit_path = Path(explicit_bin)
+        if explicit_path.exists():
+            return str(explicit_path)
+
+    env_bin = os.environ.get("AGY_BIN")
+    if env_bin:
+        env_path = Path(env_bin)
+        if env_path.exists():
+            return str(env_path)
+
+    local_bin = Path.home() / ".local" / "bin" / "agy"
+    if local_bin.exists():
+        return str(local_bin)
+
+    which_bin = shutil.which("agy")
+    if which_bin:
+        return which_bin
+
+    return "agy"
+
+
+def prepare_prompt_arg(
+    prompt: str,
+    *,
+    session_id: str | None = None,
+    temp_dir: Path | None = None,
+) -> tuple[str, Path | None]:
+    """Return `(prompt_arg, temp_file)` offloading prompts > 64 KiB to a 0600 temporary file."""
+    encoded = prompt.encode("utf-8")
+    if len(encoded) <= MAX_INLINE_PROMPT_BYTES:
+        return prompt, None
+
+    target_dir = temp_dir or Path(tempfile.gettempdir())
+    target_dir.mkdir(parents=True, exist_ok=True)
+    tag = (session_id or "default")[:8]
+    filename = f"agy-acp-prompt-{tag}-{int(time.time() * 1000)}.md"
+    file_path = target_dir / filename
+    fd = os.open(file_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, encoded)
+    finally:
+        os.close(fd)
+    file_path.chmod(0o600)
+    instruction = (
+        f"Please read the prompt and context in {file_path} using view_file "
+        "and follow the instructions in it."
+    )
+    return instruction, file_path
+
+
+def build_agy_args(
+    *,
+    cwd: str,
+    prompt_arg: str,
+    conversation_id: str | None = None,
+    model: str | None = None,
+    mode: str = "auto",
+    effort: str | None = None,
+    skip_permissions: bool | None = None,
+    sandbox: bool = False,
+    output_format: str = "stream-json",
+) -> list[str]:
+    """Construct `agy` CLI flags for non-interactive print mode (`-p`)."""
+    args: list[str] = []
+    if cwd:
+        args.extend(["--add-dir", cwd])
+    if conversation_id:
+        args.extend(["--conversation", conversation_id])
+    if model:
+        args.extend(["--model", model])
+
+    cli_mode = _MODE_TO_AGY_CLI.get(mode, "auto")
+    args.extend(["--mode", cli_mode])
+
+    if effort and effort in VALID_EFFORTS:
+        args.extend(["--effort", effort])
+
+    effective_skip = skip_permissions if skip_permissions is not None else (mode == "auto")
+    if effective_skip:
+        args.append("--dangerously-skip-permissions")
+    if sandbox:
+        args.append("--sandbox")
+
+    args.extend(["--print-timeout", "0"])
+    if output_format:
+        args.extend(["--output-format", output_format])
+    args.extend(["-p", prompt_arg])
+    return args
+
+
+def _classify_tool_step(
+    step_type: str,
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> tuple[str, str, list[dict[str, Any]]]:
+    """Map an `agy` step/tool name and arguments to ACP `(kind, title, locations)`."""
+    normalized = (tool_name or step_type).lower()
+    path_val = str(
+        arguments.get("path")
+        or arguments.get("Path")
+        or arguments.get("file_path")
+        or arguments.get("TargetFile")
+        or ""
+    )
+    locations = [{"path": path_val}] if path_val else []
+
+    if any(k in normalized for k in ("view_file", "read_file", "view_code", "read_resource")):
+        title = f"Viewing {path_val}" if path_val else f"Reading ({tool_name or step_type})"
+        return "read", title, locations
+    if any(k in normalized for k in ("code_action", "edit_file", "write_file", "replace")):
+        title = f"Editing {path_val}" if path_val else f"Editing ({tool_name or step_type})"
+        return "edit", title, locations
+    if any(k in normalized for k in ("grep", "find", "list_dir", "search")):
+        query = str(arguments.get("query") or arguments.get("Query") or path_val or "")
+        title = f"Searching {query}" if query else f"Searching ({tool_name or step_type})"
+        return "search", title, locations
+    if any(k in normalized for k in ("run_command", "command", "bash", "exec", "shell")):
+        cmd = str(arguments.get("command") or arguments.get("CommandLine") or "")
+        short_cmd = cmd[:80] if cmd else (tool_name or step_type or "Execute command")
+        title = f"Running `{short_cmd}`" if cmd else "Execute command"
+        return "execute", title, locations
+    return "execute", tool_name or step_type or "Execute command", locations
+
+
+class AgyCliProvider:
+    """Async subprocess driver for the `agy` CLI binary using `anyio`."""
+
+    def __init__(
+        self,
+        *,
+        bin_path: str | Path | None = None,
+        save_dir: Path | None = None,
+        models_cache_file: Path | None = None,
+    ) -> None:
+        self._explicit_bin = bin_path
+        self._save_dir = save_dir
+        self._models_cache_file = models_cache_file or (
+            Path.home() / ".config" / "agy-acp" / "models.json"
+        )
+        self._sessions: dict[str, dict[str, Any]] = {}
+        self._active_processes: dict[str, anyio.abc.Process] = {}
+        self._cancelled_sessions: set[str] = set()
+
+    @property
+    def bin_path(self) -> str:
+        """Resolve the `agy` binary path dynamically."""
+        return resolve_agy_binary(self._explicit_bin)
+
+    async def discover_models(self, *, refresh: bool = False) -> list[dict[str, str]]:
+        """Discover models via `agy models`, caching to `~/.config/agy-acp/models.json`."""
+        if not refresh and self._models_cache_file.is_file():
+            with contextlib.suppress(OSError, ValueError, KeyError):
+                cached = json.loads(self._models_cache_file.read_text(encoding="utf-8"))
+                models_list = cached.get("models") if isinstance(cached, dict) else None
+                if isinstance(models_list, list) and models_list:
+                    return [
+                        {
+                            "modelId": str(m.get("modelId") or m.get("id", "")),
+                            "name": str(m.get("name", "")),
+                            "description": str(m.get("description") or m.get("name", "")),
+                        }
+                        for m in models_list
+                        if isinstance(m, dict) and (m.get("modelId") or m.get("id"))
+                    ]
+
+        try:
+            with anyio.fail_after(15.0):
+                result = await anyio.run_process([self.bin_path, "models"], check=False)
+            if result.returncode == 0:
+                stdout = result.stdout.decode("utf-8", errors="replace")
+                discovered: list[dict[str, str]] = []
+                for raw_line in stdout.splitlines():
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    parts = line.split("\t")
+                    model_id = parts[0].strip()
+                    display_name = parts[1].strip() if len(parts) > 1 else model_id
+                    if model_id:
+                        discovered.append(
+                            {
+                                "modelId": model_id,
+                                "name": display_name,
+                                "description": display_name,
+                            }
+                        )
+                if discovered:
+                    with contextlib.suppress(OSError):
+                        self._models_cache_file.parent.mkdir(parents=True, exist_ok=True)
+                        self._models_cache_file.write_text(
+                            json.dumps(
+                                {
+                                    "models": discovered,
+                                    "updatedAt": datetime.now(UTC).isoformat(),
+                                },
+                                indent=2,
+                            ),
+                            encoding="utf-8",
+                        )
+                    return discovered
+        except TimeoutError, OSError:
+            pass
+
+        return list(FALLBACK_MODELS)
+
+    async def run_slash_command(
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        timeout: float = 30.0,
+    ) -> dict[str, Any]:
+        """Run a non-interactive slash command (`agy -p <cmd> --output-format json`) via anyio."""
+        normalized = command.strip()
+        if not normalized.startswith("/"):
+            normalized = f"/{normalized}"
+
+        args: list[str] = [self.bin_path]
+        if cwd:
+            args.extend(["--add-dir", cwd])
+        args.extend(["--output-format", "json", "-p", normalized])
+
+        with anyio.fail_after(timeout):
+            result = await anyio.run_process(args, check=False)
+
+        stdout = result.stdout.decode("utf-8", errors="replace").strip()
+        stderr = result.stderr.decode("utf-8", errors="replace").strip()
+
+        if stdout:
+            with contextlib.suppress(json.JSONDecodeError):
+                parsed = json.loads(stdout)
+                if isinstance(parsed, dict):
+                    return parsed
+            for line in reversed(stdout.splitlines()):
+                line = line.strip()
+                if not line:
+                    continue
+                with contextlib.suppress(json.JSONDecodeError):
+                    parsed_line = json.loads(line)
+                    if isinstance(parsed_line, dict):
+                        if "result" in parsed_line and isinstance(parsed_line["result"], dict):
+                            return parsed_line["result"]
+                        return parsed_line
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"agy command '{normalized}' exited with code {result.returncode}: "
+                f"{stderr or stdout}"
+            )
+        return {
+            "status": "SUCCESS",
+            "response": stdout,
+            "command": {"name": normalized.lstrip("/")},
+        }
+
+    async def start_or_resume_agent(
+        self,
+        *,
+        session_id: str | None,
+        cwd: str,
+        mcp_servers: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        mode: str = "auto",
+        reasoning_effort: str = "medium",
+        auth_config: dict[str, Any] | None = None,
+    ) -> str:
+        """Initialize or resume a session backed by the `agy` CLI."""
+        await anyio.sleep(0)
+        sid = session_id or str(uuid.uuid4())
+        existing: dict[str, Any] = {}
+        if session_id is not None:
+            if session_id in self._sessions:
+                existing = self._sessions[session_id]
+            elif self._save_dir is not None:
+                persisted_file = self._save_dir / f"{session_id}.json"
+                if persisted_file.is_file():
+                    loaded = json.loads(persisted_file.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        existing = loaded
+
+        translated_mcp = (
+            [translate_mcp_server(srv) for srv in mcp_servers]
+            if mcp_servers is not None
+            else [translate_mcp_server(srv) for srv in existing.get("mcp_servers", [])]
+        )
+        state: dict[str, Any] = {
+            "sessionId": sid,
+            "agyConversationId": existing.get("agyConversationId"),
+            "cwd": cwd,
+            "mcp_servers": translated_mcp,
+            "model": model or str(existing.get("model", "gemini-3.7-pro")),
+            "mode": mode,
+            "reasoning_effort": reasoning_effort,
+            "auth_config": auth_config or dict(existing.get("auth_config", {})),
+        }
+        self._sessions[sid] = state
+        if self._save_dir is not None:
+            self._save_dir.mkdir(parents=True, exist_ok=True)
+            state_file = self._save_dir / f"{sid}.json"
+            state_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        return sid
+
+    async def cancel_session(self, session_id: str) -> bool:
+        """Send SIGINT/terminate to an active `agy` subprocess for `session_id`."""
+        await anyio.sleep(0)
+        self._cancelled_sessions.add(session_id)
+        proc = self._active_processes.get(session_id)
+        if proc is not None and proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError, OSError):
+                proc.send_signal(signal.SIGINT)
+            with contextlib.suppress(ProcessLookupError, OSError):
+                proc.terminate()
+            return True
+        return False
+
+    async def stream_prompt(
+        self,
+        *,
+        cwd: str,
+        prompt: str,
+        session_id: str | None = None,
+        conversation_id: str | None = None,
+        model: str | None = None,
+        mode: str = "auto",
+        effort: str | None = None,
+        skip_permissions: bool | None = None,
+        sandbox: bool = False,
+        env: dict[str, str] | None = None,
+        on_thought: Callable[[str], Awaitable[None]] | None = None,
+        on_text: Callable[[str], Awaitable[None]] | None = None,
+        on_tool_call: Callable[[ToolCallEvent], Awaitable[bool]] | None = None,
+        on_tool_update: Callable[[ToolCallEvent], Awaitable[None]] | None = None,
+    ) -> PromptOutcome:
+        """Spawn `agy --output-format stream-json` via `anyio.open_process` and stream events."""
+        sid = session_id or "default"
+        if sid in self._cancelled_sessions:
+            self._cancelled_sessions.discard(sid)
+            return PromptOutcome(
+                conversation_id=conversation_id or "",
+                stop_reason="cancelled",
+                response="",
+                usage={
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "thinking_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "total_tokens": 0,
+                },
+            )
+
+        prompt_arg, temp_file = prepare_prompt_arg(prompt, session_id=sid)
+        args = build_agy_args(
+            cwd=cwd,
+            prompt_arg=prompt_arg,
+            conversation_id=conversation_id,
+            model=model,
+            mode=mode,
+            effort=effort,
+            skip_permissions=skip_permissions,
+            sandbox=sandbox,
+            output_format="stream-json",
+        )
+        merged_env = {**os.environ, **(env or {})}
+        effective_cwd = cwd if cwd and Path(cwd).is_dir() else None
+
+        resolved_conv_id = conversation_id or ""
+        emitted_thoughts_by_step: dict[int, int] = {}
+        emitted_texts_by_step: dict[int, int] = {}
+        active_tool_calls: dict[int, str] = {}
+        rejected_tool_steps: set[int] = set()
+        streamed_any_text = False
+        collected_texts: list[str] = []
+        plain_stdout_lines: list[str] = []
+        stderr_chunks: list[str] = []
+        final_result_obj: dict[str, Any] = {}
+        usage: dict[str, int] = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "thinking_tokens": 0,
+            "cache_read_tokens": 0,
+            "total_tokens": 0,
+        }
+
+        async def _handle_step_update(step: dict[str, Any]) -> None:
+            nonlocal streamed_any_text
+            step_idx = int(step.get("step_index", step.get("idx", 0)))
+            step_type = str(step.get("step_type", step.get("type_name", "")))
+            status_raw = str(step.get("status", step.get("state", "RUNNING"))).upper()
+
+            thinking_delta = step.get("thinking_delta")
+            thinking_full = step.get("thinking")
+            if isinstance(thinking_delta, str) and thinking_delta:
+                if on_thought is not None:
+                    await on_thought(thinking_delta)
+            elif isinstance(thinking_full, str) and thinking_full:
+                prev_len = emitted_thoughts_by_step.get(step_idx, 0)
+                if len(thinking_full) > prev_len:
+                    delta = thinking_full[prev_len:]
+                    emitted_thoughts_by_step[step_idx] = len(thinking_full)
+                    if on_thought is not None:
+                        await on_thought(delta)
+
+            tool_info = step.get("tool_info")
+            tool_name = str(
+                step.get("tool_name")
+                or (tool_info.get("tool_name") if isinstance(tool_info, dict) else "")
+                or (tool_info.get("name") if isinstance(tool_info, dict) else "")
+                or ""
+            )
+            is_tool_step = bool(
+                tool_name
+                or isinstance(tool_info, dict)
+                or (
+                    step_type
+                    and step_type.lower()
+                    not in {
+                        "planner_response",
+                        "user_input",
+                        "thinking",
+                        "text",
+                        "checkpoint",
+                        "ephemeral_message",
+                    }
+                )
+            )
+
+            if is_tool_step:
+                raw_args: dict[str, Any] = {}
+                if isinstance(tool_info, dict):
+                    params = tool_info.get("arguments") or tool_info.get("parameters")
+                    if isinstance(params, dict):
+                        raw_args = params
+                elif isinstance(step.get("arguments"), dict):
+                    raw_args = dict(step["arguments"])
+
+                kind, title, locations = _classify_tool_step(step_type, tool_name, raw_args)
+                is_done = any(
+                    tok in status_raw for tok in ("DONE", "COMPLETED", "SUCCESS", "ERROR", "FAILED")
+                )
+                is_failed = any(tok in status_raw for tok in ("ERROR", "FAILED", "CANCELED")) or (
+                    isinstance(tool_info, dict) and bool(tool_info.get("call_error"))
+                )
+
+                if step_idx not in active_tool_calls:
+                    tc_id = f"tc_{uuid.uuid4().hex[:12]}"
+                    active_tool_calls[step_idx] = tc_id
+                    start_event = ToolCallEvent(
+                        tool_call_id=tc_id,
+                        title=title,
+                        kind=kind,
+                        status="in_progress",
+                        raw_input=raw_args or {"command": prompt},
+                        locations=locations,
+                    )
+                    allowed = True
+                    if on_tool_call is not None:
+                        allowed = await on_tool_call(start_event)
+                    if not allowed:
+                        rejected_tool_steps.add(step_idx)
+                        if on_tool_update is not None:
+                            await on_tool_update(
+                                ToolCallEvent(
+                                    tool_call_id=tc_id,
+                                    title=title,
+                                    kind=kind,
+                                    status="failed",
+                                    raw_input=raw_args,
+                                    output="Tool execution rejected by user.",
+                                    locations=locations,
+                                )
+                            )
+                        return
+
+                if is_done and step_idx not in rejected_tool_steps:
+                    tc_id = active_tool_calls[step_idx]
+                    tool_output = ""
+                    if isinstance(tool_info, dict):
+                        tool_output = str(
+                            tool_info.get("output")
+                            or tool_info.get("call_error")
+                            or step.get("output", "")
+                        )
+                    else:
+                        tool_output = str(step.get("output", ""))
+                    if on_tool_update is not None:
+                        await on_tool_update(
+                            ToolCallEvent(
+                                tool_call_id=tc_id,
+                                title=title,
+                                kind=kind,
+                                status="failed" if is_failed else "completed",
+                                raw_input=raw_args,
+                                output=tool_output,
+                                locations=locations,
+                            )
+                        )
+
+            text_delta = step.get("text_delta")
+            text_full = step.get("text") or step.get("response") or step.get("content")
+            if isinstance(text_delta, str) and text_delta:
+                streamed_any_text = True
+                collected_texts.append(text_delta)
+                if on_text is not None:
+                    await on_text(text_delta)
+            elif isinstance(text_full, str) and text_full and not is_tool_step:
+                prev_len = emitted_texts_by_step.get(step_idx, 0)
+                if len(text_full) > prev_len:
+                    delta = text_full[prev_len:]
+                    emitted_texts_by_step[step_idx] = len(text_full)
+                    streamed_any_text = True
+                    collected_texts.append(delta)
+                    if on_text is not None:
+                        await on_text(delta)
+
+        async def _consume_stdout(proc: anyio.abc.Process) -> None:
+            nonlocal resolved_conv_id, final_result_obj, streamed_any_text
+            if proc.stdout is None:
+                return
+            buffer = ""
+            async for chunk in TextReceiveStream(proc.stdout):
+                buffer += chunk
+                while "\n" in buffer:
+                    raw_line, buffer = buffer.split("\n", 1)
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    try:
+                        payload = json.loads(line)
+                    except json.JSONDecodeError:
+                        plain_stdout_lines.append(line)
+                        continue
+                    if not isinstance(payload, dict):
+                        continue
+
+                    event_type = str(payload.get("event", ""))
+                    if event_type == "init" or "init" in payload:
+                        init_obj = payload.get("init")
+                        if isinstance(init_obj, dict) and init_obj.get("conversation_id"):
+                            resolved_conv_id = str(init_obj["conversation_id"])
+                        elif payload.get("conversation_id"):
+                            resolved_conv_id = str(payload["conversation_id"])
+                    elif event_type == "step_update" or "step_update" in payload:
+                        step_obj = payload.get("step_update")
+                        await _handle_step_update(
+                            step_obj if isinstance(step_obj, dict) else payload
+                        )
+                    elif event_type == "result" or "result" in payload or "status" in payload:
+                        res_obj = payload.get("result")
+                        final_result_obj = res_obj if isinstance(res_obj, dict) else payload
+                        if final_result_obj.get("conversation_id"):
+                            resolved_conv_id = str(final_result_obj["conversation_id"])
+                        raw_usage = final_result_obj.get("usage")
+                        if isinstance(raw_usage, dict):
+                            usage["input_tokens"] = int(raw_usage.get("input_tokens", 0))
+                            usage["output_tokens"] = int(raw_usage.get("output_tokens", 0))
+                            usage["thinking_tokens"] = int(raw_usage.get("thinking_tokens", 0))
+                            usage["cache_read_tokens"] = int(raw_usage.get("cache_read_tokens", 0))
+                            usage["total_tokens"] = int(
+                                raw_usage.get(
+                                    "total_tokens",
+                                    usage["input_tokens"]
+                                    + usage["output_tokens"]
+                                    + usage["thinking_tokens"]
+                                    + usage["cache_read_tokens"],
+                                )
+                            )
+                        resp_text = final_result_obj.get("response")
+                        if isinstance(resp_text, str) and resp_text and not streamed_any_text:
+                            streamed_any_text = True
+                            collected_texts.append(resp_text)
+                            if on_text is not None:
+                                await on_text(resp_text)
+
+            trailing = buffer.strip()
+            if trailing:
+                with contextlib.suppress(json.JSONDecodeError):
+                    payload = json.loads(trailing)
+                    if isinstance(payload, dict):
+                        res_obj = payload.get("result")
+                        final_result_obj = res_obj if isinstance(res_obj, dict) else payload
+
+        async def _consume_stderr(proc: anyio.abc.Process) -> None:
+            if proc.stderr is None:
+                return
+            async for chunk in TextReceiveStream(proc.stderr):
+                stderr_chunks.append(chunk)
+
+        proc: anyio.abc.Process | None = None
+        try:
+            proc = await anyio.open_process(
+                [self.bin_path, *args],
+                cwd=effective_cwd,
+                env=merged_env,
+            )
+            self._active_processes[sid] = proc
+            async with proc:
+                async with anyio.create_task_group() as tg:
+                    tg.start_soon(_consume_stdout, proc)
+                    tg.start_soon(_consume_stderr, proc)
+                await proc.wait()
+        except anyio.get_cancelled_exc_class():
+            if proc is not None and proc.returncode is None:
+                with contextlib.suppress(ProcessLookupError, OSError):
+                    proc.send_signal(signal.SIGINT)
+                with contextlib.suppress(ProcessLookupError, OSError):
+                    proc.terminate()
+            raise
+        finally:
+            self._active_processes.pop(sid, None)
+            if temp_file is not None:
+                with contextlib.suppress(OSError):
+                    temp_file.unlink(missing_ok=True)
+
+        was_cancelled = sid in self._cancelled_sessions or (
+            str(final_result_obj.get("status", "")).upper() in {"CANCELLED", "CANCELED"}
+        )
+        self._cancelled_sessions.discard(sid)
+        if was_cancelled:
+            return PromptOutcome(
+                conversation_id=resolved_conv_id,
+                stop_reason="cancelled",
+                response="".join(collected_texts),
+                usage=usage,
+                raw_result=final_result_obj,
+            )
+
+        if not streamed_any_text and plain_stdout_lines:
+            fallback_text = "\n".join(plain_stdout_lines)
+            collected_texts.append(fallback_text)
+            if on_text is not None:
+                await on_text(fallback_text)
+
+        full_response = "".join(collected_texts)
+        if usage["input_tokens"] == 0 and prompt:
+            usage["input_tokens"] = max(1, len(prompt.split()))
+        if usage["output_tokens"] == 0 and full_response:
+            usage["output_tokens"] = max(1, len(full_response.split()))
+        if usage["total_tokens"] == 0:
+            usage["total_tokens"] = (
+                usage["input_tokens"]
+                + usage["output_tokens"]
+                + usage["thinking_tokens"]
+                + usage["cache_read_tokens"]
+            )
+
+        return PromptOutcome(
+            conversation_id=resolved_conv_id,
+            stop_reason="end_turn",
+            response=full_response,
+            usage=usage,
+            raw_result=final_result_obj,
+        )

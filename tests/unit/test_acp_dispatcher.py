@@ -3,16 +3,145 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import pytest
 
 from agy_acp.logic.acp_dispatcher import AcpDispatcher
+from agy_acp.logic.quota_tracker import QuotaTracker
+from agy_acp.logic.session_manager import SessionManager
+from agy_acp.providers.agy_cli_provider import AgyCliProvider, PromptOutcome, ToolCallEvent
+from agy_acp.providers.quota_provider import QuotaProvider
+
+
+class _StubAgyCliProvider(AgyCliProvider):
+    """Test double for AgyCliProvider used exclusively in unit tests."""
+
+    async def run_slash_command(
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        timeout: float = 30.0,
+    ) -> dict[str, Any]:
+        _ = (cwd, timeout)
+        if command.lstrip("/") == "usage":
+            return {
+                "conversation_id": "",
+                "status": "SUCCESS",
+                "command": {
+                    "name": "usage",
+                    "data": {
+                        "groups": [
+                            {
+                                "name": "Gemini Models",
+                                "buckets": [
+                                    {
+                                        "id": "gemini-5h",
+                                        "name": "Five Hour Limit Remaining",
+                                        "window": "5h",
+                                        "remaining_fraction": 0.95,
+                                        "reset_time": "2026-10-24T07:52:04Z",
+                                    },
+                                    {
+                                        "id": "gemini-weekly",
+                                        "name": "Weekly Limit Remaining",
+                                        "window": "weekly",
+                                        "remaining_fraction": 0.39,
+                                        "reset_time": "2026-10-24T12:34:28Z",
+                                    },
+                                ],
+                            }
+                        ]
+                    },
+                },
+            }
+        return {
+            "conversation_id": "",
+            "status": "SUCCESS",
+            "command": {
+                "name": "credits",
+                "data": {"remaining_credits": 1000, "upgrade_uri": "https://one.google.com/ai"},
+            },
+        }
+
+    async def stream_prompt(
+        self,
+        *,
+        cwd: str,
+        prompt: str,
+        session_id: str | None = None,
+        conversation_id: str | None = None,
+        model: str | None = None,
+        mode: str = "auto",
+        effort: str | None = None,
+        skip_permissions: bool | None = None,
+        sandbox: bool = False,
+        env: dict[str, str] | None = None,
+        on_thought: Callable[[str], Awaitable[None]] | None = None,
+        on_text: Callable[[str], Awaitable[None]] | None = None,
+        on_tool_call: Callable[[ToolCallEvent], Awaitable[bool]] | None = None,
+        on_tool_update: Callable[[ToolCallEvent], Awaitable[None]] | None = None,
+    ) -> PromptOutcome:
+        _ = (cwd, session_id, model, mode, effort, skip_permissions, sandbox, env)
+        if on_thought is not None:
+            await on_thought("Analyzing prompt...")
+        if "tool" in prompt.lower():
+            tc_event = ToolCallEvent(
+                tool_call_id="tc_unit_001",
+                title="Execute command",
+                kind="execute",
+                status="in_progress",
+                raw_input={"command": prompt},
+            )
+            allowed = True
+            if on_tool_call is not None:
+                allowed = await on_tool_call(tc_event)
+            if on_tool_update is not None:
+                await on_tool_update(
+                    ToolCallEvent(
+                        tool_call_id="tc_unit_001",
+                        title="Execute command",
+                        kind="execute",
+                        status="completed" if allowed else "failed",
+                        raw_input={"command": prompt},
+                        output="Executed: " + prompt if allowed else "Rejected",
+                    )
+                )
+        if on_text is not None:
+            await on_text(f"Response: {prompt}")
+        return PromptOutcome(
+            conversation_id=conversation_id or "conv-unit-1",
+            stop_reason="end_turn",
+            response=f"Response: {prompt}",
+            usage={
+                "input_tokens": 5,
+                "output_tokens": 3,
+                "thinking_tokens": 1,
+                "cache_read_tokens": 0,
+                "total_tokens": 9,
+            },
+        )
+
+
+def _make_dispatcher(
+    *,
+    notification_sink: Any = None,
+    client_rpc_caller: Any = None,
+) -> AcpDispatcher:
+    cli = _StubAgyCliProvider()
+    return AcpDispatcher(
+        notification_sink=notification_sink,
+        client_rpc_caller=client_rpc_caller,
+        session_manager=SessionManager(cli_provider=cli),
+        quota_tracker=QuotaTracker(provider=QuotaProvider(cli_provider=cli)),
+    )
 
 
 def test_jsonrpc_frame_serialization() -> None:
     """Verify AcpDispatcher serializes newline-delimited UTF-8 JSON-RPC frames."""
-    dispatcher = AcpDispatcher()
+    dispatcher = _make_dispatcher()
     raw = dispatcher.serialize_frame({"jsonrpc": "2.0", "id": 1, "result": {}})
     assert raw.endswith(b"\n")
     assert json.loads(raw.decode("utf-8"))["id"] == 1
@@ -24,7 +153,7 @@ def test_jsonrpc_frame_serialization() -> None:
 
 async def test_handle_initialize_capabilities() -> None:
     """Verify AcpDispatcher.handle_message responds to initialize with required capabilities."""
-    dispatcher = AcpDispatcher()
+    dispatcher = _make_dispatcher()
     resp = await dispatcher.handle_message(
         json.dumps(
             {
@@ -46,7 +175,7 @@ async def test_prompt_streams_chunks_and_usage() -> None:
     async def _sink(msg: dict[str, Any]) -> None:
         emitted.append(msg)
 
-    dispatcher = AcpDispatcher(notification_sink=_sink)
+    dispatcher = _make_dispatcher(notification_sink=_sink)
     resp = await dispatcher.handle_message(
         json.dumps(
             {
@@ -110,7 +239,7 @@ async def test_tool_permission_request_allow_and_reject() -> None:
         rpc_calls.append((method, dict(params)))
         return {"outcome": {"outcome": "selected", "optionId": selected_option}}
 
-    dispatcher = AcpDispatcher(notification_sink=_sink, client_rpc_caller=_caller)
+    dispatcher = _make_dispatcher(notification_sink=_sink, client_rpc_caller=_caller)
     resp = await dispatcher.handle_message(
         json.dumps(
             {

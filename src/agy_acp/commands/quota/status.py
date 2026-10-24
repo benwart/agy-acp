@@ -15,7 +15,7 @@ async def default(
 ) -> int:
     """Display unified 5-hour quota, 7-day quota, G1 credit balance, and token usage."""
     await anyio.sleep(0)
-    data = QuotaTracker().get_unified_status(group=group)
+    data = await QuotaTracker().get_unified_status(group=group)
     if format == "json":
         print(json.dumps(data))
     else:

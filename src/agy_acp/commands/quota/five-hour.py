@@ -16,7 +16,7 @@ async def default(
     """Display 5-hour rolling quota remaining percentage, usage, and reset time."""
     await anyio.sleep(0)
     tracker = QuotaTracker()
-    data = tracker.get_five_hour_quota(group=group)
+    data = await tracker.get_five_hour_quota(group=group)
     if format == "json":
         print(json.dumps(data))
     else:

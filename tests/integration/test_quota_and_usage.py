@@ -64,7 +64,7 @@ async def test_req_quota_004_kirocrew_wire_usage_and_slash_commands(
     """Verify REQ-QUOTA-004: ACP wire emits usage_update, metadata, and /quota slash command."""
     harness = await acp_harness_factory.spawn(
         ["acp", "serve"],
-        env={"AGY_ACP_FAKE_SDK": "1", "GEMINI_API_KEY": "test-key"},
+        env={"GEMINI_API_KEY": "test-key"},
     )
     await harness.send_request("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
     new_resp = await harness.send_request("session/new", {"cwd": str(tmp_path), "mcpServers": []})

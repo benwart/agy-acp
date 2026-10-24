@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -14,6 +13,7 @@ from agy_acp import __version__
 from agy_acp.logic.auth_manager import AuthManager
 from agy_acp.logic.quota_tracker import QuotaTracker
 from agy_acp.logic.session_manager import DEFAULT_MODEL_ID, SessionManager
+from agy_acp.providers.agy_cli_provider import ToolCallEvent
 
 MAX_FRAME_SIZE_BYTES = 16 * 1024 * 1024
 SLASH_QUOTA_COMMANDS = frozenset({"/quota", "/usage", "/credits"})
@@ -75,98 +75,6 @@ class AcpDispatcher:
         except KeyError:
             return "approve" if os.environ.get("GOOSE_MODE") == "approve" else "auto"
 
-    def _should_execute_tool(self, session_id: str, prompt_text: str) -> bool:
-        """Return True when the prompt or session approval mode triggers a tool execution."""
-        if "tool" in prompt_text.lower():
-            return True
-        if os.environ.get("GOOSE_MODE") == "approve":
-            return True
-        return self._resolve_session_mode(session_id) == "approve"
-
-    async def _execute_tool_with_permission(
-        self,
-        *,
-        session_id: str,
-        prompt_text: str,
-    ) -> None:
-        """Emit `tool_call`, gate via `session/request_permission`, and emit `tool_call_update`."""
-        tool_call_id = f"tc_{uuid.uuid4().hex[:12]}"
-        tool_descriptor: dict[str, Any] = {
-            "toolCallId": tool_call_id,
-            "title": "Execute command",
-            "kind": "execute",
-            "status": "in_progress",
-            "rawInput": {"command": prompt_text},
-        }
-        await self._emit_notification(
-            {
-                "jsonrpc": "2.0",
-                "method": "session/update",
-                "params": {
-                    "sessionId": session_id,
-                    "update": {
-                        "sessionUpdate": "tool_call",
-                        **tool_descriptor,
-                    },
-                },
-            }
-        )
-
-        allowed = True
-        if self._client_rpc_caller is not None:
-            perm_response = await self._client_rpc_caller(
-                "session/request_permission",
-                {
-                    "sessionId": session_id,
-                    "toolCall": tool_descriptor,
-                    "options": [
-                        {
-                            "optionId": "allow_once",
-                            "name": "Allow once",
-                            "kind": "allow_once",
-                        },
-                        {
-                            "optionId": "allow_always",
-                            "name": "Always allow",
-                            "kind": "allow_always",
-                        },
-                        {
-                            "optionId": "reject_once",
-                            "name": "Reject",
-                            "kind": "reject_once",
-                        },
-                    ],
-                },
-            )
-            outcome = perm_response.get("outcome") if isinstance(perm_response, dict) else None
-            selected_option = outcome.get("optionId") if isinstance(outcome, dict) else None
-            allowed = selected_option in {"allow_once", "allow_always"}
-
-        tool_status = "completed" if allowed else "failed"
-        output_text = f"Executed: {prompt_text}" if allowed else "Tool execution rejected by user."
-        await self._emit_notification(
-            {
-                "jsonrpc": "2.0",
-                "method": "session/update",
-                "params": {
-                    "sessionId": session_id,
-                    "update": {
-                        "sessionUpdate": "tool_call_update",
-                        "toolCallId": tool_call_id,
-                        "status": tool_status,
-                        "kind": "execute",
-                        "content": [
-                            {
-                                "type": "content",
-                                "content": {"type": "text", "text": output_text},
-                            }
-                        ],
-                        "rawOutput": {"output": output_text, "allowed": allowed},
-                    },
-                },
-            }
-        )
-
     @staticmethod
     def _extract_prompt_text(prompt_blocks: list[dict[str, Any]]) -> str:
         """Extract concatenated text from ACP prompt content blocks."""
@@ -199,7 +107,7 @@ class AcpDispatcher:
         message_id: Any,
         params: dict[str, Any],
     ) -> dict[str, Any]:
-        """Handle `session/prompt`, streaming thought/message chunks and quota updates."""
+        """Handle `session/prompt`, streaming thought/message/tool chunks from `agy` CLI."""
         if self._auth_manager is not None and not self._auth_manager.status().authenticated:
             return {
                 "jsonrpc": "2.0",
@@ -218,31 +126,12 @@ class AcpDispatcher:
         prompt_blocks: list[dict[str, Any]] = (
             [b for b in raw_prompt if isinstance(b, dict)] if isinstance(raw_prompt, list) else []
         )
-
-        stop_reason = "end_turn"
-        try:
-            turn_result = await self._session_manager.prompt(
-                session_id=session_id,
-                prompt_blocks=prompt_blocks,
-            )
-            if isinstance(turn_result, dict) and turn_result.get("stopReason"):
-                stop_reason = str(turn_result["stopReason"])
-        except KeyError:
-            pass
-
-        if stop_reason == "cancelled" or self._session_manager.consume_cancellation(session_id):
-            return self._cancelled_prompt_response(message_id)
-
         prompt_text = self._extract_prompt_text(prompt_blocks)
         slash_cmd = prompt_text.splitlines()[-1].strip().lower() if prompt_text else ""
-        if slash_cmd in SLASH_QUOTA_COMMANDS:
-            thought_text = f"Formatting quota report for {slash_cmd}"
-            response_text = self._quota_tracker.format_slash_command_response(slash_cmd)
-        else:
-            thought_text = "Processing prompt..."
-            response_text = f"Processed: {prompt_text}" if prompt_text else "Ready."
 
-        with self._session_manager.turn_cancel_scope(session_id) as scope:
+        if slash_cmd in SLASH_QUOTA_COMMANDS:
+            thought_text = f"Querying quota report for {slash_cmd}..."
+            response_text = await self._quota_tracker.format_slash_command_response(slash_cmd)
             await self._emit_notification(
                 {
                     "jsonrpc": "2.0",
@@ -256,13 +145,6 @@ class AcpDispatcher:
                     },
                 }
             )
-            if slash_cmd not in SLASH_QUOTA_COMMANDS and self._should_execute_tool(
-                session_id, prompt_text
-            ):
-                await self._execute_tool_with_permission(
-                    session_id=session_id,
-                    prompt_text=prompt_text,
-                )
             await self._emit_notification(
                 {
                     "jsonrpc": "2.0",
@@ -276,19 +158,169 @@ class AcpDispatcher:
                     },
                 }
             )
+            input_tokens = max(1, len(prompt_text.split()))
+            output_tokens = max(1, len(response_text.split()))
+            model_id = self._resolve_session_model(session_id)
+            for wire_update in await self._quota_tracker.build_kirocrew_wire_updates(
+                session_id=session_id,
+                model_id=model_id,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cached_read_tokens=0,
+            ):
+                await self._emit_notification(wire_update)
+            return {
+                "jsonrpc": "2.0",
+                "id": message_id,
+                "result": {
+                    "stopReason": "end_turn",
+                    "usage": {
+                        "inputTokens": input_tokens,
+                        "outputTokens": output_tokens,
+                        "cachedReadTokens": 0,
+                        "cachedWriteTokens": 0,
+                    },
+                },
+            }
 
-        if scope.cancel_called or self._session_manager.consume_cancellation(session_id):
+        async def _on_thought(chunk: str) -> None:
+            await self._emit_notification(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_thought_chunk",
+                            "content": {"type": "text", "text": chunk},
+                        },
+                    },
+                }
+            )
+
+        async def _on_text(chunk: str) -> None:
+            await self._emit_notification(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": chunk},
+                        },
+                    },
+                }
+            )
+
+        async def _on_tool_call(event: ToolCallEvent) -> bool:
+            tool_descriptor: dict[str, Any] = {
+                "toolCallId": event.tool_call_id,
+                "title": event.title,
+                "kind": event.kind,
+                "status": "in_progress",
+                "rawInput": event.raw_input,
+            }
+            if event.locations:
+                tool_descriptor["locations"] = event.locations
+
+            await self._emit_notification(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "tool_call",
+                            **tool_descriptor,
+                        },
+                    },
+                }
+            )
+            if self._client_rpc_caller is None:
+                return True
+
+            perm_response = await self._client_rpc_caller(
+                "session/request_permission",
+                {
+                    "sessionId": session_id,
+                    "toolCall": tool_descriptor,
+                    "options": [
+                        {
+                            "optionId": "allow_once",
+                            "name": "Allow once",
+                            "kind": "allow_once",
+                        },
+                        {
+                            "optionId": "allow_always",
+                            "name": "Always allow",
+                            "kind": "allow_always",
+                        },
+                        {
+                            "optionId": "reject_once",
+                            "name": "Reject",
+                            "kind": "reject_once",
+                        },
+                    ],
+                },
+            )
+            outcome = perm_response.get("outcome") if isinstance(perm_response, dict) else None
+            selected_option = outcome.get("optionId") if isinstance(outcome, dict) else None
+            return selected_option in {"allow_once", "allow_always"}
+
+        async def _on_tool_update(event: ToolCallEvent) -> None:
+            allowed = event.status != "failed"
+            await self._emit_notification(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "tool_call_update",
+                            "toolCallId": event.tool_call_id,
+                            "status": event.status,
+                            "kind": event.kind,
+                            "content": [
+                                {
+                                    "type": "content",
+                                    "content": {"type": "text", "text": event.output},
+                                }
+                            ],
+                            "rawOutput": {"output": event.output, "allowed": allowed},
+                        },
+                    },
+                }
+            )
+
+        turn_result = await self._session_manager.prompt(
+            session_id=session_id,
+            prompt_blocks=prompt_blocks,
+            on_thought=_on_thought,
+            on_text=_on_text,
+            on_tool_call=_on_tool_call,
+            on_tool_update=_on_tool_update,
+        )
+
+        stop_reason = str(turn_result.get("stopReason", "end_turn"))
+        if stop_reason == "cancelled" or self._session_manager.consume_cancellation(session_id):
             return self._cancelled_prompt_response(message_id)
 
-        input_tokens = max(1, len(prompt_text.split())) if prompt_text else 1
-        output_tokens = max(1, len(response_text.split()))
+        raw_usage = turn_result.get("usage")
+        usage_dict = raw_usage if isinstance(raw_usage, dict) else {}
+        input_tokens = max(1, int(usage_dict.get("input_tokens", 0)))
+        output_tokens = max(1, int(usage_dict.get("output_tokens", 0)))
+        cached_read_tokens = int(usage_dict.get("cache_read_tokens", 0))
+        thinking_tokens = int(usage_dict.get("thinking_tokens", 0))
+
         model_id = self._resolve_session_model(session_id)
-        for wire_update in self._quota_tracker.build_kirocrew_wire_updates(
+        for wire_update in await self._quota_tracker.build_kirocrew_wire_updates(
             session_id=session_id,
             model_id=model_id,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            cached_read_tokens=0,
+            cached_read_tokens=cached_read_tokens,
+            thinking_tokens=thinking_tokens,
         ):
             await self._emit_notification(wire_update)
 
@@ -300,7 +332,7 @@ class AcpDispatcher:
                 "usage": {
                     "inputTokens": input_tokens,
                     "outputTokens": output_tokens,
-                    "cachedReadTokens": 0,
+                    "cachedReadTokens": cached_read_tokens,
                     "cachedWriteTokens": 0,
                 },
             },

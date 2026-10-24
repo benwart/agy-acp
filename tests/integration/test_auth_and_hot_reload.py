@@ -76,7 +76,6 @@ async def test_req_auth_004_running_acp_server_hot_reloads_auth_without_restart(
 
     harness = await acp_harness_factory.spawn(
         ["acp", "serve", "--auth-file", str(auth_file), "--save-dir", str(save_dir)],
-        env={"AGY_ACP_FAKE_SDK": "1"},
     )
     await harness.send_request("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
     new_resp = await harness.send_request("session/new", {"cwd": str(tmp_path), "mcpServers": []})
@@ -115,13 +114,35 @@ def test_cli_auth_login_oauth_browser_flow(
     monkeypatch: object,
 ) -> None:
     """Verify `agy-acp auth login --oauth` (and default no-flag login) runs browser OAuth flow."""
+    import anyio
     import pytest
+
+    from agy_acp.providers.oauth_provider import OAuthBrowserFlowProvider, OAuthTokenResult
 
     mp = monkeypatch
     assert isinstance(mp, pytest.MonkeyPatch)
     auth_file = tmp_path / "credentials.json"
-    mp.setenv("AGY_ACP_FAKE_OAUTH", "1")
-    mp.setenv("AGY_ACP_FAKE_OAUTH_EMAIL", "browser-user@example.com")
+    current_email = "browser-user@example.com"
+
+    async def _mock_authenticate(
+        self: OAuthBrowserFlowProvider,
+        *,
+        open_browser: bool = True,
+        timeout_seconds: float = 180.0,
+        on_auth_url: object = None,
+    ) -> OAuthTokenResult:
+        _ = (self, open_browser, timeout_seconds, on_auth_url)
+        await anyio.sleep(0)
+        return OAuthTokenResult(
+            access_token="mock-oauth-access-token",
+            refresh_token="mock-oauth-refresh-token",
+            id_token=None,
+            token_type="Bearer",
+            expiry="2026-10-25T00:00:00+00:00",
+            identity=current_email,
+        )
+
+    mp.setattr(OAuthBrowserFlowProvider, "authenticate", _mock_authenticate)
     res = run_cli(
         ["auth", "login", "--oauth", "--auth-file", str(auth_file), "--format", "json"],
     )
@@ -131,8 +152,7 @@ def test_cli_auth_login_oauth_browser_flow(
     assert payload["method"] == "oauth"
     assert payload["identity"] == "browser-user@example.com"
 
-    # Also verify running `agy-acp auth login` with no flags defaults to browser OAuth login
-    mp.setenv("AGY_ACP_FAKE_OAUTH_EMAIL", "default-oauth@example.com")
+    current_email = "default-oauth@example.com"
     res_default = run_cli(
         ["auth", "login", "--auth-file", str(auth_file), "--format", "json"],
     )

@@ -180,18 +180,6 @@ class OAuthBrowserFlowProvider:
         on_auth_url: Callable[[str], None] | None = None,
     ) -> OAuthTokenResult:
         """Run loopback HTTP callback listener, open browser, and exchange code for tokens."""
-        if os.environ.get("AGY_ACP_FAKE_OAUTH"):
-            await anyio.sleep(0)
-            fake_identity = os.environ.get("AGY_ACP_FAKE_OAUTH_EMAIL", "antigravity-oauth")
-            return OAuthTokenResult(
-                access_token="fake-oauth-access-token",
-                refresh_token="fake-oauth-refresh-token",
-                id_token=None,
-                token_type="Bearer",
-                expiry=(datetime.now(UTC) + timedelta(hours=1)).isoformat(),
-                identity=fake_identity,
-            )
-
         if not self._client_id:
             raise ValueError(
                 "OAuth client_id is required. Set AGY_ACP_OAUTH_CLIENT_ID or pass client_id."

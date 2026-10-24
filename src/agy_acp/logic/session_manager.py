@@ -2,17 +2,24 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import copy
 import json
 import os
-from collections.abc import Generator
+import tempfile
+import uuid
+from collections.abc import Awaitable, Callable, Generator
 from pathlib import Path
 from typing import Any
 
 import anyio
 
-from agy_acp.providers.antigravity_sdk import AntigravitySdkProvider
+from agy_acp.providers.agy_cli_provider import (
+    FALLBACK_MODELS,
+    AgyCliProvider,
+    ToolCallEvent,
+)
 
 DEFAULT_MODEL_ID = "gemini-3.7-pro"
 DEFAULT_REASONING_EFFORT = "medium"
@@ -27,18 +34,16 @@ REASONING_EFFORT_CONFIG_IDS: frozenset[str] = frozenset(
     {"reasoning_effort", "thought_level", "thinkingLevel"}
 )
 
-AVAILABLE_MODELS: list[dict[str, str]] = [
-    {
-        "modelId": "gemini-3.7-pro",
-        "name": "Gemini 3.7 Pro",
-        "description": "Google Antigravity Pro model",
-    },
-    {
-        "modelId": "gemini-3.8-flash",
-        "name": "Gemini 3.8 Flash",
-        "description": "Google Antigravity Flash model",
-    },
-]
+AVAILABLE_MODELS: list[dict[str, str]] = list(FALLBACK_MODELS)
+
+_MIME_TO_EXT: dict[str, str] = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/gif": "gif",
+    "image/webp": "webp",
+    "image/svg+xml": "svg",
+}
 
 
 def _write_dsh_gate_marker_if_configured() -> None:
@@ -57,8 +62,64 @@ def _write_dsh_gate_marker_if_configured() -> None:
     marker_path.chmod(0o600)
 
 
-def _build_config_options(*, model: str, mode: str, reasoning_effort: str) -> list[dict[str, Any]]:
+def _format_prompt_blocks(
+    prompt_blocks: list[dict[str, Any]],
+) -> tuple[str, list[Path]]:
+    """Convert ACP prompt content blocks into a text prompt and temporary image files."""
+    parts: list[str] = []
+    temp_images: list[Path] = []
+
+    for block in prompt_blocks:
+        if not isinstance(block, dict):
+            continue
+        btype = str(block.get("type", ""))
+        if btype == "text":
+            text = str(block.get("text", ""))
+            if text:
+                parts.append(text)
+        elif btype == "resource_link":
+            uri = str(block.get("uri", ""))
+            name = str(block.get("name") or uri)
+            parts.append(f"[Resource: {name} ({uri})]")
+        elif btype == "resource":
+            res = block.get("resource")
+            if isinstance(res, dict) and "text" in res:
+                uri = str(res.get("uri", "embedded"))
+                parts.append(f"--- {uri} ---\n{res['text']}\n---")
+        elif btype == "image":
+            raw_b64 = str(block.get("data", ""))
+            mime_type = str(block.get("mimeType", "image/png")).lower()
+            ext = _MIME_TO_EXT.get(mime_type, "png")
+            if raw_b64:
+                with contextlib.suppress(ValueError, OSError):
+                    decoded = base64.b64decode(raw_b64)
+                    img_dir = Path(tempfile.gettempdir()) / "agy-acp-images"
+                    img_dir.mkdir(parents=True, exist_ok=True)
+                    img_path = img_dir / f"img-{uuid.uuid4().hex[:12]}.{ext}"
+                    fd = os.open(img_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                    try:
+                        os.write(fd, decoded)
+                    finally:
+                        os.close(fd)
+                    img_path.chmod(0o600)
+                    temp_images.append(img_path)
+                    parts.append(
+                        f"[User attached an image: {img_path} — "
+                        "inspect it with view_file if needed]"
+                    )
+
+    return "\n\n".join(parts).strip(), temp_images
+
+
+def _build_config_options(
+    *,
+    model: str,
+    mode: str,
+    reasoning_effort: str,
+    available_models: list[dict[str, str]] | None = None,
+) -> list[dict[str, Any]]:
     """Build ACP configOptions array for the given session state."""
+    models = available_models or AVAILABLE_MODELS
     return [
         {
             "id": "model",
@@ -66,7 +127,7 @@ def _build_config_options(*, model: str, mode: str, reasoning_effort: str) -> li
             "category": "model",
             "type": "select",
             "currentValue": model,
-            "options": [{"value": m["modelId"], "name": m["name"]} for m in AVAILABLE_MODELS],
+            "options": [{"value": m["modelId"], "name": m["name"]} for m in models],
         },
         {
             "id": "mode",
@@ -95,11 +156,16 @@ def _build_config_options(*, model: str, mode: str, reasoning_effort: str) -> li
     ]
 
 
-def _build_session_descriptor(state: dict[str, Any]) -> dict[str, Any]:
+def _build_session_descriptor(
+    state: dict[str, Any],
+    *,
+    available_models: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
     """Build an ACP session response payload from internal session state."""
     model = str(state.get("model", DEFAULT_MODEL_ID))
     mode = str(state.get("mode", "auto"))
     reasoning_effort = str(state.get("reasoning_effort", DEFAULT_REASONING_EFFORT))
+    models = available_models or AVAILABLE_MODELS
     return {
         "sessionId": str(state["sessionId"]),
         "modes": {
@@ -108,31 +174,37 @@ def _build_session_descriptor(state: dict[str, Any]) -> dict[str, Any]:
         },
         "models": {
             "currentModelId": model,
-            "availableModels": list(AVAILABLE_MODELS),
+            "availableModels": list(models),
         },
         "configOptions": _build_config_options(
             model=model,
             mode=mode,
             reasoning_effort=reasoning_effort,
+            available_models=models,
         ),
     }
 
 
 class SessionManager:
-    """Manages concurrent ACP sessions backed by google.antigravity Agent trajectories."""
+    """Manages concurrent ACP sessions backed by `agy` CLI subprocesses."""
 
     def __init__(
         self,
         *,
         save_dir: Path | None = None,
-        sdk_provider: AntigravitySdkProvider | None = None,
+        cli_provider: AgyCliProvider | None = None,
     ) -> None:
         self._save_dir = save_dir
-        self._sdk = sdk_provider or AntigravitySdkProvider(save_dir=save_dir)
+        self._cli = cli_provider or AgyCliProvider(save_dir=save_dir)
         self._sessions: dict[str, dict[str, Any]] = {}
         self._cancelled_sessions: set[str] = set()
         self._cancel_scopes: dict[str, anyio.CancelScope] = {}
         self._active_cancel_scopes: dict[str, anyio.CancelScope] = self._cancel_scopes
+
+    @property
+    def cli_provider(self) -> AgyCliProvider:
+        """Return the underlying `AgyCliProvider` instance."""
+        return self._cli
 
     def _persist_session(self, sid: str, state: dict[str, Any]) -> None:
         """Persist session state to `self._save_dir` when configured."""
@@ -194,7 +266,7 @@ class SessionManager:
         initial_mode = "approve" if os.environ.get("GOOSE_MODE") else "auto"
         isolated_mcp = copy.deepcopy(mcp_servers) if mcp_servers is not None else []
         isolated_meta = copy.deepcopy(meta) if meta is not None else {}
-        sid = await self._sdk.start_or_resume_agent(
+        sid = await self._cli.start_or_resume_agent(
             session_id=None,
             cwd=cwd,
             mcp_servers=isolated_mcp,
@@ -204,6 +276,7 @@ class SessionManager:
         )
         state: dict[str, Any] = {
             "sessionId": sid,
+            "agyConversationId": None,
             "cwd": cwd,
             "mcp_servers": isolated_mcp,
             "meta": isolated_meta,
@@ -241,7 +314,7 @@ class SessionManager:
         mode = str(state.get("mode", "auto"))
         reasoning_effort = str(state.get("reasoning_effort", DEFAULT_REASONING_EFFORT))
 
-        await self._sdk.start_or_resume_agent(
+        await self._cli.start_or_resume_agent(
             session_id=session_id,
             cwd=cwd,
             mcp_servers=effective_mcp,
@@ -315,19 +388,65 @@ class SessionManager:
         *,
         session_id: str,
         prompt_blocks: list[dict[str, Any]],
+        on_thought: Callable[[str], Awaitable[None]] | None = None,
+        on_text: Callable[[str], Awaitable[None]] | None = None,
+        on_tool_call: Callable[[ToolCallEvent], Awaitable[bool]] | None = None,
+        on_tool_update: Callable[[ToolCallEvent], Awaitable[None]] | None = None,
     ) -> dict[str, Any]:
-        """Execute or steer a streaming turn (`session/prompt`)."""
-        _ = prompt_blocks
+        """Execute a streaming turn (`session/prompt`) via the `agy` CLI subprocess."""
         if self.consume_cancellation(session_id):
             return {"stopReason": "cancelled"}
-        with self.turn_cancel_scope(session_id) as scope:
-            if os.environ.get("AGY_ACP_FAKE_SDK") == "slow":
-                await anyio.sleep(0.2)
-            else:
-                await anyio.sleep(0)
-        if scope.cancel_called or self.consume_cancellation(session_id):
+
+        session = self._sessions.get(session_id) or self._load_persisted_session(session_id) or {}
+        cwd = str(session.get("cwd", ""))
+        model = str(session.get("model", DEFAULT_MODEL_ID))
+        mode = str(session.get("mode", "auto"))
+        if os.environ.get("GOOSE_MODE") == "approve":
+            mode = "approve"
+        effort = str(session.get("reasoning_effort", DEFAULT_REASONING_EFFORT))
+        agy_conv_id = session.get("agyConversationId")
+        conversation_id = str(agy_conv_id) if agy_conv_id else None
+
+        formatted_prompt, temp_images = _format_prompt_blocks(prompt_blocks)
+        outcome = None
+        try:
+            with self.turn_cancel_scope(session_id) as scope:
+                outcome = await self._cli.stream_prompt(
+                    cwd=cwd,
+                    prompt=formatted_prompt,
+                    session_id=session_id,
+                    conversation_id=conversation_id,
+                    model=model,
+                    mode=mode,
+                    effort=effort,
+                    on_thought=on_thought,
+                    on_text=on_text,
+                    on_tool_call=on_tool_call,
+                    on_tool_update=on_tool_update,
+                )
+        finally:
+            for img_path in temp_images:
+                with contextlib.suppress(OSError):
+                    img_path.unlink(missing_ok=True)
+
+        if (
+            scope.cancel_called
+            or self.consume_cancellation(session_id)
+            or outcome is None
+            or outcome.stop_reason == "cancelled"
+        ):
             return {"stopReason": "cancelled"}
-        return {"stopReason": "end_turn"}
+
+        if outcome.conversation_id and session_id in self._sessions:
+            self._sessions[session_id]["agyConversationId"] = outcome.conversation_id
+            self._persist_session(session_id, self._sessions[session_id])
+
+        return {
+            "stopReason": outcome.stop_reason,
+            "response": outcome.response,
+            "usage": outcome.usage,
+            "conversationId": outcome.conversation_id,
+        }
 
     def is_cancelled(self, session_id: str) -> bool:
         """Return whether `session_id` has a pending cancellation."""
@@ -371,8 +490,8 @@ class SessionManager:
                 self.unregister_cancel_scope(session_id, scope)
 
     async def cancel(self, *, session_id: str) -> bool:
-        """Cancel an in-flight prompt turn (`session/cancel`)."""
-        await anyio.sleep(0)
+        """Cancel an in-flight prompt turn (`session/cancel`) and interrupt `agy` subprocess."""
+        await self._cli.cancel_session(session_id)
         self._cancelled_sessions.add(session_id)
         if session_id in self._sessions:
             self._sessions[session_id]["cancelled"] = True
@@ -389,7 +508,7 @@ class SessionManager:
         delete_persisted: bool = False,
     ) -> dict[str, Any]:
         """Close and clean up an active session (`session/close`, `terminate`, `delete`)."""
-        await anyio.sleep(0)
+        await self._cli.cancel_session(session_id)
         scope = self._active_cancel_scopes.pop(session_id, None) or self._cancel_scopes.pop(
             session_id, None
         )

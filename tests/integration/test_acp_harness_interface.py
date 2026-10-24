@@ -189,7 +189,7 @@ async def test_req_acp_008_session_prompt_streaming_thoughts_and_text(
     """Verify REQ-ACP-008: session/prompt streams agent_thought_chunk and agent_message_chunk."""
     harness = await acp_harness_factory.spawn(
         ["acp", "serve"],
-        env={"AGY_ACP_FAKE_SDK": "1", "GEMINI_API_KEY": "test-key"},
+        env={"GEMINI_API_KEY": "test-key"},
     )
     await harness.send_request("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
     new_resp = await harness.send_request("session/new", {"cwd": str(tmp_path), "mcpServers": []})
@@ -231,7 +231,7 @@ async def test_req_acp_009_tool_call_and_permission_gating(
     """Verify REQ-ACP-009: tool_call, session/request_permission, and tool_call_update."""
     harness = await acp_harness_factory.spawn(
         ["acp", "serve"],
-        env={"AGY_ACP_FAKE_SDK": "1", "GEMINI_API_KEY": "test-key", "GOOSE_MODE": "approve"},
+        env={"GEMINI_API_KEY": "test-key", "GOOSE_MODE": "approve"},
     )
     harness.on_permission_request(
         lambda params: {"outcome": {"outcome": "selected", "optionId": "allow_once"}}
@@ -264,7 +264,7 @@ async def test_req_acp_010_session_cancel_and_mid_turn_steer(
     """Verify REQ-ACP-010: session/cancel resolves in-flight turn with stopReason == cancelled."""
     harness = await acp_harness_factory.spawn(
         ["acp", "serve"],
-        env={"AGY_ACP_FAKE_SDK": "slow", "GEMINI_API_KEY": "test-key"},
+        env={"TEST_AGY_SLOW": "1", "GEMINI_API_KEY": "test-key"},
     )
     await harness.send_request("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
     new_resp = await harness.send_request("session/new", {"cwd": str(tmp_path), "mcpServers": []})

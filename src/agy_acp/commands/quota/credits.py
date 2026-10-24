@@ -14,7 +14,7 @@ async def default(
 ) -> int:
     """Display remaining Antigravity G1 credits and cumulative session token usage."""
     await anyio.sleep(0)
-    data = QuotaTracker().get_credits_and_tokens()
+    data = await QuotaTracker().get_credits_and_tokens()
     if format == "json":
         print(json.dumps(data))
     else:
