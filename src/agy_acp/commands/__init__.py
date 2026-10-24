@@ -110,6 +110,12 @@ def register_commands(
                 if active_prefix is not None and entry.name.isidentifier()
                 else None
             )
+            init_file = entry / "__init__.py"
+            if init_file.is_file():
+                init_mod = _load_module(init_file, sub_prefix)
+                group_default = getattr(init_mod, "default", None)
+                if callable(group_default):
+                    group_app.default(group_default)
             register_commands(group_app, entry, package_prefix=sub_prefix)
             app.command(group_app)
 

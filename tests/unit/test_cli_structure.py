@@ -39,6 +39,17 @@ async def test_acp_serve_accepts_kirocrew_flags(tmp_path: Path) -> None:
     )
     assert rc == 0
 
+    # Verify direct KiroCrew invocation patterns without explicit 'serve' subcommand
+    for tokens in (
+        [],
+        ["--profile", "acp"],
+        ["acp"],
+        ["acp", "--with-builtin", "developer"],
+        ["acp", "--agent", "kirocrew", "--model", "gemini-3.7-pro"],
+    ):
+        cmd_rc = int(app(tokens, result_action="return_int_as_exit_code_else_zero"))
+        assert cmd_rc == 0
+
 
 def test_commands_hierarchy_and_docstrings(tmp_path: Path) -> None:
     """Verify hierarchical command registration and execution of docs build dry-run."""

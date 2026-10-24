@@ -6,6 +6,7 @@ from collections.abc import Sequence
 
 from agy_acp import __version__
 from agy_acp.commands import AnyioApp, register_commands
+from agy_acp.commands.serve import default as serve_default
 
 __all__ = ["app", "main"]
 
@@ -14,6 +15,7 @@ app = AnyioApp(
     help="Google Antigravity SDK wrapper exposing an ACP server for KiroCrew.",
     version=__version__,
 )
+app.default(serve_default)
 register_commands(app)
 
 
