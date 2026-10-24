@@ -54,16 +54,35 @@ async def test_multiplexed_session_isolation(tmp_path: Path) -> None:
     assert mgr.get_session(s1["sessionId"])["meta"]["role"] == "a"
 
 
-@pytest.mark.not_implemented
 async def test_update_session_mode_and_model(tmp_path: Path) -> None:
     """Verify SessionManager.set_mode, set_model, and set_config_option."""
     mgr = SessionManager(save_dir=tmp_path)
     s1 = await mgr.create_session(cwd=str(tmp_path))
     sid = s1["sessionId"]
-    await mgr.set_mode(session_id=sid, mode_id="read-only")
-    await mgr.set_model(session_id=sid, model_id="gemini-3.8-flash")
+    assert await mgr.set_mode(session_id=sid, mode_id="read-only") == {}
+    assert await mgr.set_model(session_id=sid, model_id="gemini-3.8-flash") == {}
     cfg = await mgr.set_config_option(session_id=sid, config_id="reasoning_effort", value="high")
     assert "configOptions" in cfg
+
+    by_id = {opt["id"]: opt["currentValue"] for opt in cfg["configOptions"]}
+    assert by_id == {
+        "model": "gemini-3.8-flash",
+        "mode": "read-only",
+        "reasoning_effort": "high",
+    }
+
+    await mgr.set_config_option(session_id=sid, config_id="mode", value="approve")
+    await mgr.set_config_option(session_id=sid, config_id="model", value="gemini-3.7-pro")
+    cfg2 = await mgr.set_config_option(session_id=sid, config_id="thinkingLevel", value="low")
+    by_id2 = {opt["id"]: opt["currentValue"] for opt in cfg2["configOptions"]}
+    assert by_id2 == {
+        "model": "gemini-3.7-pro",
+        "mode": "approve",
+        "reasoning_effort": "low",
+    }
+
+    with pytest.raises(ValueError, match="Mode 'invalid' not found"):
+        await mgr.set_mode(session_id=sid, mode_id="invalid")
 
 
 @pytest.mark.not_implemented
