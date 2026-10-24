@@ -19,7 +19,6 @@ def test_login_writes_atomic_credentials(tmp_path: Path) -> None:
     assert auth_file.is_file()
 
 
-@pytest.mark.not_implemented
 def test_logout_increments_generation(tmp_path: Path) -> None:
     """Verify AuthManager.logout clears credentials and increments generation."""
     auth_file = tmp_path / "credentials.json"

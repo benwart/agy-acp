@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +34,10 @@ def _default_auth_file() -> Path:
     return Path.home() / ".config" / "agy-acp" / "credentials.json"
 
 
-def _compute_fingerprint(record: dict[str, Any]) -> str:
+def _compute_fingerprint(record: dict[str, Any] | str) -> str:
+    if isinstance(record, str):
+        digest = hashlib.sha256(record.encode("utf-8")).hexdigest()
+        return f"sha256:{digest}"
     canonical = {k: v for k, v in record.items() if k != "fingerprint"}
     digest = hashlib.sha256(json.dumps(canonical, sort_keys=True).encode("utf-8")).hexdigest()
     return f"sha256:{digest}"
@@ -94,14 +98,32 @@ class AuthManager:
 
     def logout(self) -> AuthState:
         """Clear stored credentials atomically without killing running ACP servers."""
+        existing = self._store.read()
+        generation = int(existing.get("generation", 0)) + 1
+        record: dict[str, Any] = {
+            "authenticated": False,
+            "method": None,
+            "identity": None,
+            "api_key": None,
+            "vertex": False,
+            "project": None,
+            "location": None,
+            "oauth": False,
+            "generation": generation,
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+        fingerprint = _compute_fingerprint(record)
+        record["fingerprint"] = fingerprint
+        self._store.write(record)
+
         return AuthState(
-            authenticated=True,
+            authenticated=False,
             method=None,
             identity=None,
             project=None,
             location=None,
-            generation=0,
-            fingerprint="",
+            generation=generation,
+            fingerprint=fingerprint,
             auth_file=self._auth_file,
         )
 
