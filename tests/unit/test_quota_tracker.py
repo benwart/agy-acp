@@ -7,13 +7,24 @@ import pytest
 from agy_acp.logic.quota_tracker import QuotaTracker
 
 
-@pytest.mark.not_implemented
 def test_five_hour_bucket_calculation() -> None:
     """Verify QuotaTracker.get_five_hour_quota returns 5h bucket structure."""
     tracker = QuotaTracker()
     res = tracker.get_five_hour_quota()
     assert res["window"] == "5h"
-    assert len(res["buckets"]) >= 1
+    assert len(res["buckets"]) >= 2
+    first = res["buckets"][0]
+    assert first["id"] == "gemini-5h"
+    assert first["group"] == "Gemini Models"
+    assert first["window"] == "5h"
+    assert first["remaining_fraction"] == 0.95
+    assert first["remaining_percent"] == 95.0
+    assert first["used_percent"] == 5.0
+    assert "reset_time" in first
+
+    filtered = tracker.get_five_hour_quota(group="Gemini Models")
+    assert len(filtered["buckets"]) == 1
+    assert filtered["buckets"][0]["group"] == "Gemini Models"
 
 
 @pytest.mark.not_implemented
