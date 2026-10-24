@@ -56,7 +56,6 @@ async def test_req_acp_002_kirocrew_cli_invocation_variants(
     assert marker.read_text(encoding="utf-8") == "nonce-123\tloaded\n"
 
 
-@pytest.mark.not_implemented
 async def test_req_acp_003_initialize_handshake_and_capabilities(
     acp_harness_factory: HarnessFactory,
 ) -> None:
