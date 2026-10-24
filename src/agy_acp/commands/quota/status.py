@@ -33,6 +33,36 @@ def resolve_quota_bar_style(group_name: str, remaining_percent: float) -> str:
     return "orange1" if is_below_limit else "green"
 
 
+def format_reset_time(reset_time: str, *, now: datetime | None = None) -> str:
+    """Convert an ISO-8601 reset timestamp into a human-readable relative countdown."""
+    if not reset_time:
+        return "unknown"
+    try:
+        reset_dt = datetime.fromisoformat(reset_time.replace("Z", "+00:00"))
+    except ValueError:
+        return reset_time
+
+    active_now = now or datetime.now(UTC)
+    remaining_sec = int((reset_dt - active_now).total_seconds())
+    if remaining_sec <= 0:
+        return "now"
+
+    days, rem = divmod(remaining_sec, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, seconds = divmod(rem, 60)
+
+    parts: list[str] = []
+    if days > 0:
+        parts.append(f"{days}d")
+    if hours > 0:
+        parts.append(f"{hours}h")
+    if minutes > 0:
+        parts.append(f"{minutes}m")
+    if not parts:
+        parts.append(f"{seconds}s")
+    return f"in {' '.join(parts)}"
+
+
 def format_over_under_trend(
     *,
     remaining_percent: float,
@@ -118,6 +148,7 @@ def build_quota_status_renderables(
                 "window": window,
                 "remaining_percent": remaining_pct,
                 "reset_time": reset_time,
+                "reset_display": format_reset_time(reset_time, now=now),
                 "bar": bar,
                 "bar_style": bar_style,
                 "trend_text": trend_text,
@@ -165,7 +196,7 @@ def render_rich_quota_status(
             line.append(f"  {row['remaining_percent']:5.1f}%  ", style=f"bold {row['bar_style']}")
             line.append(f"{row['trend_text']}  ", style=row["trend_style"])
             line.append(f"{row['name']} ({row['window']})", style="bold")
-            line.append(f"  resets {row['reset_time']}", style="dim")
+            line.append(f"  resets {row['reset_display']}", style="dim")
             active_console.print(line, overflow="ignore", crop=False, soft_wrap=True)
 
     credits = data.get("credits", {})

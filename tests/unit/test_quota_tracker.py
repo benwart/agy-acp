@@ -223,6 +223,7 @@ async def test_rich_status_progress_bars_colors_grouping_and_trend() -> None:
         TREND_FIXED_WIDTH,
         build_quota_status_renderables,
         format_over_under_trend,
+        format_reset_time,
         render_rich_quota_status,
         resolve_quota_bar_style,
     )
@@ -237,6 +238,11 @@ async def test_rich_status_progress_bars_colors_grouping_and_trend() -> None:
 
     # 2. Fixed-width over/under trend calculation relative to remaining time % of window
     now = datetime(2026, 10, 24, 12, 0, 0, tzinfo=UTC)
+    assert format_reset_time("2026-10-28T21:41:00Z", now=now) == "in 4d 9h 41m"
+    assert format_reset_time("2026-10-27T12:00:00Z", now=now) == "in 3d"
+    assert format_reset_time("2026-10-24T14:30:00Z", now=now) == "in 2h 30m"
+    assert format_reset_time("2026-10-24T12:00:45Z", now=now) == "in 45s"
+    assert format_reset_time("2026-10-24T11:59:00Z", now=now) == "now"
     # 2.5 hours left in a 5h window => 50% time remaining
     reset_5h_half = "2026-10-24T14:30:00Z"
     over_str, over_style = format_over_under_trend(
@@ -366,3 +372,9 @@ async def test_rich_status_progress_bars_colors_grouping_and_trend() -> None:
                 else line.index("Five Hour Limit Remaining")
             )
             assert bar_idx < trend_idx < name_idx
+
+    # Reset strings must be human-readable durations rather than raw ISO timestamps
+    assert "resets in 3d" in rendered
+    assert "resets in 2h 30m" in rendered
+    assert "2026-10-27T12:00:00Z" not in rendered
+    assert "2026-10-24T14:30:00Z" not in rendered

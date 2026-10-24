@@ -6,6 +6,7 @@ import json
 
 import anyio
 
+from agy_acp.commands.quota.status import format_reset_time
 from agy_acp.logic.quota_tracker import QuotaTracker
 
 
@@ -21,9 +22,10 @@ async def default(
         print(json.dumps(data))
     else:
         for bucket in data["buckets"]:
+            reset_label = format_reset_time(str(bucket.get("reset_time", "")))
             print(
                 f"[{bucket['group']}] {bucket['name']} (5h): "
                 f"{bucket['remaining_percent']:.1f}% remaining "
-                f"(resets {bucket['reset_time']})"
+                f"(resets {reset_label})"
             )
     return 0
