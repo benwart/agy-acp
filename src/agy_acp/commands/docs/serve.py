@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Annotated
 
+import anyio
 from cyclopts import Parameter
 
 
-def default(
+async def default(
     host: str = "127.0.0.1",
     port: int = 8000,
     config_file: Path = Path("zensical.toml"),
@@ -17,4 +19,26 @@ def default(
     dry_run: bool = False,
 ) -> int:
     """Serve the Zensical documentation site locally with live reload."""
-    return 1
+    await anyio.sleep(0)
+    if not config_file.is_file():
+        return 1
+    if dry_run:
+        return 0
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "zensical",
+        "serve",
+        "--config-file",
+        str(config_file),
+        "--dev-addr",
+        f"{host}:{port}",
+    ]
+    if open_browser:
+        cmd.append("--open")
+    if strict:
+        cmd.append("--strict")
+
+    result = await anyio.run_process(cmd, check=False)
+    return result.returncode
