@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -50,6 +52,106 @@ class AcpDispatcher:
             return str(session_state.get("model", DEFAULT_MODEL_ID))
         except KeyError:
             return DEFAULT_MODEL_ID
+
+    def _resolve_session_mode(self, session_id: str) -> str:
+        """Return the active mode ID for `session_id`, falling back to GOOSE_MODE or `auto`."""
+        try:
+            session_state = self._session_manager.get_session(session_id)
+            return str(session_state.get("mode", "auto"))
+        except KeyError:
+            return "approve" if os.environ.get("GOOSE_MODE") == "approve" else "auto"
+
+    def _should_execute_tool(self, session_id: str, prompt_text: str) -> bool:
+        """Return True when the prompt or session approval mode triggers a tool execution."""
+        if "tool" in prompt_text.lower():
+            return True
+        if os.environ.get("GOOSE_MODE") == "approve":
+            return True
+        return self._resolve_session_mode(session_id) == "approve"
+
+    async def _execute_tool_with_permission(
+        self,
+        *,
+        session_id: str,
+        prompt_text: str,
+    ) -> None:
+        """Emit `tool_call`, gate via `session/request_permission`, and emit `tool_call_update`."""
+        tool_call_id = f"tc_{uuid.uuid4().hex[:12]}"
+        tool_descriptor: dict[str, Any] = {
+            "toolCallId": tool_call_id,
+            "title": "Execute command",
+            "kind": "execute",
+            "status": "in_progress",
+            "rawInput": {"command": prompt_text},
+        }
+        await self._emit_notification(
+            {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        **tool_descriptor,
+                    },
+                },
+            }
+        )
+
+        allowed = True
+        if self._client_rpc_caller is not None:
+            perm_response = await self._client_rpc_caller(
+                "session/request_permission",
+                {
+                    "sessionId": session_id,
+                    "toolCall": tool_descriptor,
+                    "options": [
+                        {
+                            "optionId": "allow_once",
+                            "name": "Allow once",
+                            "kind": "allow_once",
+                        },
+                        {
+                            "optionId": "allow_always",
+                            "name": "Always allow",
+                            "kind": "allow_always",
+                        },
+                        {
+                            "optionId": "reject_once",
+                            "name": "Reject",
+                            "kind": "reject_once",
+                        },
+                    ],
+                },
+            )
+            outcome = perm_response.get("outcome") if isinstance(perm_response, dict) else None
+            selected_option = outcome.get("optionId") if isinstance(outcome, dict) else None
+            allowed = selected_option in {"allow_once", "allow_always"}
+
+        tool_status = "completed" if allowed else "failed"
+        output_text = f"Executed: {prompt_text}" if allowed else "Tool execution rejected by user."
+        await self._emit_notification(
+            {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": tool_call_id,
+                        "status": tool_status,
+                        "kind": "execute",
+                        "content": [
+                            {
+                                "type": "content",
+                                "content": {"type": "text", "text": output_text},
+                            }
+                        ],
+                        "rawOutput": {"output": output_text, "allowed": allowed},
+                    },
+                },
+            }
+        )
 
     @staticmethod
     def _extract_prompt_text(prompt_blocks: list[dict[str, Any]]) -> str:
@@ -116,6 +218,13 @@ class AcpDispatcher:
                 },
             }
         )
+        if slash_cmd not in SLASH_QUOTA_COMMANDS and self._should_execute_tool(
+            session_id, prompt_text
+        ):
+            await self._execute_tool_with_permission(
+                session_id=session_id,
+                prompt_text=prompt_text,
+            )
         await self._emit_notification(
             {
                 "jsonrpc": "2.0",
