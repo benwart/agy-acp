@@ -12,13 +12,14 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import anyio
 import anyio.abc
 from anyio.streams.text import TextReceiveStream
+
+from agy_acp.providers.state_store import SqliteStateStoreProvider
 
 MAX_INLINE_PROMPT_BYTES: int = 64 * 1024
 VALID_EFFORTS: frozenset[str] = frozenset({"low", "medium", "high", "xhigh", "max"})
@@ -246,16 +247,17 @@ class AgyCliProvider:
         *,
         bin_path: str | Path | None = None,
         save_dir: Path | None = None,
-        models_cache_file: Path | None = None,
+        state_store: SqliteStateStoreProvider | None = None,
     ) -> None:
         self._explicit_bin = bin_path
-        self._save_dir = save_dir
-        self._models_cache_file = models_cache_file or (
-            Path.home() / ".config" / "agy-acp" / "models.json"
-        )
-        self._sessions: dict[str, dict[str, Any]] = {}
+        self._store = state_store or SqliteStateStoreProvider(save_dir)
         self._active_processes: dict[str, anyio.abc.Process] = {}
         self._cancelled_sessions: set[str] = set()
+
+    @property
+    def state_store(self) -> SqliteStateStoreProvider:
+        """Return the underlying `SqliteStateStoreProvider`."""
+        return self._store
 
     @property
     def bin_path(self) -> str:
@@ -263,21 +265,11 @@ class AgyCliProvider:
         return resolve_agy_binary(self._explicit_bin)
 
     async def discover_models(self, *, refresh: bool = False) -> list[dict[str, str]]:
-        """Discover models via `agy models`, caching to `~/.config/agy-acp/models.json`."""
-        if not refresh and self._models_cache_file.is_file():
-            with contextlib.suppress(OSError, ValueError, KeyError):
-                cached = json.loads(self._models_cache_file.read_text(encoding="utf-8"))
-                models_list = cached.get("models") if isinstance(cached, dict) else None
-                if isinstance(models_list, list) and models_list:
-                    return [
-                        {
-                            "modelId": str(m.get("modelId") or m.get("id", "")),
-                            "name": str(m.get("name", "")),
-                            "description": str(m.get("description") or m.get("name", "")),
-                        }
-                        for m in models_list
-                        if isinstance(m, dict) and (m.get("modelId") or m.get("id"))
-                    ]
+        """Discover models via `agy models`, caching to SQLite `models_cache` table."""
+        if not refresh:
+            cached = self._store.load_models()
+            if cached:
+                return cached
 
         try:
             with anyio.fail_after(15.0):
@@ -301,18 +293,7 @@ class AgyCliProvider:
                             }
                         )
                 if discovered:
-                    with contextlib.suppress(OSError):
-                        self._models_cache_file.parent.mkdir(parents=True, exist_ok=True)
-                        self._models_cache_file.write_text(
-                            json.dumps(
-                                {
-                                    "models": discovered,
-                                    "updatedAt": datetime.now(UTC).isoformat(),
-                                },
-                                indent=2,
-                            ),
-                            encoding="utf-8",
-                        )
+                    self._store.save_models(discovered)
                     return discovered
         except TimeoutError, OSError:
             pass
@@ -380,19 +361,10 @@ class AgyCliProvider:
         reasoning_effort: str = "medium",
         auth_config: dict[str, Any] | None = None,
     ) -> str:
-        """Initialize or resume a session backed by the `agy` CLI."""
+        """Initialize or resume a session backed by SQLite state storage and the `agy` CLI."""
         await anyio.sleep(0)
         sid = session_id or str(uuid.uuid4())
-        existing: dict[str, Any] = {}
-        if session_id is not None:
-            if session_id in self._sessions:
-                existing = self._sessions[session_id]
-            elif self._save_dir is not None:
-                persisted_file = self._save_dir / f"{session_id}.json"
-                if persisted_file.is_file():
-                    loaded = json.loads(persisted_file.read_text(encoding="utf-8"))
-                    if isinstance(loaded, dict):
-                        existing = loaded
+        existing = (self._store.get_session(sid) if session_id is not None else None) or {}
 
         translated_mcp = (
             [translate_mcp_server(srv) for srv in mcp_servers]
@@ -409,11 +381,7 @@ class AgyCliProvider:
             "reasoning_effort": reasoning_effort,
             "auth_config": auth_config or dict(existing.get("auth_config", {})),
         }
-        self._sessions[sid] = state
-        if self._save_dir is not None:
-            self._save_dir.mkdir(parents=True, exist_ok=True)
-            state_file = self._save_dir / f"{sid}.json"
-            state_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        self._store.upsert_session(state)
         return sid
 
     async def cancel_session(self, session_id: str) -> bool:
@@ -502,6 +470,15 @@ class AgyCliProvider:
             step_idx = int(step.get("step_index", step.get("idx", 0)))
             step_type = str(step.get("step_type", step.get("type_name", "")))
             status_raw = str(step.get("status", step.get("state", "RUNNING"))).upper()
+
+            if self._store.get_session(sid) is not None:
+                self._store.upsert_step(
+                    session_id=sid,
+                    idx=step_idx,
+                    step_type=step_type or "step",
+                    status=status_raw,
+                    data=step,
+                )
 
             thinking_delta = step.get("thinking_delta")
             thinking_full = step.get("thinking")

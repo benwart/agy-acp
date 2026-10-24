@@ -116,13 +116,14 @@ async def test_discover_models_parses_tab_separated_and_caches(tmp_path: Path) -
         "fi\n"
         "exit 1\n",
     )
-    cache_file = tmp_path / "models.json"
-    provider = AgyCliProvider(bin_path=fake_agy, models_cache_file=cache_file)
+    db_file = tmp_path / "state.db"
+    provider = AgyCliProvider(bin_path=fake_agy, save_dir=tmp_path)
     models = await provider.discover_models(refresh=True)
     assert len(models) == 2
     assert models[0]["modelId"] == "gemini-3.7-pro"
     assert models[0]["name"] == "Gemini 3.7 Pro"
-    assert cache_file.is_file()
+    assert db_file.is_file()
+    assert provider.state_store.load_models() == models
 
 
 async def test_run_slash_command_executes_async_subprocess(tmp_path: Path) -> None:

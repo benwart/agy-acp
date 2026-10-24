@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from agy_acp.providers.quota_provider import QuotaProvider
+from agy_acp.providers.state_store import SqliteStateStoreProvider
 
 
 class QuotaTracker:
@@ -12,14 +13,31 @@ class QuotaTracker:
 
     CONTEXT_WINDOW_SIZE: int = 1_000_000
 
-    def __init__(self, *, provider: QuotaProvider | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        provider: QuotaProvider | None = None,
+        state_store: SqliteStateStoreProvider | None = None,
+    ) -> None:
         self._provider = provider or QuotaProvider()
-        self.input_tokens: int = 0
-        self.output_tokens: int = 0
-        self.cached_read_tokens: int = 0
-        self.thinking_tokens: int = 0
-        self.total_tokens: int = 0
-        self._total_tokens: int = 0
+        self._store = state_store
+        initial = (
+            self._store.get_token_ledger()
+            if self._store is not None
+            else {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cached_read_tokens": 0,
+                "thinking_tokens": 0,
+                "total_tokens": 0,
+            }
+        )
+        self.input_tokens: int = initial["input_tokens"]
+        self.output_tokens: int = initial["output_tokens"]
+        self.cached_read_tokens: int = initial["cached_read_tokens"]
+        self.thinking_tokens: int = initial["thinking_tokens"]
+        self.total_tokens: int = initial["total_tokens"]
+        self._total_tokens: int = self.total_tokens
 
     def record_token_usage(
         self,
@@ -29,7 +47,22 @@ class QuotaTracker:
         cached_read_tokens: int = 0,
         thinking_tokens: int = 0,
     ) -> None:
-        """Accumulate session token usage into the ledger."""
+        """Accumulate session token usage into the ledger and persist to SQLite if configured."""
+        if self._store is not None:
+            ledger = self._store.record_tokens(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cached_read_tokens=cached_read_tokens,
+                thinking_tokens=thinking_tokens,
+            )
+            self.input_tokens = ledger["input_tokens"]
+            self.output_tokens = ledger["output_tokens"]
+            self.cached_read_tokens = ledger["cached_read_tokens"]
+            self.thinking_tokens = ledger["thinking_tokens"]
+            self.total_tokens = ledger["total_tokens"]
+            self._total_tokens = self.total_tokens
+            return
+
         self.input_tokens += input_tokens
         self.output_tokens += output_tokens
         self.cached_read_tokens += cached_read_tokens

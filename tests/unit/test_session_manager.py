@@ -123,12 +123,14 @@ async def test_cancel_and_steer_active_turn(tmp_path: Path) -> None:
 
 
 async def test_terminate_and_delete_session(tmp_path: Path) -> None:
-    """Verify SessionManager.close_session cleans up session state."""
+    """Verify SessionManager.close_session cleans up session state in SQLite without JSON files."""
     mgr = SessionManager(save_dir=tmp_path)
     s1 = await mgr.create_session(cwd=str(tmp_path))
     sid = s1["sessionId"]
-    session_file = tmp_path / f"{sid}.json"
-    assert session_file.is_file()
+    db_file = tmp_path / "state.db"
+    assert db_file.is_file()
+    assert not (tmp_path / f"{sid}.json").exists()
+    assert len(mgr.list_sessions(cwd=str(tmp_path))) == 1
 
     await mgr.cancel(session_id=sid)
     assert mgr.is_cancelled(sid) is True
@@ -150,13 +152,12 @@ async def test_terminate_and_delete_session(tmp_path: Path) -> None:
         assert res == {}
 
     assert scope_cancelled is True
-    assert sid not in mgr._sessions
-    assert sid not in mgr._cancelled_sessions
+    assert mgr.is_cancelled(sid) is False
     assert sid not in mgr._active_cancel_scopes
-    assert session_file.is_file()
+    assert mgr.get_session(sid)["sessionId"] == sid
 
     del_res = await mgr.close_session(session_id=sid, delete_persisted=True)
     assert del_res == {}
-    assert not session_file.exists()
+    assert mgr.list_sessions(cwd=str(tmp_path)) == []
     with pytest.raises(KeyError, match=sid):
         mgr.get_session(sid)

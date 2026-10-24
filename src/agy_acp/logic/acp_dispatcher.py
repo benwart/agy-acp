@@ -52,7 +52,9 @@ class AcpDispatcher:
         self._client_rpc_caller = client_rpc_caller
         self._session_manager = session_manager or SessionManager()
         self._auth_manager = auth_manager
-        self._quota_tracker = quota_tracker or QuotaTracker()
+        self._quota_tracker = quota_tracker or QuotaTracker(
+            state_store=self._session_manager.state_store
+        )
 
     async def _emit_notification(self, notification: dict[str, Any]) -> None:
         """Emit a JSON-RPC 2.0 notification to the configured sink if present."""
@@ -551,12 +553,34 @@ class AcpDispatcher:
                 message.get("id"),
                 params if isinstance(params, dict) else {},
             )
-        if method == "session/load":
+        if method in {"session/load", "session/resume"}:
             params = message.get("params")
             return await self._handle_session_load(
                 message.get("id"),
                 params if isinstance(params, dict) else {},
             )
+        if method == "session/list":
+            raw_params = message.get("params")
+            params = raw_params if isinstance(raw_params, dict) else {}
+            cwd_filter = params.get("cwd")
+            sessions = self._session_manager.list_sessions(
+                cwd=str(cwd_filter) if cwd_filter else None
+            )
+            return {
+                "jsonrpc": "2.0",
+                "id": message.get("id"),
+                "result": {
+                    "sessions": [
+                        {
+                            "sessionId": s["sessionId"],
+                            "cwd": s["cwd"],
+                            "title": s.get("title"),
+                            "updatedAt": s.get("updatedAt"),
+                        }
+                        for s in sessions
+                    ]
+                },
+            }
         if method == "session/set_mode":
             params = message.get("params")
             return await self._handle_session_set_mode(

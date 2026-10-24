@@ -1,11 +1,10 @@
-"""Session lifecycle, multi-session multiplexing, steer, and cancellation logic."""
+"""Session lifecycle, multi-session multiplexing, steer, and cancellation logic backed by SQLite."""
 
 from __future__ import annotations
 
 import base64
 import contextlib
 import copy
-import json
 import os
 import tempfile
 import uuid
@@ -20,6 +19,7 @@ from agy_acp.providers.agy_cli_provider import (
     AgyCliProvider,
     ToolCallEvent,
 )
+from agy_acp.providers.state_store import SqliteStateStoreProvider
 
 DEFAULT_MODEL_ID = "gemini-3.7-pro"
 DEFAULT_REASONING_EFFORT = "medium"
@@ -161,7 +161,7 @@ def _build_session_descriptor(
     *,
     available_models: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
-    """Build an ACP session response payload from internal session state."""
+    """Build an ACP session response payload from persisted session state."""
     model = str(state.get("model", DEFAULT_MODEL_ID))
     mode = str(state.get("mode", "auto"))
     reasoning_effort = str(state.get("reasoning_effort", DEFAULT_REASONING_EFFORT))
@@ -186,45 +186,33 @@ def _build_session_descriptor(
 
 
 class SessionManager:
-    """Manages concurrent ACP sessions backed by `agy` CLI subprocesses."""
+    """Manages concurrent ACP sessions backed by SQLite storage and `agy` CLI subprocesses."""
 
     def __init__(
         self,
         *,
         save_dir: Path | None = None,
+        state_store: SqliteStateStoreProvider | None = None,
         cli_provider: AgyCliProvider | None = None,
     ) -> None:
-        self._save_dir = save_dir
-        self._cli = cli_provider or AgyCliProvider(save_dir=save_dir)
-        self._sessions: dict[str, dict[str, Any]] = {}
-        self._cancelled_sessions: set[str] = set()
+        self._store = state_store or (
+            cli_provider.state_store
+            if cli_provider is not None
+            else SqliteStateStoreProvider(save_dir)
+        )
+        self._cli = cli_provider or AgyCliProvider(state_store=self._store)
         self._cancel_scopes: dict[str, anyio.CancelScope] = {}
         self._active_cancel_scopes: dict[str, anyio.CancelScope] = self._cancel_scopes
+
+    @property
+    def state_store(self) -> SqliteStateStoreProvider:
+        """Return the underlying `SqliteStateStoreProvider`."""
+        return self._store
 
     @property
     def cli_provider(self) -> AgyCliProvider:
         """Return the underlying `AgyCliProvider` instance."""
         return self._cli
-
-    def _persist_session(self, sid: str, state: dict[str, Any]) -> None:
-        """Persist session state to `self._save_dir` when configured."""
-        if self._save_dir is None:
-            return
-        self._save_dir.mkdir(parents=True, exist_ok=True)
-        session_file = self._save_dir / f"{sid}.json"
-        session_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
-
-    def _load_persisted_session(self, session_id: str) -> dict[str, Any] | None:
-        """Load persisted session state from `self._save_dir` if available."""
-        if self._save_dir is None:
-            return None
-        session_file = self._save_dir / f"{session_id}.json"
-        if not session_file.is_file():
-            return None
-        loaded = json.loads(session_file.read_text(encoding="utf-8"))
-        if not isinstance(loaded, dict):
-            return None
-        return loaded
 
     @staticmethod
     def _build_config_options(
@@ -240,20 +228,20 @@ class SessionManager:
             reasoning_effort=reasoning_effort,
         )
 
-    def _require_session_mut(self, session_id: str) -> dict[str, Any]:
-        """Return mutable session state for `session_id`, loading from disk if needed."""
-        state = self._sessions.get(session_id)
-        if state is None:
-            state = self._load_persisted_session(session_id)
-            if state is not None:
-                self._sessions[session_id] = state
+    def _require_session(self, session_id: str) -> dict[str, Any]:
+        """Fetch session state for `session_id` directly from SQLite or raise KeyError."""
+        state = self._store.get_session(session_id)
         if state is None:
             raise KeyError(f"Session '{session_id}' not found")
         return state
 
     def get_session(self, session_id: str) -> dict[str, Any]:
-        """Return an isolated copy of the state for `session_id`."""
-        return copy.deepcopy(self._require_session_mut(session_id))
+        """Return an isolated copy of the SQLite-persisted state for `session_id`."""
+        return copy.deepcopy(self._require_session(session_id))
+
+    def list_sessions(self, *, cwd: str | None = None) -> list[dict[str, Any]]:
+        """Return all persisted sessions from SQLite, optionally filtered by `cwd`."""
+        return self._store.list_sessions(cwd=cwd)
 
     async def create_session(
         self,
@@ -262,7 +250,7 @@ class SessionManager:
         mcp_servers: list[dict[str, Any]] | None = None,
         meta: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Create a new ACP session (`session/new`) and return its descriptor."""
+        """Create a new ACP session (`session/new`) in SQLite and return its descriptor."""
         initial_mode = "approve" if os.environ.get("GOOSE_MODE") else "auto"
         isolated_mcp = copy.deepcopy(mcp_servers) if mcp_servers is not None else []
         isolated_meta = copy.deepcopy(meta) if meta is not None else {}
@@ -274,19 +262,19 @@ class SessionManager:
             mode=initial_mode,
             reasoning_effort=DEFAULT_REASONING_EFFORT,
         )
-        state: dict[str, Any] = {
-            "sessionId": sid,
-            "agyConversationId": None,
-            "cwd": cwd,
-            "mcp_servers": isolated_mcp,
-            "meta": isolated_meta,
-            "mode": initial_mode,
-            "model": DEFAULT_MODEL_ID,
-            "reasoning_effort": DEFAULT_REASONING_EFFORT,
-            "cancelled": False,
-        }
-        self._sessions[sid] = state
-        self._persist_session(sid, state)
+        state = self._store.upsert_session(
+            {
+                "sessionId": sid,
+                "agyConversationId": None,
+                "cwd": cwd,
+                "mcp_servers": isolated_mcp,
+                "meta": isolated_meta,
+                "mode": initial_mode,
+                "model": DEFAULT_MODEL_ID,
+                "reasoning_effort": DEFAULT_REASONING_EFFORT,
+                "cancelled": False,
+            }
+        )
         _write_dsh_gate_marker_if_configured()
         return _build_session_descriptor(state)
 
@@ -297,13 +285,9 @@ class SessionManager:
         cwd: str,
         mcp_servers: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """Resume an existing ACP session (`session/load`) from persistent trajectory storage."""
+        """Resume an existing ACP session (`session/load`) from SQLite storage."""
         await anyio.sleep(0)
-        state = self._sessions.get(session_id)
-        if state is None:
-            state = self._load_persisted_session(session_id)
-        if state is None:
-            raise KeyError(f"Session '{session_id}' not found")
+        state = self._require_session(session_id)
 
         effective_mcp = (
             copy.deepcopy(mcp_servers)
@@ -323,37 +307,37 @@ class SessionManager:
             reasoning_effort=reasoning_effort,
         )
 
-        restored_state: dict[str, Any] = {
-            **copy.deepcopy(state),
-            "sessionId": session_id,
-            "cwd": cwd,
-            "mcp_servers": effective_mcp,
-            "mode": mode,
-            "model": model,
-            "reasoning_effort": reasoning_effort,
-            "cancelled": bool(state.get("cancelled", False)),
-        }
-        self._sessions[session_id] = restored_state
-        self._persist_session(session_id, restored_state)
+        restored_state = self._store.upsert_session(
+            {
+                **copy.deepcopy(state),
+                "sessionId": session_id,
+                "cwd": cwd,
+                "mcp_servers": effective_mcp,
+                "mode": mode,
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+                "cancelled": bool(state.get("cancelled", False)),
+            }
+        )
         _write_dsh_gate_marker_if_configured()
         return _build_session_descriptor(restored_state)
 
     async def set_mode(self, *, session_id: str, mode_id: str) -> dict[str, Any]:
-        """Update session approval mode or agent profile (`session/set_mode`)."""
+        """Update session approval mode or agent profile (`session/set_mode`) in SQLite."""
         await anyio.sleep(0)
         if mode_id not in VALID_MODE_IDS:
             raise ValueError(f"Mode '{mode_id}' not found")
-        session = self._require_session_mut(session_id)
+        session = self._require_session(session_id)
         session["mode"] = mode_id
-        self._persist_session(session_id, session)
+        self._store.upsert_session(session)
         return {}
 
     async def set_model(self, *, session_id: str, model_id: str) -> dict[str, Any]:
-        """Update active model (`session/set_model`)."""
+        """Update active model (`session/set_model`) in SQLite."""
         await anyio.sleep(0)
-        session = self._require_session_mut(session_id)
+        session = self._require_session(session_id)
         session["model"] = model_id
-        self._persist_session(session_id, session)
+        self._store.upsert_session(session)
         return {}
 
     async def set_config_option(
@@ -363,23 +347,25 @@ class SessionManager:
         config_id: str,
         value: str,
     ) -> dict[str, Any]:
-        """Update session configuration option (`session/set_config_option`)."""
+        """Update session configuration option (`session/set_config_option`) in SQLite."""
         await anyio.sleep(0)
-        session = self._require_session_mut(session_id)
+        session = self._require_session(session_id)
         if config_id == "model":
             session["model"] = value
         elif config_id == "mode":
-            await self.set_mode(session_id=session_id, mode_id=value)
+            if value not in VALID_MODE_IDS:
+                raise ValueError(f"Mode '{value}' not found")
+            session["mode"] = value
         elif config_id in REASONING_EFFORT_CONFIG_IDS:
             session["reasoning_effort"] = value
         else:
             raise ValueError(f"Config option '{config_id}' not found")
-        self._persist_session(session_id, session)
+        updated = self._store.upsert_session(session)
         return {
             "configOptions": self._build_config_options(
-                model=str(session.get("model", DEFAULT_MODEL_ID)),
-                mode=str(session.get("mode", "auto")),
-                reasoning_effort=str(session.get("reasoning_effort", DEFAULT_REASONING_EFFORT)),
+                model=str(updated.get("model", DEFAULT_MODEL_ID)),
+                mode=str(updated.get("mode", "auto")),
+                reasoning_effort=str(updated.get("reasoning_effort", DEFAULT_REASONING_EFFORT)),
             )
         }
 
@@ -397,7 +383,7 @@ class SessionManager:
         if self.consume_cancellation(session_id):
             return {"stopReason": "cancelled"}
 
-        session = self._sessions.get(session_id) or self._load_persisted_session(session_id) or {}
+        session = self._store.get_session(session_id) or {}
         cwd = str(session.get("cwd", ""))
         model = str(session.get("model", DEFAULT_MODEL_ID))
         mode = str(session.get("mode", "auto"))
@@ -437,9 +423,9 @@ class SessionManager:
         ):
             return {"stopReason": "cancelled"}
 
-        if outcome.conversation_id and session_id in self._sessions:
-            self._sessions[session_id]["agyConversationId"] = outcome.conversation_id
-            self._persist_session(session_id, self._sessions[session_id])
+        if outcome.conversation_id and session:
+            session["agyConversationId"] = outcome.conversation_id
+            self._store.upsert_session(session)
 
         return {
             "stopReason": outcome.stop_reason,
@@ -449,21 +435,23 @@ class SessionManager:
         }
 
     def is_cancelled(self, session_id: str) -> bool:
-        """Return whether `session_id` has a pending cancellation."""
-        if session_id in self._cancelled_sessions:
-            return True
-        session = self._sessions.get(session_id)
-        return bool(session and session.get("cancelled", False))
+        """Return whether `session_id` has a pending cancellation in SQLite."""
+        session = self._store.get_session(session_id)
+        if session is not None:
+            return bool(session.get("cancelled", False))
+        return bool(self._store.get_kv(f"cancelled:{session_id}"))
 
     def consume_cancellation(self, session_id: str) -> bool:
-        """Clear and return whether `session_id` was marked cancelled."""
+        """Clear and return whether `session_id` was marked cancelled in SQLite."""
         was_cancelled = self.is_cancelled(session_id)
-        self._cancelled_sessions.discard(session_id)
-        session = self._sessions.get(session_id)
-        if session is not None and session.get("cancelled", False):
+        if not was_cancelled:
+            return False
+        session = self._store.get_session(session_id)
+        if session is not None:
             session["cancelled"] = False
-            self._persist_session(session_id, session)
-        return was_cancelled
+            self._store.upsert_session(session)
+        self._store.set_kv(f"cancelled:{session_id}", False)
+        return True
 
     def register_cancel_scope(self, session_id: str, scope: anyio.CancelScope) -> None:
         """Register an active `anyio.CancelScope` for `session_id`."""
@@ -490,12 +478,14 @@ class SessionManager:
                 self.unregister_cancel_scope(session_id, scope)
 
     async def cancel(self, *, session_id: str) -> bool:
-        """Cancel an in-flight prompt turn (`session/cancel`) and interrupt `agy` subprocess."""
+        """Cancel an in-flight prompt turn (`session/cancel`) and persist in SQLite."""
         await self._cli.cancel_session(session_id)
-        self._cancelled_sessions.add(session_id)
-        if session_id in self._sessions:
-            self._sessions[session_id]["cancelled"] = True
-            self._persist_session(session_id, self._sessions[session_id])
+        session = self._store.get_session(session_id)
+        if session is not None:
+            session["cancelled"] = True
+            self._store.upsert_session(session)
+        else:
+            self._store.set_kv(f"cancelled:{session_id}", True)
         scope = self._cancel_scopes.get(session_id)
         if scope is not None:
             scope.cancel()
@@ -514,10 +504,12 @@ class SessionManager:
         )
         if scope is not None:
             scope.cancel()
-        self._sessions.pop(session_id, None)
-        self._cancelled_sessions.discard(session_id)
-        if delete_persisted and self._save_dir is not None:
-            session_file = self._save_dir / f"{session_id}.json"
-            if session_file.is_file():
-                session_file.unlink()
+        self._store.set_kv(f"cancelled:{session_id}", False)
+        if delete_persisted:
+            self._store.delete_session(session_id)
+        else:
+            session = self._store.get_session(session_id)
+            if session is not None and session.get("cancelled", False):
+                session["cancelled"] = False
+                self._store.upsert_session(session)
         return {}
