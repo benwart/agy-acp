@@ -9,6 +9,7 @@ source = { editable = "." }
 dependencies = [
     { name = "anyio" },
     { name = "cyclopts" },
+    { name = "rich" },
     { name = "zensical" },
 ]
 
@@ -24,6 +25,7 @@ dev = [
 requires-dist = [
     { name = "anyio", specifier = ">=4.0.0" },
     { name = "cyclopts", specifier = ">=3.0.0" },
+    { name = "rich", specifier = ">=13.0.0" },
     { name = "zensical" },
 ]
 

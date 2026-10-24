@@ -210,3 +210,159 @@ async def test_format_kirocrew_usage_and_slash_response() -> None:
     )
     assert len(exhausted_updates) == 3
     assert exhausted_updates[2]["method"] == "_kiro.dev/error/rate_limit"
+
+
+async def test_rich_status_progress_bars_colors_grouping_and_trend() -> None:
+    """Verify Rich quota status renders thin colored bars, 7d->5h grouping, and fixed trend."""
+    from datetime import UTC, datetime
+    from io import StringIO
+
+    from rich.console import Console
+
+    from agy_acp.commands.quota.status import (
+        TREND_FIXED_WIDTH,
+        build_quota_status_renderables,
+        format_over_under_trend,
+        render_rich_quota_status,
+        resolve_quota_bar_style,
+    )
+
+    # 1. Color rules: Gemini blue (red < 5%), other green (orange1 < 5%)
+    assert resolve_quota_bar_style("Gemini Models", 95.0) == "blue"
+    assert resolve_quota_bar_style("Gemini Models", 5.0) == "blue"
+    assert resolve_quota_bar_style("Gemini Models", 4.9) == "red"
+    assert resolve_quota_bar_style("Claude and GPT models", 80.0) == "green"
+    assert resolve_quota_bar_style("Claude and GPT models", 5.0) == "green"
+    assert resolve_quota_bar_style("Claude and GPT models", 4.9) == "orange1"
+
+    # 2. Fixed-width over/under trend calculation relative to remaining time % of window
+    now = datetime(2026, 10, 24, 12, 0, 0, tzinfo=UTC)
+    # 2.5 hours left in a 5h window => 50% time remaining
+    reset_5h_half = "2026-10-24T14:30:00Z"
+    over_str, over_style = format_over_under_trend(
+        remaining_percent=75.0,
+        window="5h",
+        reset_time=reset_5h_half,
+        now=now,
+    )
+    under_str, under_style = format_over_under_trend(
+        remaining_percent=30.0,
+        window="5h",
+        reset_time=reset_5h_half,
+        now=now,
+    )
+    even_str, _ = format_over_under_trend(
+        remaining_percent=50.0,
+        window="5h",
+        reset_time=reset_5h_half,
+        now=now,
+    )
+    assert len(over_str) == TREND_FIXED_WIDTH
+    assert len(under_str) == TREND_FIXED_WIDTH
+    assert len(even_str) == TREND_FIXED_WIDTH
+    assert "OVER" in over_str and "+25.0%" in over_str
+    assert "UNDER" in under_str and "-20.0%" in under_str
+    assert over_style != under_style
+
+    # 3. Grouping (Gemini then Claude/GPT), ordering (7d then 5h), and per-bucket low-quota color
+    status_data = {
+        "five_hour": {
+            "window": "5h",
+            "buckets": [
+                {
+                    "id": "gemini-5h",
+                    "group": "Gemini Models",
+                    "name": "Five Hour Limit Remaining",
+                    "window": "5h",
+                    "remaining_fraction": 0.03,
+                    "remaining_percent": 3.0,
+                    "used_percent": 97.0,
+                    "reset_time": reset_5h_half,
+                },
+                {
+                    "id": "3p-5h",
+                    "group": "Claude and GPT models",
+                    "name": "Five Hour Limit Remaining",
+                    "window": "5h",
+                    "remaining_fraction": 0.80,
+                    "remaining_percent": 80.0,
+                    "used_percent": 20.0,
+                    "reset_time": reset_5h_half,
+                },
+            ],
+        },
+        "seven_day": {
+            "window": "7d",
+            "buckets": [
+                {
+                    "id": "gemini-weekly",
+                    "group": "Gemini Models",
+                    "name": "Weekly Limit Remaining",
+                    "window": "7d",
+                    "remaining_fraction": 0.90,
+                    "remaining_percent": 90.0,
+                    "used_percent": 10.0,
+                    "reset_time": "2026-10-27T12:00:00Z",
+                },
+                {
+                    "id": "3p-weekly",
+                    "group": "Claude and GPT models",
+                    "name": "Weekly Limit Remaining",
+                    "window": "7d",
+                    "remaining_fraction": 0.04,
+                    "remaining_percent": 4.0,
+                    "used_percent": 96.0,
+                    "reset_time": "2026-10-27T12:00:00Z",
+                },
+            ],
+        },
+        "credits": {"remaining_credits": 500, "upgrade_uri": "https://one.google.com/ai"},
+        "token_usage": {
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "cached_read_tokens": 0,
+            "thinking_tokens": 0,
+            "total_tokens": 15,
+        },
+    }
+
+    rows_meta = build_quota_status_renderables(status_data, now=now)
+    assert [r["id"] for r in rows_meta] == [
+        "gemini-weekly",
+        "gemini-5h",
+        "3p-weekly",
+        "3p-5h",
+    ]
+    assert [r["bar"].complete_style for r in rows_meta] == [
+        "blue",
+        "red",
+        "orange1",
+        "green",
+    ]
+
+    buf = StringIO()
+    console = Console(file=buf, width=120, force_terminal=True, color_system="truecolor")
+    render_rich_quota_status(status_data, console=console, now=now)
+    rendered = buf.getvalue()
+
+    assert "━" in rendered
+    gemini_pos = rendered.index("Gemini Models")
+    claude_pos = rendered.index("Claude and GPT models")
+    assert gemini_pos < claude_pos
+
+    # Within Gemini group, Weekly (7d) appears before Five Hour (5h)
+    gemini_weekly_pos = rendered.index("Weekly Limit Remaining", gemini_pos)
+    gemini_5h_pos = rendered.index("Five Hour Limit Remaining", gemini_pos)
+    assert gemini_weekly_pos < gemini_5h_pos < claude_pos
+
+    # On each quota line, thin bar '━' precedes trend ('OVER'/'UNDER'), which precedes name
+    for line in rendered.splitlines():
+        if "Weekly Limit Remaining" in line or "Five Hour Limit Remaining" in line:
+            bar_idx = line.index("━")
+            trend_idx = line.index("OVER") if "OVER" in line else line.index("UNDER")
+            name_idx = (
+                line.index("Weekly Limit Remaining")
+                if "Weekly Limit Remaining" in line
+                else line.index("Five Hour Limit Remaining")
+            )
+            assert bar_idx < trend_idx < name_idx
