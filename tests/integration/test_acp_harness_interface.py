@@ -226,7 +226,6 @@ async def test_req_acp_008_session_prompt_streaming_thoughts_and_text(
     assert "agent_message_chunk" in update_kinds
 
 
-@pytest.mark.not_implemented
 async def test_req_acp_009_tool_call_and_permission_gating(
     acp_harness_factory: HarnessFactory,
     tmp_path: Path,
