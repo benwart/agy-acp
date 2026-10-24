@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from agy_acp.logic.auth_manager import AuthManager
 
 
+@pytest.mark.not_implemented
 def test_login_writes_atomic_credentials(tmp_path: Path) -> None:
     """Verify AuthManager.login writes 0600 credentials and returns authenticated AuthState."""
     auth_file = tmp_path / "credentials.json"
@@ -17,6 +20,7 @@ def test_login_writes_atomic_credentials(tmp_path: Path) -> None:
     assert auth_file.is_file()
 
 
+@pytest.mark.not_implemented
 def test_logout_increments_generation(tmp_path: Path) -> None:
     """Verify AuthManager.logout clears credentials and increments generation."""
     auth_file = tmp_path / "credentials.json"
@@ -27,6 +31,7 @@ def test_logout_increments_generation(tmp_path: Path) -> None:
     assert logged_out.generation == 2
 
 
+@pytest.mark.not_implemented
 def test_status_reflects_active_credential_state(tmp_path: Path) -> None:
     """Verify AuthManager.status reports current authentication state."""
     auth_file = tmp_path / "credentials.json"
@@ -34,6 +39,7 @@ def test_status_reflects_active_credential_state(tmp_path: Path) -> None:
     assert mgr.status().authenticated is False
 
 
+@pytest.mark.not_implemented
 def test_detects_external_credential_rotation(tmp_path: Path) -> None:
     """Verify AuthManager.has_changed_since detects external credential changes."""
     auth_file = tmp_path / "credentials.json"

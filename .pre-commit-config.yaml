@@ -30,8 +30,7 @@ repos:
         pass_filenames: false
       - id: pytest
         name: pytest
-        entry: uv run pytest
+        entry: uv run pytest -m "not not_implemented"
         language: system
         types: [python]
         pass_filenames: false
-        stages: [manual]

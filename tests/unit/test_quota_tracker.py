@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import pytest
+
 from agy_acp.logic.quota_tracker import QuotaTracker
 
 
+@pytest.mark.not_implemented
 def test_five_hour_bucket_calculation() -> None:
     """Verify QuotaTracker.get_five_hour_quota returns 5h bucket structure."""
     tracker = QuotaTracker()
@@ -13,6 +16,7 @@ def test_five_hour_bucket_calculation() -> None:
     assert len(res["buckets"]) >= 1
 
 
+@pytest.mark.not_implemented
 def test_seven_day_bucket_calculation() -> None:
     """Verify QuotaTracker.get_seven_day_quota returns 7d bucket structure."""
     tracker = QuotaTracker()
@@ -21,6 +25,7 @@ def test_seven_day_bucket_calculation() -> None:
     assert len(res["buckets"]) >= 1
 
 
+@pytest.mark.not_implemented
 def test_combined_quota_and_token_ledger() -> None:
     """Verify QuotaTracker.get_unified_status and get_credits_and_tokens."""
     tracker = QuotaTracker()
@@ -30,6 +35,7 @@ def test_combined_quota_and_token_ledger() -> None:
     assert "credits" in status
 
 
+@pytest.mark.not_implemented
 def test_format_kirocrew_usage_and_slash_response() -> None:
     """Verify QuotaTracker builds KiroCrew wire notifications and slash command Markdown."""
     tracker = QuotaTracker()

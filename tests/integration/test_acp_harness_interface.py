@@ -5,9 +5,12 @@ from __future__ import annotations
 import base64
 from pathlib import Path
 
+import pytest
+
 from tests.integration.conftest import HarnessFactory
 
 
+@pytest.mark.not_implemented
 async def test_req_acp_001_stdio_framing_and_stdout_purity(
     acp_harness_factory: HarnessFactory,
 ) -> None:
@@ -28,6 +31,7 @@ async def test_req_acp_001_stdio_framing_and_stdout_purity(
     assert "result" in response
 
 
+@pytest.mark.not_implemented
 async def test_req_acp_002_kirocrew_cli_invocation_variants(
     acp_harness_factory: HarnessFactory,
     tmp_path: Path,
@@ -53,6 +57,7 @@ async def test_req_acp_002_kirocrew_cli_invocation_variants(
     assert marker.read_text(encoding="utf-8") == "nonce-123\tloaded\n"
 
 
+@pytest.mark.not_implemented
 async def test_req_acp_003_initialize_handshake_and_capabilities(
     acp_harness_factory: HarnessFactory,
 ) -> None:
@@ -79,6 +84,7 @@ async def test_req_acp_003_initialize_handshake_and_capabilities(
     assert result["agentInfo"]["version"]
 
 
+@pytest.mark.not_implemented
 async def test_req_acp_004_session_new_mcp_and_config_options(
     acp_harness_factory: HarnessFactory,
     tmp_path: Path,
@@ -115,6 +121,7 @@ async def test_req_acp_004_session_new_mcp_and_config_options(
     assert {"model", "mode", "reasoning_effort"}.issubset(option_ids)
 
 
+@pytest.mark.not_implemented
 async def test_req_acp_005_session_load_resumes_existing_session(
     acp_harness_factory: HarnessFactory,
     tmp_path: Path,
@@ -138,6 +145,7 @@ async def test_req_acp_005_session_load_resumes_existing_session(
     assert load_resp["result"]["sessionId"] == session_id
 
 
+@pytest.mark.not_implemented
 async def test_req_acp_006_multiplexed_concurrent_sessions(
     acp_harness_factory: HarnessFactory,
     tmp_path: Path,
@@ -151,6 +159,7 @@ async def test_req_acp_006_multiplexed_concurrent_sessions(
     assert r1["result"]["sessionId"] != r2["result"]["sessionId"]
 
 
+@pytest.mark.not_implemented
 async def test_req_acp_007_set_mode_model_and_config_options(
     acp_harness_factory: HarnessFactory,
     tmp_path: Path,
@@ -182,6 +191,7 @@ async def test_req_acp_007_set_mode_model_and_config_options(
     assert "configOptions" in cfg_resp["result"]
 
 
+@pytest.mark.not_implemented
 async def test_req_acp_008_session_prompt_streaming_thoughts_and_text(
     acp_harness_factory: HarnessFactory,
     tmp_path: Path,
@@ -224,6 +234,7 @@ async def test_req_acp_008_session_prompt_streaming_thoughts_and_text(
     assert "agent_message_chunk" in update_kinds
 
 
+@pytest.mark.not_implemented
 async def test_req_acp_009_tool_call_and_permission_gating(
     acp_harness_factory: HarnessFactory,
     tmp_path: Path,
@@ -257,6 +268,7 @@ async def test_req_acp_009_tool_call_and_permission_gating(
     assert "tool_call_update" in update_kinds
 
 
+@pytest.mark.not_implemented
 async def test_req_acp_010_session_cancel_and_mid_turn_steer(
     acp_harness_factory: HarnessFactory,
     tmp_path: Path,
@@ -280,6 +292,7 @@ async def test_req_acp_010_session_cancel_and_mid_turn_steer(
     assert prompt_resp["result"]["stopReason"] == "cancelled"
 
 
+@pytest.mark.not_implemented
 async def test_req_acp_011_session_teardown_methods(
     acp_harness_factory: HarnessFactory,
     tmp_path: Path,

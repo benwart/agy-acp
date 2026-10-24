@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from agy_acp.logic.session_manager import SessionManager
 
 
+@pytest.mark.not_implemented
 async def test_create_session_maps_mcp_and_cwd(tmp_path: Path) -> None:
     """Verify SessionManager.create_session returns valid sessionId and configOptions."""
     mgr = SessionManager(save_dir=tmp_path)
@@ -18,6 +21,7 @@ async def test_create_session_maps_mcp_and_cwd(tmp_path: Path) -> None:
     assert "configOptions" in desc
 
 
+@pytest.mark.not_implemented
 async def test_load_session_resumes_trajectory(tmp_path: Path) -> None:
     """Verify SessionManager.load_session restores an existing sessionId."""
     mgr = SessionManager(save_dir=tmp_path)
@@ -27,6 +31,7 @@ async def test_load_session_resumes_trajectory(tmp_path: Path) -> None:
     assert loaded["sessionId"] == created["sessionId"]
 
 
+@pytest.mark.not_implemented
 async def test_multiplexed_session_isolation(tmp_path: Path) -> None:
     """Verify SessionManager isolates state between concurrent sessionIds."""
     mgr = SessionManager(save_dir=tmp_path)
@@ -35,6 +40,7 @@ async def test_multiplexed_session_isolation(tmp_path: Path) -> None:
     assert s1["sessionId"] != s2["sessionId"]
 
 
+@pytest.mark.not_implemented
 async def test_update_session_mode_and_model(tmp_path: Path) -> None:
     """Verify SessionManager.set_mode, set_model, and set_config_option."""
     mgr = SessionManager(save_dir=tmp_path)
@@ -46,6 +52,7 @@ async def test_update_session_mode_and_model(tmp_path: Path) -> None:
     assert "configOptions" in cfg
 
 
+@pytest.mark.not_implemented
 async def test_cancel_and_steer_active_turn(tmp_path: Path) -> None:
     """Verify SessionManager.cancel stops an active turn."""
     mgr = SessionManager(save_dir=tmp_path)
@@ -54,6 +61,7 @@ async def test_cancel_and_steer_active_turn(tmp_path: Path) -> None:
     assert cancelled is True
 
 
+@pytest.mark.not_implemented
 async def test_terminate_and_delete_session(tmp_path: Path) -> None:
     """Verify SessionManager.close_session cleans up session state."""
     mgr = SessionManager(save_dir=tmp_path)

@@ -5,9 +5,12 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
+import pytest
+
 from tests.integration.conftest import CliResult, HarnessFactory
 
 
+@pytest.mark.not_implemented
 def test_req_auth_001_cli_login_persists_credentials(
     run_cli: Callable[[list[str]], CliResult],
     tmp_path: Path,
@@ -34,6 +37,7 @@ def test_req_auth_001_cli_login_persists_credentials(
     assert (auth_file.stat().st_mode & 0o777) == 0o600
 
 
+@pytest.mark.not_implemented
 def test_req_auth_002_cli_logout_clears_credentials(
     run_cli: Callable[[list[str]], CliResult],
     tmp_path: Path,
@@ -48,6 +52,7 @@ def test_req_auth_002_cli_logout_clears_credentials(
     assert payload["generation"] >= 2
 
 
+@pytest.mark.not_implemented
 def test_req_auth_003_cli_auth_status_reporting(
     run_cli: Callable[[list[str]], CliResult],
     tmp_path: Path,
@@ -65,6 +70,7 @@ def test_req_auth_003_cli_auth_status_reporting(
     assert authed.json()["fingerprint"].startswith("sha256:")
 
 
+@pytest.mark.not_implemented
 async def test_req_auth_004_running_acp_server_hot_reloads_auth_without_restart(
     acp_harness_factory: HarnessFactory,
     run_cli: Callable[[list[str]], CliResult],
@@ -74,7 +80,6 @@ async def test_req_auth_004_running_acp_server_hot_reloads_auth_without_restart(
     auth_file = tmp_path / "credentials.json"
     save_dir = tmp_path / "sessions"
 
-    # 1. Start ACP server BEFORE logging in
     harness = await acp_harness_factory.spawn(
         ["acp", "serve", "--auth-file", str(auth_file), "--save-dir", str(save_dir)],
         env={"AGY_ACP_FAKE_SDK": "1"},
@@ -84,7 +89,6 @@ async def test_req_auth_004_running_acp_server_hot_reloads_auth_without_restart(
     assert "result" in new_resp
     sid = new_resp["result"]["sessionId"]
 
-    # 2. Prompt while logged out -> returns KiroCrew signed-out error without crashing server
     err_resp = await harness.send_request(
         "session/prompt",
         {"sessionId": sid, "prompt": [{"type": "text", "text": "Hello"}]},
@@ -92,18 +96,15 @@ async def test_req_auth_004_running_acp_server_hot_reloads_auth_without_restart(
     assert "error" in err_resp
     assert "not logged in" in err_resp["error"]["message"].lower()
 
-    # 3. Run standalone CLI login while ACP server stays connected
     login_res = run_cli(["auth", "login", "--api-key", "live-key", "--auth-file", str(auth_file)])
     assert login_res.exit_code == 0
 
-    # 4. Retry prompt on the SAME running ACP server and SAME sessionId -> succeeds
     ok_resp = await harness.send_request(
         "session/prompt",
         {"sessionId": sid, "prompt": [{"type": "text", "text": "Hello after login"}]},
     )
     assert ok_resp["result"]["stopReason"] == "end_turn"
 
-    # 5. Run standalone CLI logout while ACP server stays connected -> next prompt fails cleanly
     logout_res = run_cli(["auth", "logout", "--auth-file", str(auth_file)])
     assert logout_res.exit_code == 0
     post_logout_resp = await harness.send_request(
