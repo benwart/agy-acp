@@ -262,6 +262,11 @@ async def test_tool_permission_request_allow_and_reject() -> None:
     assert len(tool_calls) == 1
     assert tool_calls[0]["status"] == "in_progress"
     assert tool_calls[0]["kind"] == "execute"
+    assert tool_calls[0]["_meta"]["kiro"] == {
+        "toolName": "execute_bash",
+        "mcpServerName": "",
+    }
+    assert rpc_calls[0][1]["_meta"] == {"kiro": {"toolId": "run_command"}}
     assert len(tool_updates) == 1
     assert tool_updates[0]["status"] == "completed"
     assert tool_updates[0]["toolCallId"] == tool_calls[0]["toolCallId"]
@@ -289,3 +294,138 @@ async def test_tool_permission_request_allow_and_reject() -> None:
     ]
     assert len(reject_updates) == 1
     assert reject_updates[0]["status"] == "failed"
+
+
+async def test_acp_dispatcher_logs_incoming_outgoing_and_unhandled_messages(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify AcpDispatcher and acp_logger record JSONL trace events to acp.log."""
+    from agy_acp.providers.acp_logger import resolve_log_file_path
+
+    log_file = tmp_path / "acp.log"
+    monkeypatch.setenv("AGY_ACP_LOG_FILE", str(log_file))
+    assert resolve_log_file_path() == log_file
+
+    dispatcher = _make_dispatcher()
+    resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "initialize",
+                "params": {"protocolVersion": 1, "clientCapabilities": {}},
+            }
+        )
+    )
+    assert resp is not None
+
+    unhandled_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "_kiro.dev/unknown_probe",
+                "params": {"foo": "bar"},
+            }
+        )
+    )
+    assert unhandled_resp is None
+
+    assert log_file.exists()
+    entries = [
+        json.loads(line)
+        for line in log_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    events = [e["event"] for e in entries]
+    assert "rpc.receive" in events
+    assert "rpc.response" in events
+    assert "rpc.unhandled" in events
+    unhandled_entry = next(e for e in entries if e["event"] == "rpc.unhandled")
+    assert unhandled_entry["method"] == "_kiro.dev/unknown_probe"
+    assert unhandled_entry["params"] == {"foo": "bar"}
+
+
+async def test_kiro_commands_execute_quota_effort_mcp_and_tools() -> None:
+    """Verify _kiro.dev/commands/execute handles /quota, /effort, /mcp, and /tools."""
+    dispatcher = _make_dispatcher()
+    new_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 20,
+                "method": "session/new",
+                "params": {"cwd": "/tmp", "mcpServers": []},
+            }
+        )
+    )
+    assert new_resp is not None
+    sid = new_resp["result"]["sessionId"]
+
+    quota_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 21,
+                "method": "_kiro.dev/commands/execute",
+                "params": {"sessionId": sid, "command": {"command": "quota", "args": {}}},
+            }
+        )
+    )
+    assert quota_resp is not None
+    assert "Antigravity Quota & Usage" in quota_resp["result"]["message"]
+
+    effort_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 22,
+                "method": "_kiro.dev/commands/execute",
+                "params": {
+                    "sessionId": sid,
+                    "command": {"command": "effort", "args": {"level": "high"}},
+                },
+            }
+        )
+    )
+    assert effort_resp is not None
+    assert "high" in effort_resp["result"]["message"]
+
+    mcp_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 23,
+                "method": "_kiro.dev/commands/execute",
+                "params": {"sessionId": sid, "command": {"command": "mcp", "args": {}}},
+            }
+        )
+    )
+    assert mcp_resp is not None
+    assert mcp_resp["result"]["data"]["servers"] == []
+
+    tools_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 24,
+                "method": "_kiro.dev/commands/execute",
+                "params": {"sessionId": sid, "command": {"command": "tools", "args": {}}},
+            }
+        )
+    )
+    assert tools_resp is not None
+    assert tools_resp["result"]["data"]["tools"] == []
+
+    steer_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 25,
+                "method": "_session/steer",
+                "params": {"sessionId": sid, "message": "<user_message>steer</user_message>"},
+            }
+        )
+    )
+    assert steer_resp == {"jsonrpc": "2.0", "id": 25, "result": {}}

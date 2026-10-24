@@ -156,25 +156,72 @@ def _build_config_options(
     ]
 
 
+def _discover_agent_mode_ids(
+    *,
+    cwd: str | None = None,
+    default_agent: str | None = None,
+    active_agent: str | None = None,
+) -> list[str]:
+    """Discover KiroCrew agent mode IDs from spawn flags and `.kiro/agents/*.json`."""
+    found: list[str] = []
+    seen: set[str] = set(VALID_MODE_IDS)
+
+    def _add(agent_id: str | None) -> None:
+        if agent_id and agent_id not in seen:
+            seen.add(agent_id)
+            found.append(agent_id)
+
+    _add(default_agent)
+    _add(active_agent)
+    _add("kirocrew")
+    _add("kirocrew-lite")
+
+    search_dirs: list[Path] = []
+    if cwd:
+        search_dirs.append(Path(cwd) / ".kiro" / "agents")
+    with contextlib.suppress(RuntimeError, OSError):
+        search_dirs.append(Path.home() / ".kiro" / "agents")
+
+    for agents_dir in search_dirs:
+        if not agents_dir.is_dir():
+            continue
+        with contextlib.suppress(OSError):
+            for spec_file in sorted(agents_dir.glob("*.json")):
+                _add(spec_file.stem)
+    return found
+
+
 def _build_session_descriptor(
     state: dict[str, Any],
     *,
     available_models: list[dict[str, str]] | None = None,
+    default_agent: str | None = None,
 ) -> dict[str, Any]:
     """Build an ACP session response payload from persisted session state."""
     model = str(state.get("model", DEFAULT_MODEL_ID))
     mode = str(state.get("mode", "auto"))
+    active_agent = state.get("agent") or default_agent
+    current_mode_id = str(active_agent) if active_agent else mode
     reasoning_effort = str(state.get("reasoning_effort", DEFAULT_REASONING_EFFORT))
-    models = available_models or AVAILABLE_MODELS
+    models = list(available_models or AVAILABLE_MODELS)
+    if model and all(m.get("modelId") != model for m in models):
+        models.insert(0, {"modelId": model, "name": model, "description": model})
+
+    extra_modes = _discover_agent_mode_ids(
+        cwd=str(state.get("cwd", "")),
+        default_agent=default_agent,
+        active_agent=str(active_agent) if active_agent else None,
+    )
+    modes_list = list(AVAILABLE_MODES) + [{"id": mid, "name": mid} for mid in extra_modes]
     return {
         "sessionId": str(state["sessionId"]),
         "modes": {
-            "currentModeId": mode,
-            "availableModes": list(AVAILABLE_MODES),
+            "currentModeId": current_mode_id,
+            "availableModes": modes_list,
         },
         "models": {
             "currentModelId": model,
-            "availableModels": list(models),
+            "availableModels": models,
         },
         "configOptions": _build_config_options(
             model=model,
@@ -194,6 +241,8 @@ class SessionManager:
         save_dir: Path | None = None,
         state_store: SqliteStateStoreProvider | None = None,
         cli_provider: AgyCliProvider | None = None,
+        default_agent: str | None = None,
+        default_model: str | None = None,
     ) -> None:
         self._store = state_store or (
             cli_provider.state_store
@@ -201,6 +250,8 @@ class SessionManager:
             else SqliteStateStoreProvider(save_dir)
         )
         self._cli = cli_provider or AgyCliProvider(state_store=self._store)
+        self._default_agent = default_agent
+        self._default_model = default_model
         self._cancel_scopes: dict[str, anyio.CancelScope] = {}
         self._active_cancel_scopes: dict[str, anyio.CancelScope] = self._cancel_scopes
 
@@ -252,13 +303,20 @@ class SessionManager:
     ) -> dict[str, Any]:
         """Create a new ACP session (`session/new`) in SQLite and return its descriptor."""
         initial_mode = "approve" if os.environ.get("GOOSE_MODE") else "auto"
+        cached_models = self._store.load_models() or None
+        if self._default_model:
+            initial_model = self._default_model
+        elif cached_models and DEFAULT_MODEL_ID not in {m.get("modelId") for m in cached_models}:
+            initial_model = str(cached_models[0].get("modelId") or DEFAULT_MODEL_ID)
+        else:
+            initial_model = DEFAULT_MODEL_ID
         isolated_mcp = copy.deepcopy(mcp_servers) if mcp_servers is not None else []
         isolated_meta = copy.deepcopy(meta) if meta is not None else {}
         sid = await self._cli.start_or_resume_agent(
             session_id=None,
             cwd=cwd,
             mcp_servers=isolated_mcp,
-            model=DEFAULT_MODEL_ID,
+            model=initial_model,
             mode=initial_mode,
             reasoning_effort=DEFAULT_REASONING_EFFORT,
         )
@@ -270,13 +328,18 @@ class SessionManager:
                 "mcp_servers": isolated_mcp,
                 "meta": isolated_meta,
                 "mode": initial_mode,
-                "model": DEFAULT_MODEL_ID,
+                "agent": self._default_agent,
+                "model": initial_model,
                 "reasoning_effort": DEFAULT_REASONING_EFFORT,
                 "cancelled": False,
             }
         )
         _write_dsh_gate_marker_if_configured()
-        return _build_session_descriptor(state)
+        return _build_session_descriptor(
+            state,
+            available_models=cached_models,
+            default_agent=self._default_agent,
+        )
 
     async def load_session(
         self,
@@ -294,8 +357,9 @@ class SessionManager:
             if mcp_servers is not None
             else copy.deepcopy(state.get("mcp_servers", []))
         )
-        model = str(state.get("model", DEFAULT_MODEL_ID))
+        model = str(state.get("model", self._default_model or DEFAULT_MODEL_ID))
         mode = str(state.get("mode", "auto"))
+        agent = state.get("agent") or self._default_agent
         reasoning_effort = str(state.get("reasoning_effort", DEFAULT_REASONING_EFFORT))
 
         await self._cli.start_or_resume_agent(
@@ -314,21 +378,43 @@ class SessionManager:
                 "cwd": cwd,
                 "mcp_servers": effective_mcp,
                 "mode": mode,
+                "agent": agent,
                 "model": model,
                 "reasoning_effort": reasoning_effort,
                 "cancelled": bool(state.get("cancelled", False)),
             }
         )
         _write_dsh_gate_marker_if_configured()
-        return _build_session_descriptor(restored_state)
+        cached_models = self._store.load_models() or None
+        return _build_session_descriptor(
+            restored_state,
+            available_models=cached_models,
+            default_agent=self._default_agent,
+        )
+
+    def _is_valid_agent_mode(self, mode_id: str, *, cwd: str | None = None) -> bool:
+        """Return whether `mode_id` is a valid KiroCrew agent mode ID."""
+        if not mode_id:
+            return False
+        if mode_id.startswith("kirocrew"):
+            return True
+        known = _discover_agent_mode_ids(
+            cwd=cwd,
+            default_agent=self._default_agent,
+        )
+        return mode_id in known
 
     async def set_mode(self, *, session_id: str, mode_id: str) -> dict[str, Any]:
         """Update session approval mode or agent profile (`session/set_mode`) in SQLite."""
         await anyio.sleep(0)
-        if mode_id not in VALID_MODE_IDS:
-            raise ValueError(f"Mode '{mode_id}' not found")
         session = self._require_session(session_id)
-        session["mode"] = mode_id
+        if mode_id in VALID_MODE_IDS:
+            session["mode"] = mode_id
+            session["agent"] = None
+        elif self._is_valid_agent_mode(mode_id, cwd=str(session.get("cwd", ""))):
+            session["agent"] = mode_id
+        else:
+            raise ValueError(f"Mode '{mode_id}' not found")
         self._store.upsert_session(session)
         return {}
 
@@ -423,8 +509,11 @@ class SessionManager:
         ):
             return {"stopReason": "cancelled"}
 
-        if outcome.conversation_id and session:
-            session["agyConversationId"] = outcome.conversation_id
+        if session and (outcome.conversation_id or outcome.resolved_model):
+            if outcome.conversation_id:
+                session["agyConversationId"] = outcome.conversation_id
+            if outcome.resolved_model and session.get("model") in {DEFAULT_MODEL_ID, "auto", ""}:
+                session["model"] = outcome.resolved_model
             self._store.upsert_session(session)
 
         return {

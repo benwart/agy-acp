@@ -126,11 +126,13 @@ class SqliteStateStoreProvider:
 
     @staticmethod
     def _row_to_session(row: sqlite3.Row) -> dict[str, Any]:
+        auth_cfg: dict[str, Any] = json.loads(row["auth_config_json"] or "{}")
         return {
             "sessionId": str(row["session_id"]),
             "agyConversationId": row["agy_conversation_id"],
             "cwd": str(row["cwd"]),
             "mode": str(row["mode"]),
+            "agent": auth_cfg.get("_agent"),
             "model": str(row["model"]),
             "reasoning_effort": str(row["reasoning_effort"]),
             "cancelled": bool(row["cancelled"]),
@@ -138,7 +140,7 @@ class SqliteStateStoreProvider:
             "title": row["title"],
             "mcp_servers": json.loads(row["mcp_servers_json"] or "[]"),
             "meta": json.loads(row["meta_json"] or "{}"),
-            "auth_config": json.loads(row["auth_config_json"] or "{}"),
+            "auth_config": auth_cfg,
             "createdAt": str(row["created_at"]),
             "updatedAt": str(row["updated_at"]),
         }
@@ -159,7 +161,12 @@ class SqliteStateStoreProvider:
         title = state.get("title", existing.get("title"))
         mcp_servers = state.get("mcp_servers", existing.get("mcp_servers", []))
         meta = state.get("meta", existing.get("meta", {}))
-        auth_config = state.get("auth_config", existing.get("auth_config", {}))
+        auth_config = dict(state.get("auth_config", existing.get("auth_config", {})))
+        if "agent" in state:
+            if state["agent"]:
+                auth_config["_agent"] = str(state["agent"])
+            else:
+                auth_config.pop("_agent", None)
         created_at = str(existing.get("createdAt") or now)
 
         with self._connect() as conn:

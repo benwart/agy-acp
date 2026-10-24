@@ -302,3 +302,237 @@ async def test_stream_prompt_parses_ndjson_events_and_cancels(tmp_path: Path) ->
     assert cancelled_outcome is not None
     assert cancelled_outcome.stop_reason == "cancelled"
     _ = os
+
+
+async def test_stream_prompt_parses_real_agy_deltas_and_recovers_invalid_model(
+    tmp_path: Path,
+) -> None:
+    """Verify stream_prompt handles real agy state/text_delta/thinking_delta and model fallback."""
+    events = [
+        {
+            "event": "init",
+            "conversation_id": "conv-real-999",
+            "init": {"model": "gemini-4-argon-medium"},
+        },
+        {
+            "event": "step_update",
+            "step_update": {
+                "step_index": 1,
+                "state": "ACTIVE",
+                "step_type": "agent_response",
+                "thinking_delta": "Thinking delta...",
+            },
+        },
+        {
+            "event": "step_update",
+            "step_update": {
+                "step_index": 2,
+                "state": "ACTIVE",
+                "step_type": "tool",
+                "tool_name": "run_command",
+                "tool_info": {
+                    "name": "run_command",
+                    "parameters": {"CommandLine": "ls /tmp"},
+                },
+            },
+        },
+        {
+            "event": "step_update",
+            "step_update": {
+                "step_index": 2,
+                "state": "DONE",
+                "step_type": "tool",
+                "tool_name": "run_command",
+                "tool_info": {
+                    "name": "run_command",
+                    "parameters": {"CommandLine": "ls /tmp"},
+                    "output": "ok-tmp",
+                },
+            },
+        },
+        {
+            "event": "step_update",
+            "step_update": {
+                "step_index": 3,
+                "state": "ACTIVE",
+                "step_type": "agent_response",
+                "text_delta": "Real ",
+            },
+        },
+        {
+            "event": "step_update",
+            "step_update": {
+                "step_index": 3,
+                "state": "DONE",
+                "step_type": "agent_response",
+                "text_delta": "output!",
+            },
+        },
+        {
+            "event": "result",
+            "result": {
+                "conversation_id": "conv-real-999",
+                "status": "SUCCESS",
+                "response": "Real output!",
+                "usage": {"input_tokens": 10, "output_tokens": 4, "total_tokens": 14},
+            },
+        },
+    ]
+    err_event = {
+        "event": "result",
+        "result": {
+            "conversation_id": "",
+            "status": "ERROR",
+            "response": "",
+            "error": 'invalid model selection (--model "gemini-3.7-pro")',
+        },
+    }
+    ndjson_lines = "\n".join(json.dumps(ev) for ev in events)
+    err_line = json.dumps(err_event)
+    fake_agy = _write_executable(
+        tmp_path / "agy",
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "if 'gemini-3.7-pro' in sys.argv:\n"
+        f"    print({err_line!r}, flush=True)\n"
+        "    sys.exit(1)\n"
+        f"print({ndjson_lines!r}, flush=True)\n",
+    )
+
+    thoughts: list[str] = []
+    texts: list[str] = []
+    tool_starts: list[ToolCallEvent] = []
+    tool_updates: list[ToolCallEvent] = []
+
+    async def _on_thought(chunk: str) -> None:
+        thoughts.append(chunk)
+
+    async def _on_text(chunk: str) -> None:
+        texts.append(chunk)
+
+    async def _on_tool_call(event: ToolCallEvent) -> bool:
+        tool_starts.append(event)
+        return True
+
+    async def _on_tool_update(event: ToolCallEvent) -> None:
+        tool_updates.append(event)
+
+    provider = AgyCliProvider(bin_path=fake_agy, save_dir=tmp_path)
+    outcome = await provider.stream_prompt(
+        cwd=str(tmp_path),
+        prompt="Test real deltas",
+        session_id="sess-real",
+        model="gemini-3.7-pro",
+        on_thought=_on_thought,
+        on_text=_on_text,
+        on_tool_call=_on_tool_call,
+        on_tool_update=_on_tool_update,
+    )
+    assert outcome.conversation_id == "conv-real-999"
+    assert thoughts == ["Thinking delta..."]
+    assert "".join(texts) == "Real output!"
+    assert len(tool_starts) == 1
+    assert tool_starts[0].raw_input == {"CommandLine": "ls /tmp", "command": "ls /tmp"}
+    assert tool_starts[0].kiro_tool_name == "execute_bash"
+    assert tool_starts[0].mcp_server_name == ""
+    assert tool_starts[0].kiro_tool_id == "run_command"
+    assert len(tool_updates) == 1
+    assert tool_updates[0].status == "completed"
+    assert tool_updates[0].output == "ok-tmp"
+
+
+async def test_resolve_kiro_tool_identity_and_sync_mcp_servers(tmp_path: Path) -> None:
+    """Verify Kiro tool identity mapping (built-in & MCP) and MCP config synchronization."""
+    from agy_acp.providers.agy_cli_provider import (
+        _classify_tool_step,
+        _normalize_tool_arguments,
+        _resolve_kiro_tool_identity,
+        load_kiro_agent_mcp_servers,
+    )
+
+    assert _resolve_kiro_tool_identity("tool", "run_command", {"command": "ls"}) == (
+        "execute_bash",
+        "",
+        "run_command",
+    )
+    assert _resolve_kiro_tool_identity("tool", "read_file", {"Path": "/tmp/a"}) == (
+        "fs_read",
+        "",
+        "read_file",
+    )
+    assert _resolve_kiro_tool_identity("tool", "edit_file", {"Path": "/tmp/a"}) == (
+        "fs_write",
+        "",
+        "fs_write",
+    )
+    assert _resolve_kiro_tool_identity("tool", "search_web", {"query": "test"}) == (
+        "web_search",
+        "",
+        "remote_web_search",
+    )
+    assert _resolve_kiro_tool_identity("tool", "invoke_subagent", {"Role": "dev"}) == (
+        "use_subagent",
+        "",
+        "invoke_sub_agent",
+    )
+
+    mcp_raw = {
+        "ServerName": "kirocrew-core",
+        "ToolName": "spawn_run",
+        "Arguments": {"agent": "researcher", "task": "audit"},
+    }
+    assert _resolve_kiro_tool_identity("tool", "call_mcp_tool", mcp_raw) == (
+        "spawn_run",
+        "kirocrew-core",
+        "@kirocrew-core/spawn_run",
+    )
+    norm_mcp_args = _normalize_tool_arguments(mcp_raw, tool_name="call_mcp_tool")
+    assert norm_mcp_args == {"agent": "researcher", "task": "audit"}
+    kind, title, _ = _classify_tool_step("tool", "call_mcp_tool", mcp_raw)
+    assert kind == "other"
+    assert title == "spawn_run"
+
+    cron_raw = {
+        "ServerName": "kirocrew-cron",
+        "ToolName": "cron_list",
+        "Arguments": {},
+    }
+    _, cron_title, _ = _classify_tool_step("tool", "call_mcp_tool", cron_raw)
+    assert cron_title == "@kirocrew-cron/cron_list"
+
+    # Verify loading MCP servers from .kiro/agents/<agent>.json and syncing into mcp_config.json
+    agents_dir = tmp_path / ".kiro" / "agents"
+    agents_dir.mkdir(parents=True)
+    (agents_dir / "kirocrew.json").write_text(
+        json.dumps(
+            {
+                "name": "kirocrew",
+                "mcpServers": {
+                    "kirocrew-core": {
+                        "command": "/usr/local/bin/kirocrew",
+                        "args": ["mcp-core"],
+                    },
+                    "kirocrew-cron": {
+                        "command": "/usr/local/bin/kirocrew",
+                        "args": ["mcp-cron"],
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    agent_servers = load_kiro_agent_mcp_servers("kirocrew", cwd=str(tmp_path))
+    assert len(agent_servers) == 2
+
+    mcp_cfg_file = tmp_path / "mcp_config.json"
+    mcp_cfg_file.write_text(
+        json.dumps({"mcpServers": {"rea": {"command": "npx", "args": ["rea"]}}}),
+        encoding="utf-8",
+    )
+    provider = AgyCliProvider(save_dir=tmp_path, mcp_config_path=mcp_cfg_file)
+    synced = provider.sync_mcp_servers(agent_servers)
+    assert set(synced) == {"kirocrew-core", "kirocrew-cron"}
+    merged = json.loads(mcp_cfg_file.read_text(encoding="utf-8"))
+    assert "rea" in merged["mcpServers"]
+    assert merged["mcpServers"]["kirocrew-core"]["command"] == "/usr/local/bin/kirocrew"
+    assert merged["mcpServers"]["kirocrew-core"]["args"] == ["mcp-core"]

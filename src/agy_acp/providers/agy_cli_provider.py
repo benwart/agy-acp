@@ -19,6 +19,7 @@ import anyio
 import anyio.abc
 from anyio.streams.text import TextReceiveStream
 
+from agy_acp.providers.acp_logger import log_acp_event
 from agy_acp.providers.state_store import SqliteStateStoreProvider
 
 MAX_INLINE_PROMPT_BYTES: int = 64 * 1024
@@ -67,6 +68,9 @@ class ToolCallEvent:
     raw_input: dict[str, Any] = field(default_factory=dict)
     output: str = ""
     locations: list[dict[str, Any]] = field(default_factory=list)
+    kiro_tool_name: str = ""
+    mcp_server_name: str = ""
+    kiro_tool_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -78,6 +82,7 @@ class PromptOutcome:
     response: str
     usage: dict[str, int]
     raw_result: dict[str, Any] = field(default_factory=dict)
+    resolved_model: str = ""
 
 
 def _pairs_to_dict(items: Any) -> dict[str, str]:
@@ -205,38 +210,268 @@ def build_agy_args(
     return args
 
 
+def load_kiro_agent_mcp_servers(
+    agent_name: str | None = None,
+    *,
+    cwd: str | None = None,
+    include_home: bool = True,
+) -> list[dict[str, Any]]:
+    """Load `mcpServers` definitions from `<cwd>/.kiro/agents/<agent>.json` or `~/.kiro/agents`."""
+    candidates: list[str] = []
+    if agent_name and agent_name not in {"auto", "approve", "read-only"}:
+        candidates.append(agent_name)
+    if "kirocrew" not in candidates:
+        candidates.append("kirocrew")
+
+    search_dirs: list[Path] = []
+    if cwd:
+        search_dirs.append(Path(cwd) / ".kiro" / "agents")
+    if include_home:
+        with contextlib.suppress(RuntimeError, OSError):
+            search_dirs.append(Path.home() / ".kiro" / "agents")
+
+    servers_by_name: dict[str, dict[str, Any]] = {}
+    for cand in candidates:
+        for agents_dir in search_dirs:
+            spec_path = agents_dir / f"{cand}.json"
+            if not spec_path.is_file():
+                continue
+            with contextlib.suppress(OSError, json.JSONDecodeError):
+                raw_spec = json.loads(spec_path.read_text(encoding="utf-8"))
+                if not isinstance(raw_spec, dict):
+                    continue
+                raw_mcp = raw_spec.get("mcpServers")
+                if isinstance(raw_mcp, dict):
+                    for srv_name, srv_cfg in raw_mcp.items():
+                        if (
+                            isinstance(srv_name, str)
+                            and srv_name
+                            and isinstance(srv_cfg, dict)
+                            and not srv_cfg.get("disabled")
+                            and srv_name not in servers_by_name
+                        ):
+                            servers_by_name[srv_name] = {"name": srv_name, **srv_cfg}
+                elif isinstance(raw_mcp, list):
+                    for item in raw_mcp:
+                        if isinstance(item, dict) and item.get("name"):
+                            sname = str(item["name"])
+                            if sname not in servers_by_name:
+                                servers_by_name[sname] = dict(item)
+    return list(servers_by_name.values())
+
+
+def _resolve_kiro_tool_identity(
+    step_type: str,
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> tuple[str, str, str]:
+    """Resolve `(kiro_tool_name, mcp_server_name, kiro_tool_id)` for ACP `_meta.kiro`."""
+    raw_name = (tool_name or step_type).strip()
+    lower_name = raw_name.lower()
+
+    if lower_name == "call_mcp_tool" or ("ServerName" in arguments and "ToolName" in arguments):
+        server = str(
+            arguments.get("ServerName")
+            or arguments.get("server_name")
+            or arguments.get("server")
+            or ""
+        ).strip()
+        tool = str(
+            arguments.get("ToolName") or arguments.get("tool_name") or arguments.get("tool") or ""
+        ).strip()
+        if server and tool:
+            return tool, server, f"@{server}/{tool}"
+
+    if raw_name.startswith("mcp__"):
+        rest = raw_name[len("mcp__") :]
+        server, sep, tool = rest.rpartition("__")
+        if sep and server and tool:
+            return tool, server, f"@{server}/{tool}"
+    elif raw_name.startswith("mcp_"):
+        rest = raw_name[len("mcp_") :]
+        server, sep, tool = rest.partition("_")
+        if sep and server and tool:
+            return tool, server, f"@{server}/{tool}"
+
+    if any(
+        k in lower_name
+        for k in ("run_command", "command_execution", "send_command_input", "bash", "exec", "shell")
+    ):
+        return "execute_bash", "", "run_command"
+    if any(
+        k in lower_name
+        for k in (
+            "view_file",
+            "read_file",
+            "view_code",
+            "list_dir",
+            "list_resources",
+            "read_resource",
+            "read_browser",
+        )
+    ):
+        return "fs_read", "", "read_file"
+    if any(
+        k in lower_name
+        for k in (
+            "code_action",
+            "edit_file",
+            "write_file",
+            "write_to_file",
+            "replace",
+            "sed_file",
+            "notebook_edit",
+        )
+    ):
+        return "fs_write", "", "fs_write"
+    if "grep" in lower_name:
+        return "grep", "", "grep_search"
+    if any(k in lower_name for k in ("find_by_name", "file_search", "glob", "find")):
+        return "glob", "", "file_search"
+    if any(k in lower_name for k in ("search_web", "web_search", "remote_web_search")):
+        return "web_search", "", "remote_web_search"
+    if any(k in lower_name for k in ("read_url", "web_fetch")):
+        return "web_fetch", "", "web_fetch"
+    if any(
+        k in lower_name
+        for k in (
+            "invoke_subagent",
+            "define_subagent",
+            "manage_subagents",
+            "send_message",
+            "use_subagent",
+        )
+    ):
+        return "use_subagent", "", "invoke_sub_agent"
+    if any(k in lower_name for k in ("todo_list", "task_boundary")):
+        return "todo_list", "", "todo_list"
+    if "command" in arguments or "CommandLine" in arguments:
+        return "execute_bash", "", "run_command"
+
+    fallback = lower_name or "tool"
+    return fallback, "", fallback
+
+
+def _normalize_tool_arguments(
+    arguments: dict[str, Any],
+    *,
+    tool_name: str = "",
+) -> dict[str, Any]:
+    """Normalize `agy` tool argument keys to ACP/KiroCrew standard keys (`command`, `path`)."""
+    if tool_name.lower() == "call_mcp_tool" or (
+        "ServerName" in arguments and "ToolName" in arguments
+    ):
+        inner = arguments.get("Arguments")
+        if isinstance(inner, dict):
+            return dict(inner)
+
+    normalized = dict(arguments)
+    if "command" not in normalized:
+        for cmd_key in ("CommandLine", "cmd", "Command"):
+            val = normalized.get(cmd_key)
+            if isinstance(val, str) and val:
+                normalized["command"] = val
+                break
+    if "path" not in normalized:
+        for path_key in (
+            "Path",
+            "AbsolutePath",
+            "TargetFile",
+            "DirectoryPath",
+            "SearchPath",
+            "file_path",
+            "filePath",
+        ):
+            val = normalized.get(path_key)
+            if isinstance(val, str) and val:
+                normalized["path"] = val
+                break
+    if "description" not in normalized:
+        summary = normalized.get("toolSummary")
+        if isinstance(summary, str) and summary.strip():
+            normalized["description"] = summary.strip()
+    return normalized
+
+
 def _classify_tool_step(
     step_type: str,
     tool_name: str,
     arguments: dict[str, Any],
 ) -> tuple[str, str, list[dict[str, Any]]]:
     """Map an `agy` step/tool name and arguments to ACP `(kind, title, locations)`."""
+    kiro_tool, mcp_server, _ = _resolve_kiro_tool_identity(step_type, tool_name, arguments)
+    if mcp_server and kiro_tool:
+        title = (
+            "spawn_run"
+            if (mcp_server == "kirocrew-core" and kiro_tool == "spawn_run")
+            else f"@{mcp_server}/{kiro_tool}"
+        )
+        return "other", title, []
+
     normalized = (tool_name or step_type).lower()
     path_val = str(
         arguments.get("path")
         or arguments.get("Path")
+        or arguments.get("AbsolutePath")
         or arguments.get("file_path")
         or arguments.get("TargetFile")
+        or arguments.get("DirectoryPath")
+        or arguments.get("SearchPath")
         or ""
     )
     locations = [{"path": path_val}] if path_val else []
 
-    if any(k in normalized for k in ("view_file", "read_file", "view_code", "read_resource")):
+    if any(
+        k in normalized
+        for k in (
+            "view_file",
+            "read_file",
+            "view_code",
+            "read_resource",
+            "read_url",
+            "read_browser",
+        )
+    ):
         title = f"Viewing {path_val}" if path_val else f"Reading ({tool_name or step_type})"
         return "read", title, locations
-    if any(k in normalized for k in ("code_action", "edit_file", "write_file", "replace")):
+    if any(
+        k in normalized
+        for k in (
+            "code_action",
+            "edit_file",
+            "write_file",
+            "write_to_file",
+            "replace",
+            "sed_file",
+            "notebook_edit",
+        )
+    ):
         title = f"Editing {path_val}" if path_val else f"Editing ({tool_name or step_type})"
         return "edit", title, locations
     if any(k in normalized for k in ("grep", "find", "list_dir", "search")):
-        query = str(arguments.get("query") or arguments.get("Query") or path_val or "")
+        query = str(
+            arguments.get("query")
+            or arguments.get("Query")
+            or arguments.get("Pattern")
+            or path_val
+            or ""
+        )
         title = f"Searching {query}" if query else f"Searching ({tool_name or step_type})"
         return "search", title, locations
-    if any(k in normalized for k in ("run_command", "command", "bash", "exec", "shell")):
+    if any(
+        k in normalized
+        for k in ("run_command", "command_execution", "send_command_input", "bash", "exec", "shell")
+    ):
         cmd = str(arguments.get("command") or arguments.get("CommandLine") or "")
         short_cmd = cmd[:80] if cmd else (tool_name or step_type or "Execute command")
         title = f"Running `{short_cmd}`" if cmd else "Execute command"
         return "execute", title, locations
-    return "execute", tool_name or step_type or "Execute command", locations
+    if "command" in arguments or "CommandLine" in arguments:
+        cmd = str(arguments.get("command") or arguments.get("CommandLine") or "")
+        short_cmd = cmd[:80] if cmd else (tool_name or step_type or "Execute command")
+        title = f"Running `{short_cmd}`" if cmd else "Execute command"
+        return "execute", title, locations
+    return "other", tool_name or step_type or "Tool call", locations
 
 
 class AgyCliProvider:
@@ -248,11 +483,76 @@ class AgyCliProvider:
         bin_path: str | Path | None = None,
         save_dir: Path | None = None,
         state_store: SqliteStateStoreProvider | None = None,
+        mcp_config_path: Path | None = None,
     ) -> None:
         self._explicit_bin = bin_path
         self._store = state_store or SqliteStateStoreProvider(save_dir)
+        default_state_dir = Path.home() / ".config" / "agy-acp"
+        self._is_custom_store = self._store.db_path.parent != default_state_dir
+        if mcp_config_path is not None:
+            self._mcp_config_path = Path(mcp_config_path)
+        elif save_dir is not None:
+            self._mcp_config_path = Path(save_dir) / "mcp_config.json"
+        elif self._is_custom_store:
+            self._mcp_config_path = self._store.db_path.parent / "mcp_config.json"
+        else:
+            env_mcp = os.environ.get("AGY_MCP_CONFIG_PATH")
+            self._mcp_config_path = (
+                Path(env_mcp)
+                if env_mcp
+                else (Path.home() / ".gemini" / "config" / "mcp_config.json")
+            )
         self._active_processes: dict[str, anyio.abc.Process] = {}
         self._cancelled_sessions: set[str] = set()
+
+    def sync_mcp_servers(self, mcp_servers: list[dict[str, Any]]) -> list[str]:
+        """Synchronize MCP server configurations into `agy`'s `mcp_config.json`."""
+        if not mcp_servers:
+            return []
+        existing_data: dict[str, Any] = {}
+        if self._mcp_config_path.is_file():
+            with contextlib.suppress(OSError, json.JSONDecodeError):
+                loaded = json.loads(self._mcp_config_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    existing_data = loaded
+        servers_map = existing_data.get("mcpServers")
+        if not isinstance(servers_map, dict):
+            servers_map = {}
+            existing_data["mcpServers"] = servers_map
+
+        synced: list[str] = []
+        changed = False
+        for srv in mcp_servers:
+            translated = translate_mcp_server(srv)
+            name = str(translated.get("name") or "").strip()
+            if not name:
+                continue
+            entry: dict[str, Any] = {}
+            if translated.get("transport") == "http" or translated.get("url"):
+                entry["serverUrl"] = str(translated.get("url") or "")
+                if isinstance(translated.get("headers"), dict) and translated["headers"]:
+                    entry["headers"] = dict(translated["headers"])
+            else:
+                cmd = str(translated.get("command") or "")
+                if not cmd:
+                    continue
+                entry["command"] = cmd
+                entry["args"] = [str(a) for a in translated.get("args", [])]
+                if isinstance(translated.get("env"), dict) and translated["env"]:
+                    entry["env"] = {str(k): str(v) for k, v in translated["env"].items()}
+            if servers_map.get(name) != entry:
+                servers_map[name] = entry
+                changed = True
+            synced.append(name)
+
+        if changed:
+            with contextlib.suppress(OSError):
+                self._mcp_config_path.parent.mkdir(parents=True, exist_ok=True)
+                self._mcp_config_path.write_text(
+                    json.dumps(existing_data, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+        return synced
 
     @property
     def state_store(self) -> SqliteStateStoreProvider:
@@ -366,11 +666,21 @@ class AgyCliProvider:
         sid = session_id or str(uuid.uuid4())
         existing = (self._store.get_session(sid) if session_id is not None else None) or {}
 
-        translated_mcp = (
-            [translate_mcp_server(srv) for srv in mcp_servers]
-            if mcp_servers is not None
-            else [translate_mcp_server(srv) for srv in existing.get("mcp_servers", [])]
+        raw_mcp = (
+            list(mcp_servers) if mcp_servers is not None else list(existing.get("mcp_servers", []))
         )
+        agent_name = str(
+            (auth_config or {}).get("kiro_agent") or os.environ.get("AGY_KIRO_AGENT") or "kirocrew"
+        )
+        agent_mcp = load_kiro_agent_mcp_servers(
+            agent_name,
+            cwd=cwd,
+            include_home=not self._is_custom_store,
+        )
+        combined_mcp = [*agent_mcp, *raw_mcp]
+        translated_mcp = [translate_mcp_server(srv) for srv in combined_mcp]
+        if translated_mcp:
+            self.sync_mcp_servers(translated_mcp)
         state: dict[str, Any] = {
             "sessionId": sid,
             "agyConversationId": existing.get("agyConversationId"),
@@ -448,7 +758,9 @@ class AgyCliProvider:
         effective_cwd = cwd if cwd and Path(cwd).is_dir() else None
 
         resolved_conv_id = conversation_id or ""
+        resolved_model = model or ""
         emitted_thoughts_by_step: dict[int, int] = {}
+
         emitted_texts_by_step: dict[int, int] = {}
         active_tool_calls: dict[int, str] = {}
         rejected_tool_steps: set[int] = set()
@@ -507,6 +819,7 @@ class AgyCliProvider:
                     step_type
                     and step_type.lower()
                     not in {
+                        "agent_response",
                         "planner_response",
                         "user_input",
                         "thinking",
@@ -526,7 +839,11 @@ class AgyCliProvider:
                 elif isinstance(step.get("arguments"), dict):
                     raw_args = dict(step["arguments"])
 
+                kiro_tool_name, mcp_server_name, kiro_tool_id = _resolve_kiro_tool_identity(
+                    step_type, tool_name, raw_args
+                )
                 kind, title, locations = _classify_tool_step(step_type, tool_name, raw_args)
+                raw_args = _normalize_tool_arguments(raw_args, tool_name=tool_name)
                 is_done = any(
                     tok in status_raw for tok in ("DONE", "COMPLETED", "SUCCESS", "ERROR", "FAILED")
                 )
@@ -542,9 +859,13 @@ class AgyCliProvider:
                         title=title,
                         kind=kind,
                         status="in_progress",
-                        raw_input=raw_args or {"command": prompt},
+                        raw_input=raw_args or ({"command": prompt} if kind == "execute" else {}),
                         locations=locations,
+                        kiro_tool_name=kiro_tool_name,
+                        mcp_server_name=mcp_server_name,
+                        kiro_tool_id=kiro_tool_id,
                     )
+
                     allowed = True
                     if on_tool_call is not None:
                         allowed = await on_tool_call(start_event)
@@ -560,6 +881,9 @@ class AgyCliProvider:
                                     raw_input=raw_args,
                                     output="Tool execution rejected by user.",
                                     locations=locations,
+                                    kiro_tool_name=kiro_tool_name,
+                                    mcp_server_name=mcp_server_name,
+                                    kiro_tool_id=kiro_tool_id,
                                 )
                             )
                         return
@@ -585,6 +909,9 @@ class AgyCliProvider:
                                 raw_input=raw_args,
                                 output=tool_output,
                                 locations=locations,
+                                kiro_tool_name=kiro_tool_name,
+                                mcp_server_name=mcp_server_name,
+                                kiro_tool_id=kiro_tool_id,
                             )
                         )
 
@@ -606,7 +933,7 @@ class AgyCliProvider:
                         await on_text(delta)
 
         async def _consume_stdout(proc: anyio.abc.Process) -> None:
-            nonlocal resolved_conv_id, final_result_obj, streamed_any_text
+            nonlocal resolved_conv_id, resolved_model, final_result_obj, streamed_any_text
             if proc.stdout is None:
                 return
             buffer = ""
@@ -628,10 +955,14 @@ class AgyCliProvider:
                     event_type = str(payload.get("event", ""))
                     if event_type == "init" or "init" in payload:
                         init_obj = payload.get("init")
-                        if isinstance(init_obj, dict) and init_obj.get("conversation_id"):
-                            resolved_conv_id = str(init_obj["conversation_id"])
-                        elif payload.get("conversation_id"):
+                        if isinstance(init_obj, dict):
+                            if init_obj.get("conversation_id"):
+                                resolved_conv_id = str(init_obj["conversation_id"])
+                            if init_obj.get("model"):
+                                resolved_model = str(init_obj["model"])
+                        if not resolved_conv_id and payload.get("conversation_id"):
                             resolved_conv_id = str(payload["conversation_id"])
+
                     elif event_type == "step_update" or "step_update" in payload:
                         step_obj = payload.get("step_update")
                         await _handle_step_update(
@@ -680,6 +1011,14 @@ class AgyCliProvider:
 
         proc: anyio.abc.Process | None = None
         try:
+            log_acp_event(
+                "agy.spawn",
+                save_dir_or_db=self._store.db_path,
+                session_id=sid,
+                bin_path=self.bin_path,
+                args=args,
+                cwd=effective_cwd,
+            )
             proc = await anyio.open_process(
                 [self.bin_path, *args],
                 cwd=effective_cwd,
@@ -691,6 +1030,15 @@ class AgyCliProvider:
                     tg.start_soon(_consume_stdout, proc)
                     tg.start_soon(_consume_stderr, proc)
                 await proc.wait()
+            log_acp_event(
+                "agy.exit",
+                save_dir_or_db=self._store.db_path,
+                session_id=sid,
+                returncode=proc.returncode,
+                stderr="".join(stderr_chunks).strip(),
+                result_status=final_result_obj.get("status"),
+                result_error=final_result_obj.get("error"),
+            )
         except anyio.get_cancelled_exc_class():
             if proc is not None and proc.returncode is None:
                 with contextlib.suppress(ProcessLookupError, OSError):
@@ -715,6 +1063,36 @@ class AgyCliProvider:
                 response="".join(collected_texts),
                 usage=usage,
                 raw_result=final_result_obj,
+            )
+
+        err_msg = str(final_result_obj.get("error", ""))
+        if (
+            model
+            and str(final_result_obj.get("status", "")).upper() == "ERROR"
+            and "invalid model" in err_msg.lower()
+        ):
+            log_acp_event(
+                "agy.model_fallback",
+                save_dir_or_db=self._store.db_path,
+                session_id=sid,
+                rejected_model=model,
+                error=err_msg,
+            )
+            return await self.stream_prompt(
+                cwd=cwd,
+                prompt=prompt,
+                session_id=session_id,
+                conversation_id=conversation_id,
+                model=None,
+                mode=mode,
+                effort=effort,
+                skip_permissions=skip_permissions,
+                sandbox=sandbox,
+                env=env,
+                on_thought=on_thought,
+                on_text=on_text,
+                on_tool_call=on_tool_call,
+                on_tool_update=on_tool_update,
             )
 
         if not streamed_any_text and plain_stdout_lines:
@@ -742,4 +1120,5 @@ class AgyCliProvider:
             response=full_response,
             usage=usage,
             raw_result=final_result_obj,
+            resolved_model=resolved_model,
         )

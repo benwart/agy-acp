@@ -161,3 +161,33 @@ async def test_terminate_and_delete_session(tmp_path: Path) -> None:
     assert mgr.list_sessions(cwd=str(tmp_path)) == []
     with pytest.raises(KeyError, match=sid):
         mgr.get_session(sid)
+
+
+async def test_session_manager_kirocrew_spawn_agent_and_agent_modes(tmp_path: Path) -> None:
+    """Verify SessionManager advertises spawn --agent and kirocrew agent modes for Guard A/A2."""
+    agents_dir = tmp_path / ".kiro" / "agents"
+    agents_dir.mkdir(parents=True)
+    agent_path = agents_dir / "custom-reviewer.json"
+    agent_path.write_text('{"name": "custom-reviewer"}', encoding="utf-8")
+
+    mgr = SessionManager(
+        save_dir=tmp_path,
+        default_agent="kirocrew-skill-view-9608729a",
+        default_model="gemini-4-argon-medium",
+    )
+    desc = await mgr.create_session(cwd=str(tmp_path))
+    assert desc["modes"]["currentModeId"] == "kirocrew-skill-view-9608729a"
+    assert desc["models"]["currentModelId"] == "gemini-4-argon-medium"
+    mode_ids = {m["id"] for m in desc["modes"]["availableModes"]}
+    assert "kirocrew-skill-view-9608729a" in mode_ids
+    assert "kirocrew" in mode_ids
+    assert "kirocrew-lite" in mode_ids
+    assert "custom-reviewer" in mode_ids
+
+    sid = desc["sessionId"]
+    assert await mgr.set_mode(session_id=sid, mode_id="kirocrew-lite") == {}
+    loaded = await mgr.load_session(session_id=sid, cwd=str(tmp_path))
+    assert loaded["modes"]["currentModeId"] == "kirocrew-lite"
+
+    assert await mgr.set_mode(session_id=sid, mode_id="custom-reviewer") == {}
+    assert mgr.get_session(sid)["agent"] == "custom-reviewer"

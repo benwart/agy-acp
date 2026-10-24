@@ -13,6 +13,7 @@ from agy_acp import __version__
 from agy_acp.logic.auth_manager import AuthManager
 from agy_acp.logic.quota_tracker import QuotaTracker
 from agy_acp.logic.session_manager import DEFAULT_MODEL_ID, SessionManager
+from agy_acp.providers.acp_logger import log_acp_event
 from agy_acp.providers.agy_cli_provider import ToolCallEvent
 
 MAX_FRAME_SIZE_BYTES = 16 * 1024 * 1024
@@ -58,6 +59,12 @@ class AcpDispatcher:
 
     async def _emit_notification(self, notification: dict[str, Any]) -> None:
         """Emit a JSON-RPC 2.0 notification to the configured sink if present."""
+        log_acp_event(
+            "rpc.notification",
+            save_dir_or_db=self._session_manager.state_store.db_path,
+            method=notification.get("method"),
+            params=notification.get("params"),
+        )
         if self._notification_sink is not None:
             await self._notification_sink(notification)
 
@@ -86,6 +93,25 @@ class AcpDispatcher:
             if isinstance(block, dict) and block.get("type") == "text"
         ]
         return "\n".join(part for part in parts if part).strip()
+
+    @staticmethod
+    def _extract_slash_command(prompt_text: str) -> str:
+        """Extract a slash command (`/quota`, `/usage`, `/credits`) from an ACP prompt."""
+        if not prompt_text:
+            return ""
+        marker = "[CURRENT USER REQUEST"
+        idx = prompt_text.rfind(marker)
+        if idx != -1:
+            close_bracket = prompt_text.find("]", idx)
+            if close_bracket != -1:
+                tail = prompt_text[close_bracket + 1 :].strip()
+                first_line = tail.splitlines()[0].strip().lower() if tail else ""
+                if first_line in SLASH_QUOTA_COMMANDS:
+                    return first_line
+        last_line = prompt_text.splitlines()[-1].strip().lower()
+        if last_line in SLASH_QUOTA_COMMANDS:
+            return last_line
+        return ""
 
     @staticmethod
     def _cancelled_prompt_response(message_id: Any) -> dict[str, Any]:
@@ -129,7 +155,7 @@ class AcpDispatcher:
             [b for b in raw_prompt if isinstance(b, dict)] if isinstance(raw_prompt, list) else []
         )
         prompt_text = self._extract_prompt_text(prompt_blocks)
-        slash_cmd = prompt_text.splitlines()[-1].strip().lower() if prompt_text else ""
+        slash_cmd = self._extract_slash_command(prompt_text)
 
         if slash_cmd in SLASH_QUOTA_COMMANDS:
             thought_text = f"Querying quota report for {slash_cmd}..."
@@ -216,12 +242,24 @@ class AcpDispatcher:
             )
 
         async def _on_tool_call(event: ToolCallEvent) -> bool:
+            kiro_tool_name = event.kiro_tool_name or (
+                "execute_bash" if event.kind == "execute" else event.title
+            )
+            mcp_server_name = event.mcp_server_name
+            kiro_tool_id = event.kiro_tool_id or (
+                "run_command" if event.kind == "execute" else kiro_tool_name
+            )
+            kiro_meta = {
+                "toolName": kiro_tool_name,
+                "mcpServerName": mcp_server_name,
+            }
             tool_descriptor: dict[str, Any] = {
                 "toolCallId": event.tool_call_id,
                 "title": event.title,
                 "kind": event.kind,
                 "status": "in_progress",
                 "rawInput": event.raw_input,
+                "_meta": {"kiro": kiro_meta},
             }
             if event.locations:
                 tool_descriptor["locations"] = event.locations
@@ -247,6 +285,7 @@ class AcpDispatcher:
                 {
                     "sessionId": session_id,
                     "toolCall": tool_descriptor,
+                    "_meta": {"kiro": {"toolId": kiro_tool_id}},
                     "options": [
                         {
                             "optionId": "allow_once",
@@ -272,6 +311,10 @@ class AcpDispatcher:
 
         async def _on_tool_update(event: ToolCallEvent) -> None:
             allowed = event.status != "failed"
+            kiro_tool_name = event.kiro_tool_name or (
+                "execute_bash" if event.kind == "execute" else event.title
+            )
+            mcp_server_name = event.mcp_server_name
             await self._emit_notification(
                 {
                     "jsonrpc": "2.0",
@@ -290,6 +333,12 @@ class AcpDispatcher:
                                 }
                             ],
                             "rawOutput": {"output": event.output, "allowed": allowed},
+                            "_meta": {
+                                "kiro": {
+                                    "toolName": kiro_tool_name,
+                                    "mcpServerName": mcp_server_name,
+                                }
+                            },
                         },
                     },
                 }
@@ -475,6 +524,89 @@ class AcpDispatcher:
             "result": res,
         }
 
+    async def _handle_commands_execute(
+        self,
+        message_id: Any,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Handle `_kiro.dev/commands/execute` for `/quota`, `/usage`, `/effort`, `/mcp`."""
+        session_id = str(params.get("sessionId", ""))
+        raw_cmd = params.get("command")
+        cmd_name = ""
+        cmd_args: dict[str, Any] = {}
+        if isinstance(raw_cmd, dict):
+            cmd_name = str(raw_cmd.get("command", "")).strip().lstrip("/").lower()
+            raw_args = raw_cmd.get("args")
+            if isinstance(raw_args, dict):
+                cmd_args = dict(raw_args)
+        elif isinstance(raw_cmd, str):
+            parts = raw_cmd.strip().split(None, 1)
+            cmd_name = parts[0].lstrip("/").lower() if parts else ""
+            if len(parts) > 1:
+                cmd_args = {"value": parts[1]}
+
+        if cmd_name in {"quota", "usage", "credits"}:
+            md = await self._quota_tracker.format_slash_command_response(f"/{cmd_name}")
+            return {
+                "jsonrpc": "2.0",
+                "id": message_id,
+                "result": {
+                    "message": md,
+                    "text": md,
+                    "stopReason": "end_turn",
+                },
+            }
+        if cmd_name == "effort":
+            level = str(cmd_args.get("level") or cmd_args.get("value") or "medium").strip().lower()
+            if session_id:
+                try:
+                    await self._session_manager.set_config_option(
+                        session_id=session_id,
+                        config_id="reasoning_effort",
+                        value=level,
+                    )
+                except KeyError, ValueError:
+                    pass
+            msg = f"Reasoning effort set to {level}"
+            return {
+                "jsonrpc": "2.0",
+                "id": message_id,
+                "result": {
+                    "message": msg,
+                    "text": msg,
+                    "stopReason": "end_turn",
+                },
+            }
+        if cmd_name == "mcp":
+            return {
+                "jsonrpc": "2.0",
+                "id": message_id,
+                "result": {
+                    "message": "MCP servers",
+                    "data": {"servers": []},
+                    "stopReason": "end_turn",
+                },
+            }
+        if cmd_name == "tools":
+            return {
+                "jsonrpc": "2.0",
+                "id": message_id,
+                "result": {
+                    "message": "Tools",
+                    "data": {"tools": []},
+                    "stopReason": "end_turn",
+                },
+            }
+        return {
+            "jsonrpc": "2.0",
+            "id": message_id,
+            "result": {
+                "message": "",
+                "text": "",
+                "stopReason": "end_turn",
+            },
+        }
+
     async def _handle_session_set_config_option(
         self,
         message_id: Any,
@@ -522,10 +654,40 @@ class AcpDispatcher:
         await anyio.sleep(0)
         message: dict[str, Any] = json.loads(raw_line)
         method = message.get("method")
+        msg_id = message.get("id")
+        raw_params = message.get("params")
+        db_path = self._session_manager.state_store.db_path
+        log_acp_event(
+            "rpc.receive",
+            save_dir_or_db=db_path,
+            id=msg_id,
+            method=method,
+            params=raw_params,
+            raw_message=message,
+        )
+        response = await self._dispatch_method(method, msg_id, raw_params, message)
+        if response is not None:
+            log_acp_event(
+                "rpc.response",
+                save_dir_or_db=db_path,
+                id=msg_id,
+                method=method,
+                response=response,
+            )
+        return response
+
+    async def _dispatch_method(
+        self,
+        method: Any,
+        msg_id: Any,
+        raw_params: Any,
+        message: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Route a parsed JSON-RPC 2.0 method to its handler."""
         if method == "initialize":
             return {
                 "jsonrpc": "2.0",
-                "id": message.get("id"),
+                "id": msg_id,
                 "result": {
                     "protocolVersion": 1,
                     "agentCapabilities": {
@@ -548,19 +710,16 @@ class AcpDispatcher:
                 },
             }
         if method == "session/new":
-            params = message.get("params")
             return await self._handle_session_new(
-                message.get("id"),
-                params if isinstance(params, dict) else {},
+                msg_id,
+                raw_params if isinstance(raw_params, dict) else {},
             )
         if method in {"session/load", "session/resume"}:
-            params = message.get("params")
             return await self._handle_session_load(
-                message.get("id"),
-                params if isinstance(params, dict) else {},
+                msg_id,
+                raw_params if isinstance(raw_params, dict) else {},
             )
         if method == "session/list":
-            raw_params = message.get("params")
             params = raw_params if isinstance(raw_params, dict) else {}
             cwd_filter = params.get("cwd")
             sessions = self._session_manager.list_sessions(
@@ -568,7 +727,7 @@ class AcpDispatcher:
             )
             return {
                 "jsonrpc": "2.0",
-                "id": message.get("id"),
+                "id": msg_id,
                 "result": {
                     "sessions": [
                         {
@@ -582,37 +741,44 @@ class AcpDispatcher:
                 },
             }
         if method == "session/set_mode":
-            params = message.get("params")
             return await self._handle_session_set_mode(
-                message.get("id"),
-                params if isinstance(params, dict) else {},
+                msg_id,
+                raw_params if isinstance(raw_params, dict) else {},
             )
         if method == "session/set_model":
-            params = message.get("params")
             return await self._handle_session_set_model(
-                message.get("id"),
-                params if isinstance(params, dict) else {},
+                msg_id,
+                raw_params if isinstance(raw_params, dict) else {},
             )
         if method == "session/set_config_option":
-            params = message.get("params")
             return await self._handle_session_set_config_option(
-                message.get("id"),
-                params if isinstance(params, dict) else {},
+                msg_id,
+                raw_params if isinstance(raw_params, dict) else {},
+            )
+        if method == "_kiro.dev/commands/execute":
+            return await self._handle_commands_execute(
+                msg_id,
+                raw_params if isinstance(raw_params, dict) else {},
             )
         if method == "session/prompt":
-            params = message.get("params")
             return await self._handle_session_prompt(
-                message.get("id"),
-                params if isinstance(params, dict) else {},
+                msg_id,
+                raw_params if isinstance(raw_params, dict) else {},
             )
         if method == "session/cancel":
-            raw_params = message.get("params")
             params = raw_params if isinstance(raw_params, dict) else {}
             session_id = str(params.get("sessionId", ""))
             await self._session_manager.cancel(session_id=session_id)
             return None
+        if method in {"_session/steer", "_session/steering"}:
+            if msg_id is None:
+                return None
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {},
+            }
         if method in {"session/close", "_kiro.dev/session/terminate", "_kiro/session/delete"}:
-            raw_params = message.get("params")
             params = raw_params if isinstance(raw_params, dict) else {}
             session_id = str(params.get("sessionId", ""))
             res = await self._session_manager.close_session(
@@ -621,7 +787,15 @@ class AcpDispatcher:
             )
             return {
                 "jsonrpc": "2.0",
-                "id": message.get("id"),
+                "id": msg_id,
                 "result": res,
             }
+        log_acp_event(
+            "rpc.unhandled",
+            save_dir_or_db=self._session_manager.state_store.db_path,
+            id=msg_id,
+            method=method,
+            params=raw_params,
+            raw_message=message,
+        )
         return None

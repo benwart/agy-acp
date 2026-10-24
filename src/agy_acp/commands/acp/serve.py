@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import anyio
 
@@ -19,17 +20,31 @@ async def default(
     auth_method: str | None = None,
     auth_file: Path | None = None,
     save_dir: Path | None = None,
+    stdio: bool = False,
+    experimental_acp: bool = False,
+    verbose: bool = False,
+    debug: bool = False,
+    quiet: bool = False,
+    *extra_args: str,
+    **extra_kwargs: Any,
 ) -> int:
     """Run the ACP JSON-RPC 2.0 stdio harness for KiroCrew."""
     await anyio.sleep(0)
     return await serve_default(
-        profile=profile,
-        patch=patch,
-        agent=agent,
-        model=model,
-        with_builtin=with_builtin,
-        agent_engine=agent_engine,
-        auth_method=auth_method,
-        auth_file=auth_file,
-        save_dir=save_dir,
+        profile,
+        patch,
+        agent,
+        model,
+        with_builtin,
+        agent_engine,
+        auth_method,
+        auth_file,
+        save_dir,
+        stdio,
+        experimental_acp,
+        verbose,
+        debug,
+        quiet,
+        *extra_args,
+        **extra_kwargs,
     )
