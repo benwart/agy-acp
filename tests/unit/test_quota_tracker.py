@@ -27,13 +27,24 @@ def test_five_hour_bucket_calculation() -> None:
     assert filtered["buckets"][0]["group"] == "Gemini Models"
 
 
-@pytest.mark.not_implemented
 def test_seven_day_bucket_calculation() -> None:
     """Verify QuotaTracker.get_seven_day_quota returns 7d bucket structure."""
     tracker = QuotaTracker()
     res = tracker.get_seven_day_quota()
     assert res["window"] == "7d"
-    assert len(res["buckets"]) >= 1
+    assert len(res["buckets"]) >= 2
+    first = res["buckets"][0]
+    assert first["id"] == "gemini-weekly"
+    assert first["group"] == "Gemini Models"
+    assert first["window"] == "7d"
+    assert first["remaining_fraction"] == 0.39
+    assert first["remaining_percent"] == 39.0
+    assert first["used_percent"] == 61.0
+    assert "reset_time" in first
+
+    filtered = tracker.get_seven_day_quota(group="Gemini Models")
+    assert len(filtered["buckets"]) == 1
+    assert filtered["buckets"][0]["group"] == "Gemini Models"
 
 
 @pytest.mark.not_implemented

@@ -54,7 +54,12 @@ class QuotaTracker:
 
     def get_seven_day_quota(self, *, group: str | None = None) -> dict[str, Any]:
         """Return 7-day (weekly) rolling quota buckets and reset times."""
-        return {"window": "", "buckets": []}
+        buckets = [
+            self._format_bucket(bucket, window="7d")
+            for bucket in self._extract_raw_buckets(group=group)
+            if bucket.get("window") in {"weekly", "7d"}
+        ]
+        return {"window": "7d", "buckets": buckets}
 
     def get_credits_and_tokens(self) -> dict[str, Any]:
         """Return G1 credit balance and cumulative session token ledger."""
