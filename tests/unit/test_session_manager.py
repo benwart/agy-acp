@@ -20,7 +20,6 @@ async def test_create_session_maps_mcp_and_cwd(tmp_path: Path) -> None:
     assert "configOptions" in desc
 
 
-@pytest.mark.not_implemented
 async def test_load_session_resumes_trajectory(tmp_path: Path) -> None:
     """Verify SessionManager.load_session restores an existing sessionId."""
     mgr = SessionManager(save_dir=tmp_path)

@@ -63,15 +63,30 @@ class AntigravitySdkProvider:
         """Spawn or resume a `google.antigravity.Agent` and return its conversation_id."""
         await anyio.sleep(0)
         sid = session_id or str(uuid.uuid4())
-        translated_mcp = [_translate_mcp_server(srv) for srv in (mcp_servers or [])]
+        existing: dict[str, Any] = {}
+        if session_id is not None:
+            if session_id in self._agents:
+                existing = self._agents[session_id]
+            elif self._save_dir is not None:
+                persisted_file = self._save_dir / f"{session_id}.json"
+                if persisted_file.is_file():
+                    loaded = json.loads(persisted_file.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        existing = loaded
+
+        translated_mcp = (
+            [_translate_mcp_server(srv) for srv in mcp_servers]
+            if mcp_servers is not None
+            else [_translate_mcp_server(srv) for srv in existing.get("mcp_servers", [])]
+        )
         state: dict[str, Any] = {
             "sessionId": sid,
             "cwd": cwd,
             "mcp_servers": translated_mcp,
-            "model": model or "gemini-3.7-pro",
+            "model": model or str(existing.get("model", "gemini-3.7-pro")),
             "mode": mode,
             "reasoning_effort": reasoning_effort,
-            "auth_config": auth_config or {},
+            "auth_config": auth_config or dict(existing.get("auth_config", {})),
         }
         self._agents[sid] = state
         if self._save_dir is not None:
