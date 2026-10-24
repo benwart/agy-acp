@@ -10,7 +10,6 @@ import pytest
 from tests.integration.conftest import CliResult, HarnessFactory
 
 
-@pytest.mark.not_implemented
 def test_req_quota_001_cli_five_hour_quota(
     run_cli: Callable[[list[str]], CliResult],
 ) -> None:
@@ -26,7 +25,6 @@ def test_req_quota_001_cli_five_hour_quota(
     assert "reset_time" in first
 
 
-@pytest.mark.not_implemented
 def test_req_quota_002_cli_seven_day_quota(
     run_cli: Callable[[list[str]], CliResult],
 ) -> None:
@@ -42,7 +40,6 @@ def test_req_quota_002_cli_seven_day_quota(
     assert "reset_time" in first
 
 
-@pytest.mark.not_implemented
 def test_req_quota_003_cli_credits_and_combined_status(
     run_cli: Callable[[list[str]], CliResult],
 ) -> None:
