@@ -140,7 +140,6 @@ async def test_req_acp_005_session_load_resumes_existing_session(
     assert load_resp["result"]["sessionId"] == session_id
 
 
-@pytest.mark.not_implemented
 async def test_req_acp_006_multiplexed_concurrent_sessions(
     acp_harness_factory: HarnessFactory,
     tmp_path: Path,
