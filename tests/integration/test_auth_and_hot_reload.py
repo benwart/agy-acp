@@ -36,7 +36,6 @@ def test_req_auth_001_cli_login_persists_credentials(
     assert (auth_file.stat().st_mode & 0o777) == 0o600
 
 
-@pytest.mark.not_implemented
 def test_req_auth_002_cli_logout_clears_credentials(
     run_cli: Callable[[list[str]], CliResult],
     tmp_path: Path,
