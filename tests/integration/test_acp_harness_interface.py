@@ -10,7 +10,6 @@ import pytest
 from tests.integration.conftest import HarnessFactory
 
 
-@pytest.mark.not_implemented
 async def test_req_acp_001_stdio_framing_and_stdout_purity(
     acp_harness_factory: HarnessFactory,
 ) -> None:
