@@ -201,12 +201,31 @@ def render_rich_quota_status(
 
     credits = data.get("credits", {})
     tokens = data.get("token_usage", {})
+    kiro_credits = credits.get("kiro_credits")
+    if not isinstance(kiro_credits, dict):
+        kiro_credits = QuotaTracker.calculate_effective_kiro_credits(
+            data.get("five_hour", {}).get("buckets", []),
+            data.get("seven_day", {}).get("buckets", []),
+            g1_overage_credits=int(credits.get("remaining_credits", 0)),
+        )
+    bottleneck_reset = format_reset_time(str(kiro_credits.get("reset_time", "")), now=now)
     active_console.print()
     active_console.print(
         Text.assemble(
-            ("Remaining Credits: ", "bold"),
-            (f"{credits.get('remaining_credits', 0)}", "cyan"),
-            (f" (Total Tokens: {tokens.get('total_tokens', 0)})", "dim"),
+            ("Effective Kiro Credits: ", "bold"),
+            (
+                f"{kiro_credits['effective_credits']:.1f} / {kiro_credits['credit_capacity']:.0f}",
+                "cyan",
+            ),
+            (
+                f" ({kiro_credits['bottleneck_window']} bottleneck, resets {bottleneck_reset})",
+                "dim",
+            ),
+            (
+                f" | G1 Overage: {credits.get('remaining_credits', 0)}"
+                f" | Total Tokens: {tokens.get('total_tokens', 0)}",
+                "dim",
+            ),
         )
     )
 

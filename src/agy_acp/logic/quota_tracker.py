@@ -12,6 +12,8 @@ class QuotaTracker:
     """Aggregates 5-hour (`5h`) and 7-day (`7d`) quota buckets, credits, and token usage."""
 
     CONTEXT_WINDOW_SIZE: int = 1_000_000
+    WEEKLY_CREDIT_CAPACITY: float = 1_000.0
+    FIVE_HOUR_CREDIT_CAPACITY: float = 200.0
 
     def __init__(
         self,
@@ -87,12 +89,18 @@ class QuotaTracker:
                 raw_buckets.append({**candidate, "group": bucket_group})
         return raw_buckets
 
-    @staticmethod
-    def _format_bucket(raw_bucket: dict[str, Any], *, window: str) -> dict[str, Any]:
-        """Enrich a raw quota bucket with remaining and used percentages."""
+    @classmethod
+    def _format_bucket(cls, raw_bucket: dict[str, Any], *, window: str) -> dict[str, Any]:
+        """Enrich a raw quota bucket with remaining/used percentages and Kiro credit equivalents."""
         remaining_fraction = float(raw_bucket["remaining_fraction"])
         remaining_percent = round(remaining_fraction * 100.0, 2)
         used_percent = round((1.0 - remaining_fraction) * 100.0, 2)
+        credit_capacity = (
+            cls.WEEKLY_CREDIT_CAPACITY
+            if window in {"7d", "weekly"}
+            else cls.FIVE_HOUR_CREDIT_CAPACITY
+        )
+        remaining_credits = round(remaining_fraction * credit_capacity, 2)
         return {
             "id": raw_bucket["id"],
             "group": raw_bucket["group"],
@@ -101,7 +109,88 @@ class QuotaTracker:
             "remaining_fraction": remaining_fraction,
             "remaining_percent": remaining_percent,
             "used_percent": used_percent,
+            "credit_capacity": credit_capacity,
+            "remaining_credits": remaining_credits,
             "reset_time": raw_bucket["reset_time"],
+        }
+
+    @classmethod
+    def calculate_effective_kiro_credits(
+        cls,
+        five_hour_buckets: list[dict[str, Any]],
+        seven_day_buckets: list[dict[str, Any]],
+        *,
+        model_id: str | None = None,
+        g1_overage_credits: int = 0,
+    ) -> dict[str, Any]:
+        """Convert 7d (1000) and 5h (200) quotas to Kiro credits, picking min and its reset."""
+        prefer_gemini = model_id is None or "gemini" in model_id.lower()
+
+        def _pick_group_bucket(buckets: list[dict[str, Any]]) -> dict[str, Any] | None:
+            for bucket in buckets:
+                is_gemini = "gemini" in str(bucket.get("group", "")).lower()
+                if is_gemini == prefer_gemini:
+                    return bucket
+            return buckets[0] if buckets else None
+
+        bucket_5h = _pick_group_bucket(five_hour_buckets)
+        bucket_7d = _pick_group_bucket(seven_day_buckets)
+
+        credits_5h = (
+            float(
+                bucket_5h.get(
+                    "remaining_credits",
+                    float(bucket_5h.get("remaining_fraction", 0.0)) * cls.FIVE_HOUR_CREDIT_CAPACITY,
+                )
+            )
+            if bucket_5h is not None
+            else None
+        )
+        credits_7d = (
+            float(
+                bucket_7d.get(
+                    "remaining_credits",
+                    float(bucket_7d.get("remaining_fraction", 0.0)) * cls.WEEKLY_CREDIT_CAPACITY,
+                )
+            )
+            if bucket_7d is not None
+            else None
+        )
+
+        if (
+            bucket_7d is not None
+            and credits_7d is not None
+            and (credits_5h is None or credits_7d <= credits_5h)
+        ):
+            bottleneck_window = "7d"
+            quota_credits = round(credits_7d, 2)
+            base_capacity = cls.WEEKLY_CREDIT_CAPACITY
+            reset_time = str(bucket_7d.get("reset_time", ""))
+            active_group = str(bucket_7d.get("group", ""))
+        elif bucket_5h is not None and credits_5h is not None:
+            bottleneck_window = "5h"
+            quota_credits = round(credits_5h, 2)
+            base_capacity = cls.FIVE_HOUR_CREDIT_CAPACITY
+            reset_time = str(bucket_5h.get("reset_time", ""))
+            active_group = str(bucket_5h.get("group", ""))
+        else:
+            bottleneck_window = "5h"
+            quota_credits = 0.0
+            base_capacity = cls.FIVE_HOUR_CREDIT_CAPACITY
+            reset_time = ""
+            active_group = "Gemini Models" if prefer_gemini else "Claude and GPT models"
+
+        effective_credits = round(quota_credits + float(g1_overage_credits), 2)
+        return {
+            "effective_credits": effective_credits,
+            "quota_credits": quota_credits,
+            "g1_overage_credits": g1_overage_credits,
+            "credit_capacity": round(base_capacity + float(g1_overage_credits), 2),
+            "bottleneck_window": bottleneck_window,
+            "group": active_group,
+            "reset_time": reset_time,
+            "five_hour_credits": round(credits_5h, 2) if credits_5h is not None else 0.0,
+            "seven_day_credits": round(credits_7d, 2) if credits_7d is not None else 0.0,
         }
 
     async def get_five_hour_quota(self, *, group: str | None = None) -> dict[str, Any]:
@@ -122,12 +211,22 @@ class QuotaTracker:
         ]
         return {"window": "7d", "buckets": buckets}
 
-    async def get_credits_and_tokens(self) -> dict[str, Any]:
-        """Return G1 credit balance and cumulative session token ledger."""
+    async def get_credits_and_tokens(self, *, group: str | None = None) -> dict[str, Any]:
+        """Return G1 credit balance, converted Kiro quota credits, and session token ledger."""
         credits = await self._provider.fetch_credits()
+        five_hour = await self.get_five_hour_quota(group=group)
+        seven_day = await self.get_seven_day_quota(group=group)
+        g1_overage = int(credits.get("remaining_credits", 0))
+        kiro_credits = self.calculate_effective_kiro_credits(
+            five_hour["buckets"],
+            seven_day["buckets"],
+            model_id=group,
+            g1_overage_credits=g1_overage,
+        )
         return {
-            "remaining_credits": credits.get("remaining_credits", 0),
+            "remaining_credits": g1_overage,
             "upgrade_uri": credits.get("upgrade_uri"),
+            "kiro_credits": kiro_credits,
             "token_usage": {
                 "input_tokens": self.input_tokens,
                 "output_tokens": self.output_tokens,
@@ -139,12 +238,30 @@ class QuotaTracker:
 
     async def get_unified_status(self, *, group: str | None = None) -> dict[str, Any]:
         """Return combined 5-hour, 7-day, credit, and token usage snapshot."""
-        credits_and_tokens = await self.get_credits_and_tokens()
+        five_hour = await self.get_five_hour_quota(group=group)
+        seven_day = await self.get_seven_day_quota(group=group)
+        raw_credits = await self._provider.fetch_credits()
+        g1_overage = int(raw_credits.get("remaining_credits", 0))
+        kiro_credits = self.calculate_effective_kiro_credits(
+            five_hour["buckets"],
+            seven_day["buckets"],
+            model_id=group,
+            g1_overage_credits=g1_overage,
+        )
         return {
-            "five_hour": await self.get_five_hour_quota(group=group),
-            "seven_day": await self.get_seven_day_quota(group=group),
-            "credits": await self._provider.fetch_credits(),
-            "token_usage": credits_and_tokens["token_usage"],
+            "five_hour": five_hour,
+            "seven_day": seven_day,
+            "credits": {
+                **raw_credits,
+                "kiro_credits": kiro_credits,
+            },
+            "token_usage": {
+                "input_tokens": self.input_tokens,
+                "output_tokens": self.output_tokens,
+                "cached_read_tokens": self.cached_read_tokens,
+                "thinking_tokens": self.thinking_tokens,
+                "total_tokens": self.total_tokens,
+            },
         }
 
     async def build_kirocrew_wire_updates(
@@ -167,7 +284,13 @@ class QuotaTracker:
         five_hour = await self.get_five_hour_quota()
         seven_day = await self.get_seven_day_quota()
         credits_info = await self._provider.fetch_credits()
-        remaining_credits = credits_info.get("remaining_credits", 0)
+        g1_overage = int(credits_info.get("remaining_credits", 0))
+        kiro_credits = self.calculate_effective_kiro_credits(
+            five_hour["buckets"],
+            seven_day["buckets"],
+            model_id=model_id,
+            g1_overage_credits=g1_overage,
+        )
         context_usage_pct = round((self._total_tokens / self.CONTEXT_WINDOW_SIZE) * 100.0, 4)
 
         notifications: list[dict[str, Any]] = [
@@ -191,12 +314,18 @@ class QuotaTracker:
                     "sessionId": session_id,
                     "contextUsagePercentage": context_usage_pct,
                     "contextWindowSize": self.CONTEXT_WINDOW_SIZE,
-                    "credits": remaining_credits,
+                    "credits": kiro_credits["effective_credits"],
+                    "quotaCredits": kiro_credits["quota_credits"],
+                    "creditsCapacity": kiro_credits["credit_capacity"],
+                    "creditsBottleneckWindow": kiro_credits["bottleneck_window"],
+                    "creditsResetTime": kiro_credits["reset_time"],
+                    "g1OverageCredits": g1_overage,
                     "modelId": model_id,
                     "_meta": {
                         "quota": {
                             "five_hour": five_hour,
                             "seven_day": seven_day,
+                            "kiro_credits": kiro_credits,
                         }
                     },
                 },

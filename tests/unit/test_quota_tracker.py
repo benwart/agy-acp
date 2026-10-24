@@ -378,3 +378,77 @@ async def test_rich_status_progress_bars_colors_grouping_and_trend() -> None:
     assert "resets in 2h 30m" in rendered
     assert "2026-10-27T12:00:00Z" not in rendered
     assert "2026-10-24T14:30:00Z" not in rendered
+
+
+async def test_kiro_credit_conversion_picks_min_of_7d_and_5h_with_matching_reset() -> None:
+    """Verify Option 1 credit conversion (7d=1000, 5h=200) picks min credits and its reset_time."""
+    tracker = _make_tracker()
+
+    # In _StubAgyCliProvider for Gemini:
+    # 5h: 0.95 * 200 = 190.0 credits (resets 2026-10-24T07:52:04Z)
+    # 7d: 0.39 * 1000 = 390.0 credits (resets 2026-10-24T12:34:28Z)
+    # G1 overage: 1000 credits
+    # Bottleneck is 5h (190.0 < 390.0) -> quota_credits=190.0, reset_time=5h reset_time
+    five_hour = await tracker.get_five_hour_quota()
+    seven_day = await tracker.get_seven_day_quota()
+    eff_5h = tracker.calculate_effective_kiro_credits(
+        five_hour["buckets"],
+        seven_day["buckets"],
+        model_id="gemini-3.7-pro",
+        g1_overage_credits=0,
+    )
+    assert eff_5h["five_hour_credits"] == 190.0
+    assert eff_5h["seven_day_credits"] == 390.0
+    assert eff_5h["bottleneck_window"] == "5h"
+    assert eff_5h["quota_credits"] == 190.0
+    assert eff_5h["effective_credits"] == 190.0
+    assert eff_5h["reset_time"] == "2026-10-24T07:52:04Z"
+
+    # Now test when 7d is the bottleneck: 7d = 0.05 * 1000 = 50.0 vs 5h = 0.80 * 200 = 160.0
+    eff_7d = tracker.calculate_effective_kiro_credits(
+        [
+            {
+                "id": "gemini-5h",
+                "group": "Gemini Models",
+                "name": "Five Hour Limit Remaining",
+                "window": "5h",
+                "remaining_fraction": 0.80,
+                "remaining_credits": 160.0,
+                "credit_capacity": 200.0,
+                "reset_time": "2026-10-24T14:30:00Z",
+            }
+        ],
+        [
+            {
+                "id": "gemini-weekly",
+                "group": "Gemini Models",
+                "name": "Weekly Limit Remaining",
+                "window": "7d",
+                "remaining_fraction": 0.05,
+                "remaining_credits": 50.0,
+                "credit_capacity": 1000.0,
+                "reset_time": "2026-10-27T12:00:00Z",
+            }
+        ],
+        model_id="gemini-3.7-pro",
+        g1_overage_credits=25,
+    )
+    assert eff_7d["five_hour_credits"] == 160.0
+    assert eff_7d["seven_day_credits"] == 50.0
+    assert eff_7d["bottleneck_window"] == "7d"
+    assert eff_7d["quota_credits"] == 50.0
+    assert eff_7d["effective_credits"] == 75.0
+    assert eff_7d["reset_time"] == "2026-10-27T12:00:00Z"
+
+    # Verify _kiro.dev/metadata wire payload includes creditsResetTime and converted credits
+    updates = await tracker.build_kirocrew_wire_updates(
+        session_id="s" * 36,
+        model_id="gemini-3.7-pro",
+        input_tokens=100,
+        output_tokens=50,
+    )
+    meta_params = updates[1]["params"]
+    assert meta_params["credits"] == 1190.0  # 190.0 quota_credits + 1000 G1 overage in stub
+    assert meta_params["quotaCredits"] == 190.0
+    assert meta_params["creditsBottleneckWindow"] == "5h"
+    assert meta_params["creditsResetTime"] == "2026-10-24T07:52:04Z"
