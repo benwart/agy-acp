@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import os
+from collections.abc import Generator
 from pathlib import Path
 from typing import Any
 
@@ -128,6 +130,8 @@ class SessionManager:
         self._save_dir = save_dir
         self._sdk = sdk_provider or AntigravitySdkProvider(save_dir=save_dir)
         self._sessions: dict[str, dict[str, Any]] = {}
+        self._cancelled_sessions: set[str] = set()
+        self._cancel_scopes: dict[str, anyio.CancelScope] = {}
 
     def _persist_session(self, sid: str, state: dict[str, Any]) -> None:
         """Persist session state to `self._save_dir` when configured."""
@@ -314,9 +318,58 @@ class SessionManager:
         """Execute or steer a streaming turn (`session/prompt`)."""
         return {}
 
+    def is_cancelled(self, session_id: str) -> bool:
+        """Return whether `session_id` has a pending cancellation."""
+        if session_id in self._cancelled_sessions:
+            return True
+        session = self._sessions.get(session_id)
+        return bool(session and session.get("cancelled", False))
+
+    def consume_cancellation(self, session_id: str) -> bool:
+        """Clear and return whether `session_id` was marked cancelled."""
+        was_cancelled = self.is_cancelled(session_id)
+        self._cancelled_sessions.discard(session_id)
+        session = self._sessions.get(session_id)
+        if session is not None and session.get("cancelled", False):
+            session["cancelled"] = False
+            self._persist_session(session_id, session)
+        return was_cancelled
+
+    def register_cancel_scope(self, session_id: str, scope: anyio.CancelScope) -> None:
+        """Register an active `anyio.CancelScope` for `session_id`."""
+        self._cancel_scopes[session_id] = scope
+
+    def unregister_cancel_scope(
+        self,
+        session_id: str,
+        scope: anyio.CancelScope | None = None,
+    ) -> None:
+        """Unregister the active `anyio.CancelScope` for `session_id`."""
+        current = self._cancel_scopes.get(session_id)
+        if current is not None and (scope is None or current is scope):
+            self._cancel_scopes.pop(session_id, None)
+
+    @contextlib.contextmanager
+    def turn_cancel_scope(self, session_id: str) -> Generator[anyio.CancelScope]:
+        """Context manager registering an `anyio.CancelScope` for an active turn."""
+        with anyio.CancelScope() as scope:
+            self.register_cancel_scope(session_id, scope)
+            try:
+                yield scope
+            finally:
+                self.unregister_cancel_scope(session_id, scope)
+
     async def cancel(self, *, session_id: str) -> bool:
         """Cancel an in-flight prompt turn (`session/cancel`)."""
-        return False
+        await anyio.sleep(0)
+        self._cancelled_sessions.add(session_id)
+        if session_id in self._sessions:
+            self._sessions[session_id]["cancelled"] = True
+            self._persist_session(session_id, self._sessions[session_id])
+        scope = self._cancel_scopes.get(session_id)
+        if scope is not None:
+            scope.cancel()
+        return True
 
     async def close_session(self, *, session_id: str) -> dict[str, Any]:
         """Close and clean up an active session (`session/close`, `terminate`, `delete`)."""

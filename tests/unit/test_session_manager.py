@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import anyio
 import pytest
 
 from agy_acp.logic.session_manager import SessionManager
@@ -85,13 +86,40 @@ async def test_update_session_mode_and_model(tmp_path: Path) -> None:
         await mgr.set_mode(session_id=sid, mode_id="invalid")
 
 
-@pytest.mark.not_implemented
 async def test_cancel_and_steer_active_turn(tmp_path: Path) -> None:
-    """Verify SessionManager.cancel stops an active turn."""
+    """Verify SessionManager.cancel stops an active turn and tracks cancellation."""
     mgr = SessionManager(save_dir=tmp_path)
     s1 = await mgr.create_session(cwd=str(tmp_path))
-    cancelled = await mgr.cancel(session_id=s1["sessionId"])
+    sid = s1["sessionId"]
+
+    assert mgr.is_cancelled(sid) is False
+    cancelled = await mgr.cancel(session_id=sid)
     assert cancelled is True
+    assert mgr.is_cancelled(sid) is True
+    assert mgr.get_session(sid)["cancelled"] is True
+
+    assert mgr.consume_cancellation(sid) is True
+    assert mgr.is_cancelled(sid) is False
+    assert mgr.get_session(sid)["cancelled"] is False
+    assert mgr.consume_cancellation(sid) is False
+
+    scope_cancelled = False
+    turn_started = anyio.Event()
+
+    async def _run_active_turn() -> None:
+        nonlocal scope_cancelled
+        with mgr.turn_cancel_scope(sid) as scope:
+            turn_started.set()
+            await anyio.sleep(10)
+        scope_cancelled = scope.cancel_called
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(_run_active_turn)
+        await turn_started.wait()
+        assert await mgr.cancel(session_id=sid) is True
+
+    assert scope_cancelled is True
+    assert mgr.is_cancelled(sid) is True
 
 
 @pytest.mark.not_implemented
