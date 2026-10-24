@@ -522,4 +522,17 @@ class AcpDispatcher:
                 message.get("id"),
                 params if isinstance(params, dict) else {},
             )
+        if method in {"session/close", "_kiro.dev/session/terminate", "_kiro/session/delete"}:
+            raw_params = message.get("params")
+            params = raw_params if isinstance(raw_params, dict) else {}
+            session_id = str(params.get("sessionId", ""))
+            res = await self._session_manager.close_session(
+                session_id=session_id,
+                delete_persisted=(method == "_kiro/session/delete"),
+            )
+            return {
+                "jsonrpc": "2.0",
+                "id": message.get("id"),
+                "result": res,
+            }
         return None
