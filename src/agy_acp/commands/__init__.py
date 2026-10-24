@@ -6,13 +6,41 @@ import ast
 import importlib
 import importlib.util
 import inspect
+from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
+import anyio
 from cyclopts import App
+
+__all__ = ["AnyioApp", "register_commands"]
 
 COMMANDS_DIR = Path(__file__).resolve().parent
 DEFAULT_PACKAGE = __name__
+
+
+class AnyioApp(App):
+    """Cyclopts App subclass that executes commands via anyio."""
+
+    def __call__(
+        self,
+        tokens: None | str | Iterable[str] = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Execute command via anyio.run, using a worker thread if an event loop is active."""
+
+        async def _runner() -> Any:
+            return await self.run_async(tokens, **kwargs)
+
+        try:
+            anyio.current_effective_deadline()
+        except RuntimeError:
+            return anyio.run(_runner)
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            return executor.submit(anyio.run, _runner).result()
 
 
 def _is_ignored_entry(entry: Path) -> bool:
@@ -73,9 +101,9 @@ def register_commands(
         elif entry.is_dir():
             group_help = _read_group_docstring(entry)
             group_app = (
-                App(name=entry.name, help=group_help)
+                AnyioApp(name=entry.name, help=group_help)
                 if group_help is not None
-                else App(name=entry.name)
+                else AnyioApp(name=entry.name)
             )
             sub_prefix = (
                 f"{active_prefix}.{entry.name}"

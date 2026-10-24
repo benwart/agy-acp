@@ -9,6 +9,7 @@ description = "Google Antigravity SDK wrapper exposing an Agent Client Protocol 
 readme = "README.md"
 requires-python = ">=3.15"
 dependencies = [
+    "anyio>=4.0.0",
     "cyclopts>=3.0.0",
     "google-antigravity>=0.1.22",
     "zensical",
