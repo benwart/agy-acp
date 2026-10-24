@@ -96,15 +96,21 @@ async def test_prompt_streams_chunks_and_usage() -> None:
     assert any("Antigravity Quota & Usage (`/quota`)" in chunk for chunk in message_chunks)
 
 
-@pytest.mark.not_implemented
 async def test_tool_permission_request_allow_and_reject() -> None:
     """Verify AcpDispatcher issues session/request_permission via client_rpc_caller."""
+    emitted: list[dict[str, Any]] = []
+    rpc_calls: list[tuple[str, dict[str, Any]]] = []
+    selected_option = "allow_once"
+
+    async def _sink(msg: dict[str, Any]) -> None:
+        emitted.append(msg)
 
     async def _caller(method: str, params: dict[str, object]) -> dict[str, object]:
         assert method == "session/request_permission"
-        return {"outcome": {"outcome": "selected", "optionId": "allow_once"}}
+        rpc_calls.append((method, dict(params)))
+        return {"outcome": {"outcome": "selected", "optionId": selected_option}}
 
-    dispatcher = AcpDispatcher(client_rpc_caller=_caller)
+    dispatcher = AcpDispatcher(notification_sink=_sink, client_rpc_caller=_caller)
     resp = await dispatcher.handle_message(
         json.dumps(
             {
@@ -116,3 +122,41 @@ async def test_tool_permission_request_allow_and_reject() -> None:
         )
     )
     assert resp is not None
+    assert len(rpc_calls) == 1
+    assert rpc_calls[0][0] == "session/request_permission"
+    option_ids = [opt["optionId"] for opt in rpc_calls[0][1]["options"]]
+    assert option_ids == ["allow_once", "allow_always", "reject_once"]
+
+    updates = [n["params"]["update"] for n in emitted if n.get("method") == "session/update"]
+    tool_calls = [u for u in updates if u.get("sessionUpdate") == "tool_call"]
+    tool_updates = [u for u in updates if u.get("sessionUpdate") == "tool_call_update"]
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["status"] == "in_progress"
+    assert tool_calls[0]["kind"] == "execute"
+    assert len(tool_updates) == 1
+    assert tool_updates[0]["status"] == "completed"
+    assert tool_updates[0]["toolCallId"] == tool_calls[0]["toolCallId"]
+
+    emitted.clear()
+    rpc_calls.clear()
+    selected_option = "reject_once"
+    resp_reject = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "session/prompt",
+                "params": {"sessionId": "s" * 36, "prompt": [{"type": "text", "text": "tool"}]},
+            }
+        )
+    )
+    assert resp_reject is not None
+    assert len(rpc_calls) == 1
+    reject_updates = [
+        n["params"]["update"]
+        for n in emitted
+        if n.get("method") == "session/update"
+        and n["params"]["update"].get("sessionUpdate") == "tool_call_update"
+    ]
+    assert len(reject_updates) == 1
+    assert reject_updates[0]["status"] == "failed"
