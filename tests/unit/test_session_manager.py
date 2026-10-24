@@ -9,7 +9,6 @@ import pytest
 from agy_acp.logic.session_manager import SessionManager
 
 
-@pytest.mark.not_implemented
 async def test_create_session_maps_mcp_and_cwd(tmp_path: Path) -> None:
     """Verify SessionManager.create_session returns valid sessionId and configOptions."""
     mgr = SessionManager(save_dir=tmp_path)
