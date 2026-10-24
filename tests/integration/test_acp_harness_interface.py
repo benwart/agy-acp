@@ -117,7 +117,6 @@ async def test_req_acp_004_session_new_mcp_and_config_options(
     assert {"model", "mode", "reasoning_effort"}.issubset(option_ids)
 
 
-@pytest.mark.not_implemented
 async def test_req_acp_005_session_load_resumes_existing_session(
     acp_harness_factory: HarnessFactory,
     tmp_path: Path,

@@ -279,6 +279,22 @@ class AcpDispatcher:
             },
         }
 
+    async def _emit_available_commands_update(self, session_id: str) -> None:
+        """Emit the `available_commands_update` notification for a session."""
+        await self._emit_notification(
+            {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "available_commands_update",
+                        "availableCommands": list(AVAILABLE_SLASH_COMMANDS),
+                    },
+                },
+            }
+        )
+
     async def _handle_session_new(
         self,
         message_id: Any,
@@ -297,19 +313,41 @@ class AcpDispatcher:
             mcp_servers=mcp_servers,
             meta=meta,
         )
-        await self._emit_notification(
-            {
+        await self._emit_available_commands_update(desc["sessionId"])
+        return {
+            "jsonrpc": "2.0",
+            "id": message_id,
+            "result": desc,
+        }
+
+    async def _handle_session_load(
+        self,
+        message_id: Any,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Handle `session/load`, restoring a session and emitting available slash commands."""
+        session_id = str(params.get("sessionId", ""))
+        cwd = str(params.get("cwd", ""))
+        raw_mcp = params.get("mcpServers")
+        mcp_servers: list[dict[str, Any]] | None = (
+            [s for s in raw_mcp if isinstance(s, dict)] if isinstance(raw_mcp, list) else None
+        )
+        try:
+            desc = await self._session_manager.load_session(
+                session_id=session_id,
+                cwd=cwd,
+                mcp_servers=mcp_servers,
+            )
+        except KeyError as exc:
+            return {
                 "jsonrpc": "2.0",
-                "method": "session/update",
-                "params": {
-                    "sessionId": desc["sessionId"],
-                    "update": {
-                        "sessionUpdate": "available_commands_update",
-                        "availableCommands": list(AVAILABLE_SLASH_COMMANDS),
-                    },
+                "id": message_id,
+                "error": {
+                    "code": -32002,
+                    "message": str(exc),
                 },
             }
-        )
+        await self._emit_available_commands_update(desc["sessionId"])
         return {
             "jsonrpc": "2.0",
             "id": message_id,
@@ -360,6 +398,12 @@ class AcpDispatcher:
         if method == "session/new":
             params = message.get("params")
             return await self._handle_session_new(
+                message.get("id"),
+                params if isinstance(params, dict) else {},
+            )
+        if method == "session/load":
+            params = message.get("params")
+            return await self._handle_session_load(
                 message.get("id"),
                 params if isinstance(params, dict) else {},
             )
