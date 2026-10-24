@@ -317,7 +317,17 @@ class SessionManager:
         prompt_blocks: list[dict[str, Any]],
     ) -> dict[str, Any]:
         """Execute or steer a streaming turn (`session/prompt`)."""
-        return {}
+        _ = prompt_blocks
+        if self.consume_cancellation(session_id):
+            return {"stopReason": "cancelled"}
+        with self.turn_cancel_scope(session_id) as scope:
+            if os.environ.get("AGY_ACP_FAKE_SDK") == "slow":
+                await anyio.sleep(0.2)
+            else:
+                await anyio.sleep(0)
+        if scope.cancel_called or self.consume_cancellation(session_id):
+            return {"stopReason": "cancelled"}
+        return {"stopReason": "end_turn"}
 
     def is_cancelled(self, session_id: str) -> bool:
         """Return whether `session_id` has a pending cancellation."""
