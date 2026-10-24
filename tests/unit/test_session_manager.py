@@ -122,10 +122,41 @@ async def test_cancel_and_steer_active_turn(tmp_path: Path) -> None:
     assert mgr.is_cancelled(sid) is True
 
 
-@pytest.mark.not_implemented
 async def test_terminate_and_delete_session(tmp_path: Path) -> None:
     """Verify SessionManager.close_session cleans up session state."""
     mgr = SessionManager(save_dir=tmp_path)
     s1 = await mgr.create_session(cwd=str(tmp_path))
-    res = await mgr.close_session(session_id=s1["sessionId"])
-    assert res == {}
+    sid = s1["sessionId"]
+    session_file = tmp_path / f"{sid}.json"
+    assert session_file.is_file()
+
+    await mgr.cancel(session_id=sid)
+    assert mgr.is_cancelled(sid) is True
+
+    scope_cancelled = False
+    turn_started = anyio.Event()
+
+    async def _run_active_turn() -> None:
+        nonlocal scope_cancelled
+        with mgr.turn_cancel_scope(sid) as scope:
+            turn_started.set()
+            await anyio.sleep(10)
+        scope_cancelled = scope.cancel_called
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(_run_active_turn)
+        await turn_started.wait()
+        res = await mgr.close_session(session_id=sid)
+        assert res == {}
+
+    assert scope_cancelled is True
+    assert sid not in mgr._sessions
+    assert sid not in mgr._cancelled_sessions
+    assert sid not in mgr._active_cancel_scopes
+    assert session_file.is_file()
+
+    del_res = await mgr.close_session(session_id=sid, delete_persisted=True)
+    assert del_res == {}
+    assert not session_file.exists()
+    with pytest.raises(KeyError, match=sid):
+        mgr.get_session(sid)

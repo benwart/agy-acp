@@ -132,6 +132,7 @@ class SessionManager:
         self._sessions: dict[str, dict[str, Any]] = {}
         self._cancelled_sessions: set[str] = set()
         self._cancel_scopes: dict[str, anyio.CancelScope] = {}
+        self._active_cancel_scopes: dict[str, anyio.CancelScope] = self._cancel_scopes
 
     def _persist_session(self, sid: str, state: dict[str, Any]) -> None:
         """Persist session state to `self._save_dir` when configured."""
@@ -371,6 +372,23 @@ class SessionManager:
             scope.cancel()
         return True
 
-    async def close_session(self, *, session_id: str) -> dict[str, Any]:
+    async def close_session(
+        self,
+        *,
+        session_id: str,
+        delete_persisted: bool = False,
+    ) -> dict[str, Any]:
         """Close and clean up an active session (`session/close`, `terminate`, `delete`)."""
-        return {"closed": False}
+        await anyio.sleep(0)
+        scope = self._active_cancel_scopes.pop(session_id, None) or self._cancel_scopes.pop(
+            session_id, None
+        )
+        if scope is not None:
+            scope.cancel()
+        self._sessions.pop(session_id, None)
+        self._cancelled_sessions.discard(session_id)
+        if delete_persisted and self._save_dir is not None:
+            session_file = self._save_dir / f"{session_id}.json"
+            if session_file.is_file():
+                session_file.unlink()
+        return {}
