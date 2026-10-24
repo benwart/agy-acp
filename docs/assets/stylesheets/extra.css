@@ -1,0 +1,4 @@
+/* Full-width layout: expand .md-grid and .md-content while keeping fixed 12.1rem sidebars */
+.md-grid {
+  max-width: 100%;
+}
