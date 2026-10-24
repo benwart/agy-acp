@@ -25,7 +25,6 @@ def test_req_quota_001_cli_five_hour_quota(
     assert "reset_time" in first
 
 
-@pytest.mark.not_implemented
 def test_req_quota_002_cli_seven_day_quota(
     run_cli: Callable[[list[str]], CliResult],
 ) -> None:
