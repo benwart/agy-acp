@@ -10,7 +10,6 @@ import pytest
 from tests.integration.conftest import CliResult, HarnessFactory
 
 
-@pytest.mark.not_implemented
 def test_req_quota_001_cli_five_hour_quota(
     run_cli: Callable[[list[str]], CliResult],
 ) -> None:
