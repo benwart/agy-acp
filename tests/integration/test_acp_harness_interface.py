@@ -184,7 +184,6 @@ async def test_req_acp_007_set_mode_model_and_config_options(
     assert "configOptions" in cfg_resp["result"]
 
 
-@pytest.mark.not_implemented
 async def test_req_acp_008_session_prompt_streaming_thoughts_and_text(
     acp_harness_factory: HarnessFactory,
     tmp_path: Path,
