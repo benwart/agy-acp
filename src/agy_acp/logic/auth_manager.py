@@ -180,6 +180,7 @@ class AuthManager:
             auth_file=self._auth_file,
         )
 
-    def has_changed_since(self, previous_fingerprint: str | None) -> bool | None:
+    def has_changed_since(self, previous_fingerprint: str | None) -> bool:
         """Return True if the on-disk credential store changed since previous_fingerprint."""
-        return None
+        current_fp = self.status().fingerprint
+        return current_fp != (previous_fingerprint or "")

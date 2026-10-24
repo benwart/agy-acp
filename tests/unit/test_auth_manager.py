@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from agy_acp.logic.auth_manager import AuthManager
 
 
@@ -36,7 +34,6 @@ def test_status_reflects_active_credential_state(tmp_path: Path) -> None:
     assert mgr.status().authenticated is False
 
 
-@pytest.mark.not_implemented
 def test_detects_external_credential_rotation(tmp_path: Path) -> None:
     """Verify AuthManager.has_changed_since detects external credential changes."""
     auth_file = tmp_path / "credentials.json"
