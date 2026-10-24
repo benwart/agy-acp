@@ -177,6 +177,23 @@ class AcpDispatcher:
         ]
         return "\n".join(part for part in parts if part).strip()
 
+    @staticmethod
+    def _cancelled_prompt_response(message_id: Any) -> dict[str, Any]:
+        """Build a JSON-RPC 2.0 `session/prompt` response with `stopReason == 'cancelled'`."""
+        return {
+            "jsonrpc": "2.0",
+            "id": message_id,
+            "result": {
+                "stopReason": "cancelled",
+                "usage": {
+                    "inputTokens": 0,
+                    "outputTokens": 0,
+                    "cachedReadTokens": 0,
+                    "cachedWriteTokens": 0,
+                },
+            },
+        }
+
     async def _handle_session_prompt(
         self,
         message_id: Any,
@@ -194,6 +211,9 @@ class AcpDispatcher:
             }
 
         session_id = str(params.get("sessionId", ""))
+        if self._session_manager.consume_cancellation(session_id):
+            return self._cancelled_prompt_response(message_id)
+
         raw_prompt = params.get("prompt")
         prompt_blocks: list[dict[str, Any]] = (
             [b for b in raw_prompt if isinstance(b, dict)] if isinstance(raw_prompt, list) else []
@@ -210,6 +230,9 @@ class AcpDispatcher:
         except KeyError:
             pass
 
+        if stop_reason == "cancelled" or self._session_manager.consume_cancellation(session_id):
+            return self._cancelled_prompt_response(message_id)
+
         prompt_text = self._extract_prompt_text(prompt_blocks)
         slash_cmd = prompt_text.splitlines()[-1].strip().lower() if prompt_text else ""
         if slash_cmd in SLASH_QUOTA_COMMANDS:
@@ -219,39 +242,43 @@ class AcpDispatcher:
             thought_text = "Processing prompt..."
             response_text = f"Processed: {prompt_text}" if prompt_text else "Ready."
 
-        await self._emit_notification(
-            {
-                "jsonrpc": "2.0",
-                "method": "session/update",
-                "params": {
-                    "sessionId": session_id,
-                    "update": {
-                        "sessionUpdate": "agent_thought_chunk",
-                        "content": {"type": "text", "text": thought_text},
+        with self._session_manager.turn_cancel_scope(session_id) as scope:
+            await self._emit_notification(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_thought_chunk",
+                            "content": {"type": "text", "text": thought_text},
+                        },
                     },
-                },
-            }
-        )
-        if slash_cmd not in SLASH_QUOTA_COMMANDS and self._should_execute_tool(
-            session_id, prompt_text
-        ):
-            await self._execute_tool_with_permission(
-                session_id=session_id,
-                prompt_text=prompt_text,
+                }
             )
-        await self._emit_notification(
-            {
-                "jsonrpc": "2.0",
-                "method": "session/update",
-                "params": {
-                    "sessionId": session_id,
-                    "update": {
-                        "sessionUpdate": "agent_message_chunk",
-                        "content": {"type": "text", "text": response_text},
+            if slash_cmd not in SLASH_QUOTA_COMMANDS and self._should_execute_tool(
+                session_id, prompt_text
+            ):
+                await self._execute_tool_with_permission(
+                    session_id=session_id,
+                    prompt_text=prompt_text,
+                )
+            await self._emit_notification(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": response_text},
+                        },
                     },
-                },
-            }
-        )
+                }
+            )
+
+        if scope.cancel_called or self._session_manager.consume_cancellation(session_id):
+            return self._cancelled_prompt_response(message_id)
 
         input_tokens = max(1, len(prompt_text.split())) if prompt_text else 1
         output_tokens = max(1, len(response_text.split()))
@@ -522,6 +549,12 @@ class AcpDispatcher:
                 message.get("id"),
                 params if isinstance(params, dict) else {},
             )
+        if method == "session/cancel":
+            raw_params = message.get("params")
+            params = raw_params if isinstance(raw_params, dict) else {}
+            session_id = str(params.get("sessionId", ""))
+            await self._session_manager.cancel(session_id=session_id)
+            return None
         if method in {"session/close", "_kiro.dev/session/terminate", "_kiro/session/delete"}:
             raw_params = message.get("params")
             params = raw_params if isinstance(raw_params, dict) else {}
