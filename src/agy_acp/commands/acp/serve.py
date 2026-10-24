@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import anyio
+
 from agy_acp.commands.serve import default as serve_default
 
 
-def default(
+async def default(
     profile: str = "acp",
     patch: Path | None = None,
     agent: str | None = None,
@@ -19,7 +21,8 @@ def default(
     save_dir: Path | None = None,
 ) -> int:
     """Run the ACP JSON-RPC 2.0 stdio harness for KiroCrew."""
-    return serve_default(
+    await anyio.sleep(0)
+    return await serve_default(
         profile=profile,
         patch=patch,
         agent=agent,
