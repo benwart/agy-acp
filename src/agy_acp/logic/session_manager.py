@@ -20,6 +20,10 @@ AVAILABLE_MODES: list[dict[str, str]] = [
     {"id": "approve", "name": "Approve"},
     {"id": "read-only", "name": "Read Only"},
 ]
+VALID_MODE_IDS: frozenset[str] = frozenset(m["id"] for m in AVAILABLE_MODES)
+REASONING_EFFORT_CONFIG_IDS: frozenset[str] = frozenset(
+    {"reasoning_effort", "thought_level", "thinkingLevel"}
+)
 
 AVAILABLE_MODELS: list[dict[str, str]] = [
     {
@@ -145,14 +149,34 @@ class SessionManager:
             return None
         return loaded
 
-    def get_session(self, session_id: str) -> dict[str, Any]:
-        """Return an isolated copy of the state for `session_id`."""
+    @staticmethod
+    def _build_config_options(
+        *,
+        model: str,
+        mode: str,
+        reasoning_effort: str,
+    ) -> list[dict[str, Any]]:
+        """Build ACP configOptions array for the given session state."""
+        return _build_config_options(
+            model=model,
+            mode=mode,
+            reasoning_effort=reasoning_effort,
+        )
+
+    def _require_session_mut(self, session_id: str) -> dict[str, Any]:
+        """Return mutable session state for `session_id`, loading from disk if needed."""
         state = self._sessions.get(session_id)
         if state is None:
             state = self._load_persisted_session(session_id)
+            if state is not None:
+                self._sessions[session_id] = state
         if state is None:
             raise KeyError(f"Session '{session_id}' not found")
-        return copy.deepcopy(state)
+        return state
+
+    def get_session(self, session_id: str) -> dict[str, Any]:
+        """Return an isolated copy of the state for `session_id`."""
+        return copy.deepcopy(self._require_session_mut(session_id))
 
     async def create_session(
         self,
@@ -238,11 +262,21 @@ class SessionManager:
 
     async def set_mode(self, *, session_id: str, mode_id: str) -> dict[str, Any]:
         """Update session approval mode or agent profile (`session/set_mode`)."""
-        return {"unimplemented": True}
+        await anyio.sleep(0)
+        if mode_id not in VALID_MODE_IDS:
+            raise ValueError(f"Mode '{mode_id}' not found")
+        session = self._require_session_mut(session_id)
+        session["mode"] = mode_id
+        self._persist_session(session_id, session)
+        return {}
 
     async def set_model(self, *, session_id: str, model_id: str) -> dict[str, Any]:
         """Update active model (`session/set_model`)."""
-        return {"unimplemented": True}
+        await anyio.sleep(0)
+        session = self._require_session_mut(session_id)
+        session["model"] = model_id
+        self._persist_session(session_id, session)
+        return {}
 
     async def set_config_option(
         self,
@@ -252,7 +286,24 @@ class SessionManager:
         value: str,
     ) -> dict[str, Any]:
         """Update session configuration option (`session/set_config_option`)."""
-        return {}
+        await anyio.sleep(0)
+        session = self._require_session_mut(session_id)
+        if config_id == "model":
+            session["model"] = value
+        elif config_id == "mode":
+            await self.set_mode(session_id=session_id, mode_id=value)
+        elif config_id in REASONING_EFFORT_CONFIG_IDS:
+            session["reasoning_effort"] = value
+        else:
+            raise ValueError(f"Config option '{config_id}' not found")
+        self._persist_session(session_id, session)
+        return {
+            "configOptions": self._build_config_options(
+                model=str(session.get("model", DEFAULT_MODEL_ID)),
+                mode=str(session.get("mode", "auto")),
+                reasoning_effort=str(session.get("reasoning_effort", DEFAULT_REASONING_EFFORT)),
+            )
+        }
 
     async def prompt(
         self,
