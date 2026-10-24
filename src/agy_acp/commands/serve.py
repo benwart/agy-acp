@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import io
 import json
 import sys
 from pathlib import Path
 
+import anyio
 
-def default(
+
+async def default(
     profile: str = "acp",
     patch: Path | None = None,
     agent: str | None = None,
@@ -19,8 +22,23 @@ def default(
     save_dir: Path | None = None,
 ) -> int:
     """Start the Agent Client Protocol (ACP) JSON-RPC 2.0 server over stdio."""
+    _ = (
+        profile,
+        patch,
+        agent,
+        model,
+        with_builtin,
+        agent_engine,
+        auth_method,
+        auth_file,
+        save_dir,
+    )
+    await anyio.sleep(0)
     while True:
-        raw_line = sys.stdin.readline()
+        try:
+            raw_line = sys.stdin.readline()
+        except io.UnsupportedOperation, OSError:
+            break
         if not raw_line:
             break
         line = raw_line.strip()
@@ -35,4 +53,4 @@ def default(
             }
             sys.stdout.write(json.dumps(reply) + "\n")
             sys.stdout.flush()
-    return 1
+    return 0
