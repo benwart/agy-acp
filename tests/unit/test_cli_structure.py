@@ -41,7 +41,6 @@ def test_acp_serve_accepts_kirocrew_flags(tmp_path: Path) -> None:
     assert rc == 0
 
 
-@pytest.mark.not_implemented
 def test_commands_hierarchy_and_docstrings(tmp_path: Path) -> None:
     """Verify hierarchical command registration and execution of docs build dry-run."""
     rc = int(
