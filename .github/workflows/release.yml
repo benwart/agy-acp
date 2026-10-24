@@ -1,0 +1,78 @@
+name: Semantic Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  verify:
+    name: Verify Implemented Pytest Suite & Linters
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --all-groups
+
+      - name: Run Ruff lint & format checks
+        run: |
+          uv run ruff check
+          uv run ruff format --check
+
+      - name: Run ty type checker
+        run: uv run ty check
+
+      - name: Run implemented pytest suite
+        run: uv run pytest -m "not not_implemented"
+
+  release:
+    name: Semantic Release
+    needs: verify
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Run semantic-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SR_DIR="$RUNNER_TEMP/semantic-release"
+          mkdir -p "$SR_DIR"
+          npm install --prefix "$SR_DIR" --no-save --no-audit --no-fund \
+            semantic-release@^25.0.0 \
+            @semantic-release/commit-analyzer@^13.0.0 \
+            @semantic-release/release-notes-generator@^14.0.0 \
+            @semantic-release/changelog@^7.0.0 \
+            @semantic-release/exec@^7.0.0 \
+            @semantic-release/git@^11.0.0 \
+            @semantic-release/github@^12.0.0 \
+            conventional-changelog-conventionalcommits@^9.0.0
+          NODE_PATH="$SR_DIR/node_modules" npx --prefix "$SR_DIR" semantic-release
