@@ -285,7 +285,6 @@ async def test_req_acp_010_session_cancel_and_mid_turn_steer(
     assert prompt_resp["result"]["stopReason"] == "cancelled"
 
 
-@pytest.mark.not_implemented
 async def test_req_acp_011_session_teardown_methods(
     acp_harness_factory: HarnessFactory,
     tmp_path: Path,
