@@ -21,7 +21,6 @@ def test_jsonrpc_frame_serialization() -> None:
         )
 
 
-@pytest.mark.not_implemented
 async def test_handle_initialize_capabilities() -> None:
     """Verify AcpDispatcher.handle_message responds to initialize with required capabilities."""
     dispatcher = AcpDispatcher()

@@ -6,6 +6,10 @@ import json
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+import anyio
+
+from agy_acp import __version__
+
 MAX_FRAME_SIZE_BYTES = 16 * 1024 * 1024
 
 NotificationSink = Callable[[dict[str, Any]], Awaitable[None]]
@@ -37,4 +41,32 @@ class AcpDispatcher:
 
     async def handle_message(self, raw_line: str) -> dict[str, Any] | None:
         """Parse and dispatch a single JSON-RPC 2.0 request or notification line."""
+        await anyio.sleep(0)
+        message: dict[str, Any] = json.loads(raw_line)
+        method = message.get("method")
+        if method == "initialize":
+            return {
+                "jsonrpc": "2.0",
+                "id": message.get("id"),
+                "result": {
+                    "protocolVersion": 1,
+                    "agentCapabilities": {
+                        "loadSession": True,
+                        "mcpCapabilities": {"http": True, "sse": False},
+                        "promptCapabilities": {"image": True, "embeddedContext": True},
+                        "sessionCapabilities": {
+                            "close": {},
+                            "fork": {},
+                            "list": {},
+                            "resume": {},
+                        },
+                    },
+                    "agentInfo": {
+                        "name": "agy-acp",
+                        "title": "Google Antigravity ACP Harness",
+                        "version": __version__,
+                    },
+                    "authMethods": [],
+                },
+            }
         return None
