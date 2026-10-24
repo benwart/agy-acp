@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import pytest
 
@@ -38,12 +39,11 @@ async def test_handle_initialize_capabilities() -> None:
     assert resp["result"]["agentCapabilities"]["loadSession"] is True
 
 
-@pytest.mark.not_implemented
 async def test_prompt_streams_chunks_and_usage() -> None:
     """Verify AcpDispatcher routes session/prompt and returns token usage."""
-    emitted: list[dict[str, object]] = []
+    emitted: list[dict[str, Any]] = []
 
-    async def _sink(msg: dict[str, object]) -> None:
+    async def _sink(msg: dict[str, Any]) -> None:
         emitted.append(msg)
 
     dispatcher = AcpDispatcher(notification_sink=_sink)
@@ -59,7 +59,41 @@ async def test_prompt_streams_chunks_and_usage() -> None:
     )
     assert resp is not None
     assert resp["result"]["stopReason"] == "end_turn"
+    assert resp["result"]["usage"]["inputTokens"] >= 1
+    assert resp["result"]["usage"]["outputTokens"] >= 1
+    assert resp["result"]["usage"]["cachedReadTokens"] == 0
+    assert resp["result"]["usage"]["cachedWriteTokens"] == 0
     assert len(emitted) > 0
+    update_kinds = [
+        n["params"]["update"]["sessionUpdate"]
+        for n in emitted
+        if n.get("method") == "session/update"
+    ]
+    assert "agent_thought_chunk" in update_kinds
+    assert "agent_message_chunk" in update_kinds
+    assert "usage_update" in update_kinds
+    assert any(n.get("method") == "_kiro.dev/metadata" for n in emitted)
+
+    emitted.clear()
+    quota_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "session/prompt",
+                "params": {"sessionId": "s" * 36, "prompt": [{"type": "text", "text": "/quota"}]},
+            }
+        )
+    )
+    assert quota_resp is not None
+    assert quota_resp["result"]["stopReason"] == "end_turn"
+    message_chunks = [
+        n["params"]["update"]["content"]["text"]
+        for n in emitted
+        if n.get("method") == "session/update"
+        and n["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
+    ]
+    assert any("Antigravity Quota & Usage (`/quota`)" in chunk for chunk in message_chunks)
 
 
 @pytest.mark.not_implemented
