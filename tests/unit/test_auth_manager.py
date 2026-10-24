@@ -29,7 +29,6 @@ def test_logout_increments_generation(tmp_path: Path) -> None:
     assert logged_out.generation == 2
 
 
-@pytest.mark.not_implemented
 def test_status_reflects_active_credential_state(tmp_path: Path) -> None:
     """Verify AuthManager.status reports current authentication state."""
     auth_file = tmp_path / "credentials.json"

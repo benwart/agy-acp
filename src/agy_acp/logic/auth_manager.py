@@ -17,7 +17,7 @@ from agy_acp.providers.credential_store import CredentialStoreProvider
 class AuthState:
     """Snapshot of current authentication state and fingerprint."""
 
-    authenticated: bool | None
+    authenticated: bool
     method: str | None
     identity: str | None
     project: str | None
@@ -25,6 +25,19 @@ class AuthState:
     generation: int
     fingerprint: str
     auth_file: Path
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize authentication state to a JSON-compatible dictionary."""
+        return {
+            "authenticated": self.authenticated,
+            "method": self.method,
+            "identity": self.identity,
+            "project": self.project,
+            "location": self.location,
+            "generation": self.generation,
+            "fingerprint": self.fingerprint,
+            "auth_file": str(self.auth_file),
+        }
 
 
 def _default_auth_file() -> Path:
@@ -47,6 +60,7 @@ class AuthManager:
     """Manages CLI login/logout/status and detects external credential updates for ACP sessions."""
 
     def __init__(self, *, auth_file: Path | None = None) -> None:
+        self._explicit_auth_file = auth_file is not None
         self._auth_file = Path(auth_file) if auth_file is not None else _default_auth_file()
         self._store = CredentialStoreProvider(self._auth_file)
 
@@ -129,8 +143,34 @@ class AuthManager:
 
     def status(self) -> AuthState:
         """Return current authentication state and credential fingerprint."""
+        record = self._store.read()
+        if "authenticated" in record:
+            return AuthState(
+                authenticated=bool(record["authenticated"]),
+                method=record.get("method"),
+                identity=record.get("identity"),
+                project=record.get("project"),
+                location=record.get("location"),
+                generation=int(record.get("generation", 0)),
+                fingerprint=str(record.get("fingerprint", "")),
+                auth_file=self._auth_file,
+            )
+
+        env_key = os.environ.get("GEMINI_API_KEY")
+        if not self._explicit_auth_file and "AGY_ACP_AUTH_FILE" not in os.environ and env_key:
+            return AuthState(
+                authenticated=True,
+                method="api_key",
+                identity="gemini-api-key",
+                project=None,
+                location=None,
+                generation=1,
+                fingerprint=_compute_fingerprint(f"env:{env_key}"),
+                auth_file=self._auth_file,
+            )
+
         return AuthState(
-            authenticated=None,
+            authenticated=False,
             method=None,
             identity=None,
             project=None,
