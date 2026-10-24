@@ -16,6 +16,7 @@ name = "agy-acp"
 version = "1.0.0"
 source = { editable = "." }
 dependencies = [
+    { name = "anyio" },
     { name = "cyclopts" },
     { name = "google-antigravity" },
     { name = "zensical" },
@@ -31,6 +32,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", specifier = ">=4.0.0" },
     { name = "cyclopts", specifier = ">=3.0.0" },
     { name = "google-antigravity", specifier = ">=0.1.22" },
     { name = "zensical" },

@@ -4,14 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from cyclopts import App
-
 from agy_acp import __version__
-from agy_acp.commands import register_commands
+from agy_acp.commands import AnyioApp, register_commands
 
 __all__ = ["app", "main"]
 
-app = App(
+app = AnyioApp(
     name="agy-acp",
     help="Google Antigravity SDK wrapper exposing an ACP server for KiroCrew.",
     version=__version__,
