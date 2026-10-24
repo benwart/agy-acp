@@ -17,6 +17,20 @@ from agy_acp.logic.session_manager import DEFAULT_MODEL_ID, SessionManager
 
 MAX_FRAME_SIZE_BYTES = 16 * 1024 * 1024
 SLASH_QUOTA_COMMANDS = frozenset({"/quota", "/usage", "/credits"})
+AVAILABLE_SLASH_COMMANDS: list[dict[str, str]] = [
+    {
+        "name": "quota",
+        "description": "Display 5h and 7d rolling quota remaining percentages and reset times",
+    },
+    {
+        "name": "usage",
+        "description": "Display session token usage and quota summary",
+    },
+    {
+        "name": "credits",
+        "description": "Display remaining Antigravity G1 credits",
+    },
+]
 
 NotificationSink = Callable[[dict[str, Any]], Awaitable[None]]
 ClientRpcCaller = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
@@ -265,6 +279,172 @@ class AcpDispatcher:
             },
         }
 
+    async def _emit_available_commands_update(self, session_id: str) -> None:
+        """Emit the `available_commands_update` notification for a session."""
+        await self._emit_notification(
+            {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "available_commands_update",
+                        "availableCommands": list(AVAILABLE_SLASH_COMMANDS),
+                    },
+                },
+            }
+        )
+
+    async def _handle_session_new(
+        self,
+        message_id: Any,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Handle `session/new`, creating a session and emitting available slash commands."""
+        cwd = str(params.get("cwd", ""))
+        raw_mcp = params.get("mcpServers")
+        mcp_servers: list[dict[str, Any]] | None = (
+            [s for s in raw_mcp if isinstance(s, dict)] if isinstance(raw_mcp, list) else None
+        )
+        raw_meta = params.get("_meta")
+        meta: dict[str, Any] | None = dict(raw_meta) if isinstance(raw_meta, dict) else None
+        desc = await self._session_manager.create_session(
+            cwd=cwd,
+            mcp_servers=mcp_servers,
+            meta=meta,
+        )
+        await self._emit_available_commands_update(desc["sessionId"])
+        return {
+            "jsonrpc": "2.0",
+            "id": message_id,
+            "result": desc,
+        }
+
+    async def _handle_session_load(
+        self,
+        message_id: Any,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Handle `session/load`, restoring a session and emitting available slash commands."""
+        session_id = str(params.get("sessionId", ""))
+        cwd = str(params.get("cwd", ""))
+        raw_mcp = params.get("mcpServers")
+        mcp_servers: list[dict[str, Any]] | None = (
+            [s for s in raw_mcp if isinstance(s, dict)] if isinstance(raw_mcp, list) else None
+        )
+        try:
+            desc = await self._session_manager.load_session(
+                session_id=session_id,
+                cwd=cwd,
+                mcp_servers=mcp_servers,
+            )
+        except KeyError as exc:
+            return {
+                "jsonrpc": "2.0",
+                "id": message_id,
+                "error": {
+                    "code": -32002,
+                    "message": str(exc),
+                },
+            }
+        await self._emit_available_commands_update(desc["sessionId"])
+        return {
+            "jsonrpc": "2.0",
+            "id": message_id,
+            "result": desc,
+        }
+
+    async def _handle_session_set_mode(
+        self,
+        message_id: Any,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Handle `session/set_mode`, updating session mode and emitting `current_mode_update`."""
+        session_id = str(params.get("sessionId", ""))
+        mode_id = str(params.get("modeId", ""))
+        try:
+            res = await self._session_manager.set_mode(
+                session_id=session_id,
+                mode_id=mode_id,
+            )
+        except ValueError as exc:
+            return {
+                "jsonrpc": "2.0",
+                "id": message_id,
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": str(exc),
+                },
+            }
+        await self._emit_notification(
+            {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "current_mode_update",
+                        "currentModeId": mode_id,
+                    },
+                },
+            }
+        )
+        return {
+            "jsonrpc": "2.0",
+            "id": message_id,
+            "result": res,
+        }
+
+    async def _handle_session_set_model(
+        self,
+        message_id: Any,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Handle `session/set_model`, updating the active session model."""
+        session_id = str(params.get("sessionId", ""))
+        model_id = str(params.get("modelId", ""))
+        res = await self._session_manager.set_model(
+            session_id=session_id,
+            model_id=model_id,
+        )
+        return {
+            "jsonrpc": "2.0",
+            "id": message_id,
+            "result": res,
+        }
+
+    async def _handle_session_set_config_option(
+        self,
+        message_id: Any,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Handle `session/set_config_option`, updating a session configuration option."""
+        session_id = str(params.get("sessionId", ""))
+        config_id = str(params.get("configId", ""))
+        value = str(params.get("value", ""))
+        try:
+            res = await self._session_manager.set_config_option(
+                session_id=session_id,
+                config_id=config_id,
+                value=value,
+            )
+        except ValueError as exc:
+            return {
+                "jsonrpc": "2.0",
+                "id": message_id,
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": str(exc),
+                },
+            }
+        return {
+            "jsonrpc": "2.0",
+            "id": message_id,
+            "result": res,
+        }
+
     def serialize_frame(self, payload: dict[str, Any]) -> bytes:
         """Serialize a JSON-RPC 2.0 payload into a newline-delimited UTF-8 frame <= 16 MiB."""
         serialized = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
@@ -306,10 +486,53 @@ class AcpDispatcher:
                     "authMethods": [],
                 },
             }
+        if method == "session/new":
+            params = message.get("params")
+            return await self._handle_session_new(
+                message.get("id"),
+                params if isinstance(params, dict) else {},
+            )
+        if method == "session/load":
+            params = message.get("params")
+            return await self._handle_session_load(
+                message.get("id"),
+                params if isinstance(params, dict) else {},
+            )
+        if method == "session/set_mode":
+            params = message.get("params")
+            return await self._handle_session_set_mode(
+                message.get("id"),
+                params if isinstance(params, dict) else {},
+            )
+        if method == "session/set_model":
+            params = message.get("params")
+            return await self._handle_session_set_model(
+                message.get("id"),
+                params if isinstance(params, dict) else {},
+            )
+        if method == "session/set_config_option":
+            params = message.get("params")
+            return await self._handle_session_set_config_option(
+                message.get("id"),
+                params if isinstance(params, dict) else {},
+            )
         if method == "session/prompt":
             params = message.get("params")
             return await self._handle_session_prompt(
                 message.get("id"),
                 params if isinstance(params, dict) else {},
             )
+        if method in {"session/close", "_kiro.dev/session/terminate", "_kiro/session/delete"}:
+            raw_params = message.get("params")
+            params = raw_params if isinstance(raw_params, dict) else {}
+            session_id = str(params.get("sessionId", ""))
+            res = await self._session_manager.close_session(
+                session_id=session_id,
+                delete_persisted=(method == "_kiro/session/delete"),
+            )
+            return {
+                "jsonrpc": "2.0",
+                "id": message.get("id"),
+                "result": res,
+            }
         return None
