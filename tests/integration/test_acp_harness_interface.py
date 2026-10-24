@@ -81,7 +81,6 @@ async def test_req_acp_003_initialize_handshake_and_capabilities(
     assert result["agentInfo"]["version"]
 
 
-@pytest.mark.not_implemented
 async def test_req_acp_004_session_new_mcp_and_config_options(
     acp_harness_factory: HarnessFactory,
     tmp_path: Path,
