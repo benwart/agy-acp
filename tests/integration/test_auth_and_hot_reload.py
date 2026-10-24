@@ -5,8 +5,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
-import pytest
-
 from tests.integration.conftest import CliResult, HarnessFactory
 
 
@@ -67,7 +65,6 @@ def test_req_auth_003_cli_auth_status_reporting(
     assert authed.json()["fingerprint"].startswith("sha256:")
 
 
-@pytest.mark.not_implemented
 async def test_req_auth_004_running_acp_server_hot_reloads_auth_without_restart(
     acp_harness_factory: HarnessFactory,
     run_cli: Callable[[list[str]], CliResult],
