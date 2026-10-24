@@ -5,12 +5,9 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
-import pytest
-
 from tests.integration.conftest import CliResult
 
 
-@pytest.mark.not_implemented
 def test_req_cli_001_hierarchical_cli_execution(
     run_cli: Callable[[list[str]], CliResult],
     tmp_path: Path,
@@ -22,7 +19,6 @@ def test_req_cli_001_hierarchical_cli_execution(
     assert "valid" in res.json()
 
 
-@pytest.mark.not_implemented
 def test_req_cli_002_zensical_docs_build(
     run_cli: Callable[[list[str]], CliResult],
     tmp_path: Path,

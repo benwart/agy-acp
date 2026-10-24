@@ -41,7 +41,6 @@ def test_acp_serve_accepts_kirocrew_flags(tmp_path: Path) -> None:
     assert rc == 0
 
 
-@pytest.mark.not_implemented
 def test_commands_hierarchy_and_docstrings(tmp_path: Path) -> None:
     """Verify hierarchical command registration and execution of docs build dry-run."""
     rc = int(
@@ -53,8 +52,7 @@ def test_commands_hierarchy_and_docstrings(tmp_path: Path) -> None:
     assert rc == 0
 
 
-@pytest.mark.not_implemented
-def test_zensical_config_and_pages(tmp_path: Path) -> None:
+async def test_zensical_config_and_pages(tmp_path: Path) -> None:
     """Verify docs build handler invokes Zensical build cleanly."""
-    rc = docs_build_cmd.default(site_dir=tmp_path, dry_run=True)
+    rc = await docs_build_cmd.default(site_dir=tmp_path, dry_run=True)
     assert rc == 0
