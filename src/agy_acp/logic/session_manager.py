@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 from pathlib import Path
@@ -144,6 +145,15 @@ class SessionManager:
             return None
         return loaded
 
+    def get_session(self, session_id: str) -> dict[str, Any]:
+        """Return an isolated copy of the state for `session_id`."""
+        state = self._sessions.get(session_id)
+        if state is None:
+            state = self._load_persisted_session(session_id)
+        if state is None:
+            raise KeyError(f"Session '{session_id}' not found")
+        return copy.deepcopy(state)
+
     async def create_session(
         self,
         *,
@@ -153,10 +163,12 @@ class SessionManager:
     ) -> dict[str, Any]:
         """Create a new ACP session (`session/new`) and return its descriptor."""
         initial_mode = "approve" if os.environ.get("GOOSE_MODE") else "auto"
+        isolated_mcp = copy.deepcopy(mcp_servers) if mcp_servers is not None else []
+        isolated_meta = copy.deepcopy(meta) if meta is not None else {}
         sid = await self._sdk.start_or_resume_agent(
             session_id=None,
             cwd=cwd,
-            mcp_servers=mcp_servers,
+            mcp_servers=isolated_mcp,
             model=DEFAULT_MODEL_ID,
             mode=initial_mode,
             reasoning_effort=DEFAULT_REASONING_EFFORT,
@@ -164,8 +176,8 @@ class SessionManager:
         state: dict[str, Any] = {
             "sessionId": sid,
             "cwd": cwd,
-            "mcp_servers": list(mcp_servers or []),
-            "meta": dict(meta or {}),
+            "mcp_servers": isolated_mcp,
+            "meta": isolated_meta,
             "mode": initial_mode,
             "model": DEFAULT_MODEL_ID,
             "reasoning_effort": DEFAULT_REASONING_EFFORT,
@@ -192,7 +204,9 @@ class SessionManager:
             raise KeyError(f"Session '{session_id}' not found")
 
         effective_mcp = (
-            list(mcp_servers) if mcp_servers is not None else list(state.get("mcp_servers", []))
+            copy.deepcopy(mcp_servers)
+            if mcp_servers is not None
+            else copy.deepcopy(state.get("mcp_servers", []))
         )
         model = str(state.get("model", DEFAULT_MODEL_ID))
         mode = str(state.get("mode", "auto"))
@@ -208,7 +222,7 @@ class SessionManager:
         )
 
         restored_state: dict[str, Any] = {
-            **state,
+            **copy.deepcopy(state),
             "sessionId": session_id,
             "cwd": cwd,
             "mcp_servers": effective_mcp,
