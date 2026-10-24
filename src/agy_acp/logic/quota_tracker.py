@@ -10,6 +10,8 @@ from agy_acp.providers.quota_provider import QuotaProvider
 class QuotaTracker:
     """Aggregates 5-hour (`5h`) and 7-day (`7d`) quota buckets, credits, and token usage."""
 
+    CONTEXT_WINDOW_SIZE: int = 1_000_000
+
     def __init__(self, *, provider: QuotaProvider | None = None) -> None:
         self._provider = provider or QuotaProvider()
         self.input_tokens: int = 0
@@ -17,6 +19,7 @@ class QuotaTracker:
         self.cached_read_tokens: int = 0
         self.thinking_tokens: int = 0
         self.total_tokens: int = 0
+        self._total_tokens: int = 0
 
     def record_token_usage(
         self,
@@ -34,6 +37,7 @@ class QuotaTracker:
         self.total_tokens = (
             self.input_tokens + self.output_tokens + self.cached_read_tokens + self.thinking_tokens
         )
+        self._total_tokens = self.total_tokens
 
     def _extract_raw_buckets(self, *, group: str | None = None) -> list[dict[str, Any]]:
         """Flatten quota groups into raw bucket dicts, optionally filtered by group."""
@@ -118,8 +122,105 @@ class QuotaTracker:
         cached_read_tokens: int = 0,
     ) -> list[dict[str, Any]]:
         """Build `usage_update` and `_kiro.dev/metadata` notifications for KiroCrew."""
-        return []
+        self.record_token_usage(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_read_tokens=cached_read_tokens,
+        )
+        five_hour = self.get_five_hour_quota()
+        seven_day = self.get_seven_day_quota()
+        credits_info = self._provider.fetch_credits()
+        remaining_credits = credits_info.get("remaining_credits", 0)
+        context_usage_pct = round((self._total_tokens / self.CONTEXT_WINDOW_SIZE) * 100.0, 4)
+
+        notifications: list[dict[str, Any]] = [
+            {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "usage_update",
+                        "used": self._total_tokens,
+                        "size": self.CONTEXT_WINDOW_SIZE,
+                        "cost": {"amount": 0.0, "currency": "USD"},
+                    },
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "method": "_kiro.dev/metadata",
+                "params": {
+                    "sessionId": session_id,
+                    "contextUsagePercentage": context_usage_pct,
+                    "contextWindowSize": self.CONTEXT_WINDOW_SIZE,
+                    "credits": remaining_credits,
+                    "modelId": model_id,
+                    "_meta": {
+                        "quota": {
+                            "five_hour": five_hour,
+                            "seven_day": seven_day,
+                        }
+                    },
+                },
+            },
+        ]
+
+        all_buckets = [*five_hour["buckets"], *seven_day["buckets"]]
+        exhausted = [bucket for bucket in all_buckets if float(bucket["remaining_fraction"]) <= 0.0]
+        if exhausted:
+            notifications.append(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "_kiro.dev/error/rate_limit",
+                    "params": {
+                        "sessionId": session_id,
+                        "modelId": model_id,
+                        "message": "Quota limit reached for one or more rolling windows.",
+                        "exhaustedBuckets": exhausted,
+                        "resetTime": exhausted[0]["reset_time"],
+                    },
+                }
+            )
+
+        return notifications
 
     def format_slash_command_response(self, command: str) -> str:
         """Render `/quota`, `/usage`, or `/credits` Markdown table for KiroCrew chat."""
-        return ""
+        normalized = command.strip().lower() or "/quota"
+        if not normalized.startswith("/"):
+            normalized = f"/{normalized}"
+
+        five_hour = self.get_five_hour_quota()["buckets"]
+        seven_day = self.get_seven_day_quota()["buckets"]
+        credits_and_tokens = self.get_credits_and_tokens()
+        tokens = credits_and_tokens["token_usage"]
+
+        lines = [
+            f"### Antigravity Quota & Usage (`{normalized}`)",
+            "",
+            "| Group | Window | Label | Remaining | Used | Reset Time |",
+            "| :--- | :--- | :--- | :--- | :--- | :--- |",
+        ]
+        for bucket in [*five_hour, *seven_day]:
+            window_label = "Five Hour (5h)" if bucket["window"] == "5h" else "Weekly (7d)"
+            lines.append(
+                f"| {bucket['group']} | {window_label} | {bucket['name']} | "
+                f"{bucket['remaining_percent']:.1f}% | {bucket['used_percent']:.1f}% | "
+                f"{bucket['reset_time']} |"
+            )
+
+        lines.extend(
+            [
+                "",
+                "**Credits & Session Tokens**",
+                f"- Remaining Credits: `{credits_and_tokens['remaining_credits']}` "
+                f"({credits_and_tokens['upgrade_uri']})",
+                f"- Input Tokens: `{tokens['input_tokens']}`",
+                f"- Output Tokens: `{tokens['output_tokens']}`",
+                f"- Cached Read Tokens: `{tokens['cached_read_tokens']}`",
+                f"- Thinking Tokens: `{tokens['thinking_tokens']}`",
+                f"- Total Tokens: `{tokens['total_tokens']}`",
+            ]
+        )
+        return "\n".join(lines)
