@@ -9,7 +9,6 @@ import pytest
 from agy_acp.logic.auth_manager import AuthManager
 
 
-@pytest.mark.not_implemented
 def test_login_writes_atomic_credentials(tmp_path: Path) -> None:
     """Verify AuthManager.login writes 0600 credentials and returns authenticated AuthState."""
     auth_file = tmp_path / "credentials.json"
