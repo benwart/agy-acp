@@ -12,6 +12,28 @@ class QuotaTracker:
 
     def __init__(self, *, provider: QuotaProvider | None = None) -> None:
         self._provider = provider or QuotaProvider()
+        self.input_tokens: int = 0
+        self.output_tokens: int = 0
+        self.cached_read_tokens: int = 0
+        self.thinking_tokens: int = 0
+        self.total_tokens: int = 0
+
+    def record_token_usage(
+        self,
+        *,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cached_read_tokens: int = 0,
+        thinking_tokens: int = 0,
+    ) -> None:
+        """Accumulate session token usage into the ledger."""
+        self.input_tokens += input_tokens
+        self.output_tokens += output_tokens
+        self.cached_read_tokens += cached_read_tokens
+        self.thinking_tokens += thinking_tokens
+        self.total_tokens = (
+            self.input_tokens + self.output_tokens + self.cached_read_tokens + self.thinking_tokens
+        )
 
     def _extract_raw_buckets(self, *, group: str | None = None) -> list[dict[str, Any]]:
         """Flatten quota groups into raw bucket dicts, optionally filtered by group."""
@@ -63,11 +85,28 @@ class QuotaTracker:
 
     def get_credits_and_tokens(self) -> dict[str, Any]:
         """Return G1 credit balance and cumulative session token ledger."""
-        return {}
+        credits = self._provider.fetch_credits()
+        return {
+            "remaining_credits": credits.get("remaining_credits", 0),
+            "upgrade_uri": credits.get("upgrade_uri"),
+            "token_usage": {
+                "input_tokens": self.input_tokens,
+                "output_tokens": self.output_tokens,
+                "cached_read_tokens": self.cached_read_tokens,
+                "thinking_tokens": self.thinking_tokens,
+                "total_tokens": self.total_tokens,
+            },
+        }
 
     def get_unified_status(self, *, group: str | None = None) -> dict[str, Any]:
         """Return combined 5-hour, 7-day, credit, and token usage snapshot."""
-        return {}
+        credits_and_tokens = self.get_credits_and_tokens()
+        return {
+            "five_hour": self.get_five_hour_quota(group=group),
+            "seven_day": self.get_seven_day_quota(group=group),
+            "credits": self._provider.fetch_credits(),
+            "token_usage": credits_and_tokens["token_usage"],
+        }
 
     def build_kirocrew_wire_updates(
         self,
