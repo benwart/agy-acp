@@ -29,13 +29,29 @@ async def test_load_session_resumes_trajectory(tmp_path: Path) -> None:
     assert loaded["sessionId"] == created["sessionId"]
 
 
-@pytest.mark.not_implemented
 async def test_multiplexed_session_isolation(tmp_path: Path) -> None:
     """Verify SessionManager isolates state between concurrent sessionIds."""
     mgr = SessionManager(save_dir=tmp_path)
-    s1 = await mgr.create_session(cwd=str(tmp_path))
-    s2 = await mgr.create_session(cwd=str(tmp_path))
+    ws1 = tmp_path / "ws1"
+    ws2 = tmp_path / "ws2"
+    mcp1 = [{"name": "srv1", "command": "echo", "args": ["1"], "env": []}]
+    mcp2 = [{"name": "srv2", "command": "echo", "args": ["2"], "env": []}]
+    s1 = await mgr.create_session(cwd=str(ws1), mcp_servers=mcp1, meta={"role": "a"})
+    s2 = await mgr.create_session(cwd=str(ws2), mcp_servers=mcp2, meta={"role": "b"})
     assert s1["sessionId"] != s2["sessionId"]
+
+    mcp1[0]["name"] = "mutated"
+    state1 = mgr.get_session(s1["sessionId"])
+    state2 = mgr.get_session(s2["sessionId"])
+    assert state1["cwd"] == str(ws1)
+    assert state2["cwd"] == str(ws2)
+    assert state1["mcp_servers"][0]["name"] == "srv1"
+    assert state2["mcp_servers"][0]["name"] == "srv2"
+    assert state1["meta"] == {"role": "a"}
+    assert state2["meta"] == {"role": "b"}
+
+    state1["meta"]["role"] = "tampered"
+    assert mgr.get_session(s1["sessionId"])["meta"]["role"] == "a"
 
 
 @pytest.mark.not_implemented
