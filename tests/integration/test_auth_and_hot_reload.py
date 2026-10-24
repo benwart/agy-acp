@@ -50,7 +50,6 @@ def test_req_auth_002_cli_logout_clears_credentials(
     assert payload["generation"] >= 2
 
 
-@pytest.mark.not_implemented
 def test_req_auth_003_cli_auth_status_reporting(
     run_cli: Callable[[list[str]], CliResult],
     tmp_path: Path,
