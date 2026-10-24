@@ -10,7 +10,6 @@ import pytest
 from tests.integration.conftest import CliResult, HarnessFactory
 
 
-@pytest.mark.not_implemented
 def test_req_auth_001_cli_login_persists_credentials(
     run_cli: Callable[[list[str]], CliResult],
     tmp_path: Path,
