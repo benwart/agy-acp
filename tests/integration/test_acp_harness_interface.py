@@ -5,8 +5,6 @@ from __future__ import annotations
 import base64
 from pathlib import Path
 
-import pytest
-
 from tests.integration.conftest import HarnessFactory
 
 
@@ -184,7 +182,6 @@ async def test_req_acp_007_set_mode_model_and_config_options(
     assert "configOptions" in cfg_resp["result"]
 
 
-@pytest.mark.not_implemented
 async def test_req_acp_008_session_prompt_streaming_thoughts_and_text(
     acp_harness_factory: HarnessFactory,
     tmp_path: Path,
@@ -227,7 +224,6 @@ async def test_req_acp_008_session_prompt_streaming_thoughts_and_text(
     assert "agent_message_chunk" in update_kinds
 
 
-@pytest.mark.not_implemented
 async def test_req_acp_009_tool_call_and_permission_gating(
     acp_harness_factory: HarnessFactory,
     tmp_path: Path,
@@ -261,7 +257,6 @@ async def test_req_acp_009_tool_call_and_permission_gating(
     assert "tool_call_update" in update_kinds
 
 
-@pytest.mark.not_implemented
 async def test_req_acp_010_session_cancel_and_mid_turn_steer(
     acp_harness_factory: HarnessFactory,
     tmp_path: Path,

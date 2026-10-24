@@ -5,8 +5,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
-import pytest
-
 from tests.integration.conftest import CliResult, HarnessFactory
 
 
@@ -59,7 +57,6 @@ def test_req_quota_003_cli_credits_and_combined_status(
     assert "token_usage" in status_data
 
 
-@pytest.mark.not_implemented
 async def test_req_quota_004_kirocrew_wire_usage_and_slash_commands(
     acp_harness_factory: HarnessFactory,
     tmp_path: Path,
