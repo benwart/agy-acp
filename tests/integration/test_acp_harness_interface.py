@@ -153,7 +153,6 @@ async def test_req_acp_006_multiplexed_concurrent_sessions(
     assert r1["result"]["sessionId"] != r2["result"]["sessionId"]
 
 
-@pytest.mark.not_implemented
 async def test_req_acp_007_set_mode_model_and_config_options(
     acp_harness_factory: HarnessFactory,
     tmp_path: Path,

@@ -354,6 +354,97 @@ class AcpDispatcher:
             "result": desc,
         }
 
+    async def _handle_session_set_mode(
+        self,
+        message_id: Any,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Handle `session/set_mode`, updating session mode and emitting `current_mode_update`."""
+        session_id = str(params.get("sessionId", ""))
+        mode_id = str(params.get("modeId", ""))
+        try:
+            res = await self._session_manager.set_mode(
+                session_id=session_id,
+                mode_id=mode_id,
+            )
+        except ValueError as exc:
+            return {
+                "jsonrpc": "2.0",
+                "id": message_id,
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": str(exc),
+                },
+            }
+        await self._emit_notification(
+            {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "current_mode_update",
+                        "currentModeId": mode_id,
+                    },
+                },
+            }
+        )
+        return {
+            "jsonrpc": "2.0",
+            "id": message_id,
+            "result": res,
+        }
+
+    async def _handle_session_set_model(
+        self,
+        message_id: Any,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Handle `session/set_model`, updating the active session model."""
+        session_id = str(params.get("sessionId", ""))
+        model_id = str(params.get("modelId", ""))
+        res = await self._session_manager.set_model(
+            session_id=session_id,
+            model_id=model_id,
+        )
+        return {
+            "jsonrpc": "2.0",
+            "id": message_id,
+            "result": res,
+        }
+
+    async def _handle_session_set_config_option(
+        self,
+        message_id: Any,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Handle `session/set_config_option`, updating a session configuration option."""
+        session_id = str(params.get("sessionId", ""))
+        config_id = str(params.get("configId", ""))
+        value = str(params.get("value", ""))
+        try:
+            res = await self._session_manager.set_config_option(
+                session_id=session_id,
+                config_id=config_id,
+                value=value,
+            )
+        except ValueError as exc:
+            return {
+                "jsonrpc": "2.0",
+                "id": message_id,
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": str(exc),
+                },
+            }
+        return {
+            "jsonrpc": "2.0",
+            "id": message_id,
+            "result": res,
+        }
+
     def serialize_frame(self, payload: dict[str, Any]) -> bytes:
         """Serialize a JSON-RPC 2.0 payload into a newline-delimited UTF-8 frame <= 16 MiB."""
         serialized = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
@@ -404,6 +495,24 @@ class AcpDispatcher:
         if method == "session/load":
             params = message.get("params")
             return await self._handle_session_load(
+                message.get("id"),
+                params if isinstance(params, dict) else {},
+            )
+        if method == "session/set_mode":
+            params = message.get("params")
+            return await self._handle_session_set_mode(
+                message.get("id"),
+                params if isinstance(params, dict) else {},
+            )
+        if method == "session/set_model":
+            params = message.get("params")
+            return await self._handle_session_set_model(
+                message.get("id"),
+                params if isinstance(params, dict) else {},
+            )
+        if method == "session/set_config_option":
+            params = message.get("params")
+            return await self._handle_session_set_config_option(
                 message.get("id"),
                 params if isinstance(params, dict) else {},
             )
