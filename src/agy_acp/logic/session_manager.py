@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+import anyio
+
 from agy_acp.providers.antigravity_sdk import AntigravitySdkProvider
 
 DEFAULT_MODEL_ID = "gemini-3.7-pro"
@@ -130,6 +132,18 @@ class SessionManager:
         session_file = self._save_dir / f"{sid}.json"
         session_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
+    def _load_persisted_session(self, session_id: str) -> dict[str, Any] | None:
+        """Load persisted session state from `self._save_dir` if available."""
+        if self._save_dir is None:
+            return None
+        session_file = self._save_dir / f"{session_id}.json"
+        if not session_file.is_file():
+            return None
+        loaded = json.loads(session_file.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            return None
+        return loaded
+
     async def create_session(
         self,
         *,
@@ -170,7 +184,43 @@ class SessionManager:
         mcp_servers: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Resume an existing ACP session (`session/load`) from persistent trajectory storage."""
-        return {"sessionId": ""}
+        await anyio.sleep(0)
+        state = self._sessions.get(session_id)
+        if state is None:
+            state = self._load_persisted_session(session_id)
+        if state is None:
+            raise KeyError(f"Session '{session_id}' not found")
+
+        effective_mcp = (
+            list(mcp_servers) if mcp_servers is not None else list(state.get("mcp_servers", []))
+        )
+        model = str(state.get("model", DEFAULT_MODEL_ID))
+        mode = str(state.get("mode", "auto"))
+        reasoning_effort = str(state.get("reasoning_effort", DEFAULT_REASONING_EFFORT))
+
+        await self._sdk.start_or_resume_agent(
+            session_id=session_id,
+            cwd=cwd,
+            mcp_servers=effective_mcp,
+            model=model,
+            mode=mode,
+            reasoning_effort=reasoning_effort,
+        )
+
+        restored_state: dict[str, Any] = {
+            **state,
+            "sessionId": session_id,
+            "cwd": cwd,
+            "mcp_servers": effective_mcp,
+            "mode": mode,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "cancelled": bool(state.get("cancelled", False)),
+        }
+        self._sessions[session_id] = restored_state
+        self._persist_session(session_id, restored_state)
+        _write_dsh_gate_marker_if_configured()
+        return _build_session_descriptor(restored_state)
 
     async def set_mode(self, *, session_id: str, mode_id: str) -> dict[str, Any]:
         """Update session approval mode or agent profile (`session/set_mode`)."""
