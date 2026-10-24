@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Awaitable, Callable
 from typing import Any
+
+MAX_FRAME_SIZE_BYTES = 16 * 1024 * 1024
 
 NotificationSink = Callable[[dict[str, Any]], Awaitable[None]]
 ClientRpcCaller = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
@@ -23,7 +26,14 @@ class AcpDispatcher:
 
     def serialize_frame(self, payload: dict[str, Any]) -> bytes:
         """Serialize a JSON-RPC 2.0 payload into a newline-delimited UTF-8 frame <= 16 MiB."""
-        return b""
+        serialized = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+        encoded = f"{serialized}\n".encode()
+        if len(encoded) > MAX_FRAME_SIZE_BYTES:
+            raise ValueError(
+                f"Serialized JSON-RPC frame size ({len(encoded)} bytes) "
+                f"exceeds maximum of {MAX_FRAME_SIZE_BYTES} bytes"
+            )
+        return encoded
 
     async def handle_message(self, raw_line: str) -> dict[str, Any] | None:
         """Parse and dispatch a single JSON-RPC 2.0 request or notification line."""

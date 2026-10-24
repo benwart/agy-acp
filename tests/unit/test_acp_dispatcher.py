@@ -9,13 +9,16 @@ import pytest
 from agy_acp.logic.acp_dispatcher import AcpDispatcher
 
 
-@pytest.mark.not_implemented
 def test_jsonrpc_frame_serialization() -> None:
     """Verify AcpDispatcher serializes newline-delimited UTF-8 JSON-RPC frames."""
     dispatcher = AcpDispatcher()
     raw = dispatcher.serialize_frame({"jsonrpc": "2.0", "id": 1, "result": {}})
     assert raw.endswith(b"\n")
     assert json.loads(raw.decode("utf-8"))["id"] == 1
+    with pytest.raises(ValueError, match="exceeds maximum"):
+        dispatcher.serialize_frame(
+            {"jsonrpc": "2.0", "id": 1, "result": {"data": "x" * (16 * 1024 * 1024)}}
+        )
 
 
 @pytest.mark.not_implemented
