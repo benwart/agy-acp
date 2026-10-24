@@ -30,7 +30,6 @@ async def test_req_acp_001_stdio_framing_and_stdout_purity(
     assert "result" in response
 
 
-@pytest.mark.not_implemented
 async def test_req_acp_002_kirocrew_cli_invocation_variants(
     acp_harness_factory: HarnessFactory,
     tmp_path: Path,

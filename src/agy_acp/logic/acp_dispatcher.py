@@ -17,6 +17,20 @@ from agy_acp.logic.session_manager import DEFAULT_MODEL_ID, SessionManager
 
 MAX_FRAME_SIZE_BYTES = 16 * 1024 * 1024
 SLASH_QUOTA_COMMANDS = frozenset({"/quota", "/usage", "/credits"})
+AVAILABLE_SLASH_COMMANDS: list[dict[str, str]] = [
+    {
+        "name": "quota",
+        "description": "Display 5h and 7d rolling quota remaining percentages and reset times",
+    },
+    {
+        "name": "usage",
+        "description": "Display session token usage and quota summary",
+    },
+    {
+        "name": "credits",
+        "description": "Display remaining Antigravity G1 credits",
+    },
+]
 
 NotificationSink = Callable[[dict[str, Any]], Awaitable[None]]
 ClientRpcCaller = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
@@ -265,6 +279,43 @@ class AcpDispatcher:
             },
         }
 
+    async def _handle_session_new(
+        self,
+        message_id: Any,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Handle `session/new`, creating a session and emitting available slash commands."""
+        cwd = str(params.get("cwd", ""))
+        raw_mcp = params.get("mcpServers")
+        mcp_servers: list[dict[str, Any]] | None = (
+            [s for s in raw_mcp if isinstance(s, dict)] if isinstance(raw_mcp, list) else None
+        )
+        raw_meta = params.get("_meta")
+        meta: dict[str, Any] | None = dict(raw_meta) if isinstance(raw_meta, dict) else None
+        desc = await self._session_manager.create_session(
+            cwd=cwd,
+            mcp_servers=mcp_servers,
+            meta=meta,
+        )
+        await self._emit_notification(
+            {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": desc["sessionId"],
+                    "update": {
+                        "sessionUpdate": "available_commands_update",
+                        "availableCommands": list(AVAILABLE_SLASH_COMMANDS),
+                    },
+                },
+            }
+        )
+        return {
+            "jsonrpc": "2.0",
+            "id": message_id,
+            "result": desc,
+        }
+
     def serialize_frame(self, payload: dict[str, Any]) -> bytes:
         """Serialize a JSON-RPC 2.0 payload into a newline-delimited UTF-8 frame <= 16 MiB."""
         serialized = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
@@ -306,6 +357,12 @@ class AcpDispatcher:
                     "authMethods": [],
                 },
             }
+        if method == "session/new":
+            params = message.get("params")
+            return await self._handle_session_new(
+                message.get("id"),
+                params if isinstance(params, dict) else {},
+            )
         if method == "session/prompt":
             params = message.get("params")
             return await self._handle_session_prompt(
