@@ -29,10 +29,9 @@ def test_cli_scaffold_help_and_version(capsys: pytest.CaptureFixture[str]) -> No
     assert "seven-day" in quota_help
 
 
-@pytest.mark.not_implemented
-def test_acp_serve_accepts_kirocrew_flags(tmp_path: Path) -> None:
+async def test_acp_serve_accepts_kirocrew_flags(tmp_path: Path) -> None:
     """Verify acp serve handler executes and returns 0 when invoked in dry/validation mode."""
-    rc = acp_serve_cmd.default(
+    rc = await acp_serve_cmd.default(
         profile="acp",
         with_builtin="developer",
         agent="kirocrew",

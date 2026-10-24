@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import anyio
 import pytest
 
 from agy_acp.logic.session_manager import SessionManager
 
 
-@pytest.mark.not_implemented
 async def test_create_session_maps_mcp_and_cwd(tmp_path: Path) -> None:
     """Verify SessionManager.create_session returns valid sessionId and configOptions."""
     mgr = SessionManager(save_dir=tmp_path)
@@ -21,7 +21,6 @@ async def test_create_session_maps_mcp_and_cwd(tmp_path: Path) -> None:
     assert "configOptions" in desc
 
 
-@pytest.mark.not_implemented
 async def test_load_session_resumes_trajectory(tmp_path: Path) -> None:
     """Verify SessionManager.load_session restores an existing sessionId."""
     mgr = SessionManager(save_dir=tmp_path)
@@ -31,40 +30,133 @@ async def test_load_session_resumes_trajectory(tmp_path: Path) -> None:
     assert loaded["sessionId"] == created["sessionId"]
 
 
-@pytest.mark.not_implemented
 async def test_multiplexed_session_isolation(tmp_path: Path) -> None:
     """Verify SessionManager isolates state between concurrent sessionIds."""
     mgr = SessionManager(save_dir=tmp_path)
-    s1 = await mgr.create_session(cwd=str(tmp_path))
-    s2 = await mgr.create_session(cwd=str(tmp_path))
+    ws1 = tmp_path / "ws1"
+    ws2 = tmp_path / "ws2"
+    mcp1 = [{"name": "srv1", "command": "echo", "args": ["1"], "env": []}]
+    mcp2 = [{"name": "srv2", "command": "echo", "args": ["2"], "env": []}]
+    s1 = await mgr.create_session(cwd=str(ws1), mcp_servers=mcp1, meta={"role": "a"})
+    s2 = await mgr.create_session(cwd=str(ws2), mcp_servers=mcp2, meta={"role": "b"})
     assert s1["sessionId"] != s2["sessionId"]
 
+    mcp1[0]["name"] = "mutated"
+    state1 = mgr.get_session(s1["sessionId"])
+    state2 = mgr.get_session(s2["sessionId"])
+    assert state1["cwd"] == str(ws1)
+    assert state2["cwd"] == str(ws2)
+    assert state1["mcp_servers"][0]["name"] == "srv1"
+    assert state2["mcp_servers"][0]["name"] == "srv2"
+    assert state1["meta"] == {"role": "a"}
+    assert state2["meta"] == {"role": "b"}
 
-@pytest.mark.not_implemented
+    state1["meta"]["role"] = "tampered"
+    assert mgr.get_session(s1["sessionId"])["meta"]["role"] == "a"
+
+
 async def test_update_session_mode_and_model(tmp_path: Path) -> None:
     """Verify SessionManager.set_mode, set_model, and set_config_option."""
     mgr = SessionManager(save_dir=tmp_path)
     s1 = await mgr.create_session(cwd=str(tmp_path))
     sid = s1["sessionId"]
-    await mgr.set_mode(session_id=sid, mode_id="read-only")
-    await mgr.set_model(session_id=sid, model_id="gemini-3.8-flash")
+    assert await mgr.set_mode(session_id=sid, mode_id="read-only") == {}
+    assert await mgr.set_model(session_id=sid, model_id="gemini-3.8-flash") == {}
     cfg = await mgr.set_config_option(session_id=sid, config_id="reasoning_effort", value="high")
     assert "configOptions" in cfg
 
+    by_id = {opt["id"]: opt["currentValue"] for opt in cfg["configOptions"]}
+    assert by_id == {
+        "model": "gemini-3.8-flash",
+        "mode": "read-only",
+        "reasoning_effort": "high",
+    }
 
-@pytest.mark.not_implemented
+    await mgr.set_config_option(session_id=sid, config_id="mode", value="approve")
+    await mgr.set_config_option(session_id=sid, config_id="model", value="gemini-3.7-pro")
+    cfg2 = await mgr.set_config_option(session_id=sid, config_id="thinkingLevel", value="low")
+    by_id2 = {opt["id"]: opt["currentValue"] for opt in cfg2["configOptions"]}
+    assert by_id2 == {
+        "model": "gemini-3.7-pro",
+        "mode": "approve",
+        "reasoning_effort": "low",
+    }
+
+    with pytest.raises(ValueError, match="Mode 'invalid' not found"):
+        await mgr.set_mode(session_id=sid, mode_id="invalid")
+
+
 async def test_cancel_and_steer_active_turn(tmp_path: Path) -> None:
-    """Verify SessionManager.cancel stops an active turn."""
+    """Verify SessionManager.cancel stops an active turn and tracks cancellation."""
     mgr = SessionManager(save_dir=tmp_path)
     s1 = await mgr.create_session(cwd=str(tmp_path))
-    cancelled = await mgr.cancel(session_id=s1["sessionId"])
+    sid = s1["sessionId"]
+
+    assert mgr.is_cancelled(sid) is False
+    cancelled = await mgr.cancel(session_id=sid)
     assert cancelled is True
+    assert mgr.is_cancelled(sid) is True
+    assert mgr.get_session(sid)["cancelled"] is True
+
+    assert mgr.consume_cancellation(sid) is True
+    assert mgr.is_cancelled(sid) is False
+    assert mgr.get_session(sid)["cancelled"] is False
+    assert mgr.consume_cancellation(sid) is False
+
+    scope_cancelled = False
+    turn_started = anyio.Event()
+
+    async def _run_active_turn() -> None:
+        nonlocal scope_cancelled
+        with mgr.turn_cancel_scope(sid) as scope:
+            turn_started.set()
+            await anyio.sleep(10)
+        scope_cancelled = scope.cancel_called
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(_run_active_turn)
+        await turn_started.wait()
+        assert await mgr.cancel(session_id=sid) is True
+
+    assert scope_cancelled is True
+    assert mgr.is_cancelled(sid) is True
 
 
-@pytest.mark.not_implemented
 async def test_terminate_and_delete_session(tmp_path: Path) -> None:
     """Verify SessionManager.close_session cleans up session state."""
     mgr = SessionManager(save_dir=tmp_path)
     s1 = await mgr.create_session(cwd=str(tmp_path))
-    res = await mgr.close_session(session_id=s1["sessionId"])
-    assert res == {}
+    sid = s1["sessionId"]
+    session_file = tmp_path / f"{sid}.json"
+    assert session_file.is_file()
+
+    await mgr.cancel(session_id=sid)
+    assert mgr.is_cancelled(sid) is True
+
+    scope_cancelled = False
+    turn_started = anyio.Event()
+
+    async def _run_active_turn() -> None:
+        nonlocal scope_cancelled
+        with mgr.turn_cancel_scope(sid) as scope:
+            turn_started.set()
+            await anyio.sleep(10)
+        scope_cancelled = scope.cancel_called
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(_run_active_turn)
+        await turn_started.wait()
+        res = await mgr.close_session(session_id=sid)
+        assert res == {}
+
+    assert scope_cancelled is True
+    assert sid not in mgr._sessions
+    assert sid not in mgr._cancelled_sessions
+    assert sid not in mgr._active_cancel_scopes
+    assert session_file.is_file()
+
+    del_res = await mgr.close_session(session_id=sid, delete_persisted=True)
+    assert del_res == {}
+    assert not session_file.exists()
+    with pytest.raises(KeyError, match=sid):
+        mgr.get_session(sid)
