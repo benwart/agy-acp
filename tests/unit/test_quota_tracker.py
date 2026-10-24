@@ -47,14 +47,31 @@ def test_seven_day_bucket_calculation() -> None:
     assert filtered["buckets"][0]["group"] == "Gemini Models"
 
 
-@pytest.mark.not_implemented
 def test_combined_quota_and_token_ledger() -> None:
     """Verify QuotaTracker.get_unified_status and get_credits_and_tokens."""
     tracker = QuotaTracker()
+    tracker.record_token_usage(
+        input_tokens=120,
+        output_tokens=30,
+        cached_read_tokens=40,
+        thinking_tokens=10,
+    )
+    credits_and_tokens = tracker.get_credits_and_tokens()
+    assert credits_and_tokens["remaining_credits"] == 1000
+    assert credits_and_tokens["upgrade_uri"] == "https://one.google.com/ai"
+    assert credits_and_tokens["token_usage"] == {
+        "input_tokens": 120,
+        "output_tokens": 30,
+        "cached_read_tokens": 40,
+        "thinking_tokens": 10,
+        "total_tokens": 200,
+    }
+
     status = tracker.get_unified_status()
     assert "five_hour" in status
     assert "seven_day" in status
     assert "credits" in status
+    assert status["token_usage"]["total_tokens"] == 200
 
 
 @pytest.mark.not_implemented
