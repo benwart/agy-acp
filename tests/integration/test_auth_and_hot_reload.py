@@ -107,3 +107,38 @@ async def test_req_auth_004_running_acp_server_hot_reloads_auth_without_restart(
     )
     assert "error" in post_logout_resp
     assert "not logged in" in post_logout_resp["error"]["message"].lower()
+
+
+def test_cli_auth_login_oauth_browser_flow(
+    run_cli: Callable[[list[str]], CliResult],
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    """Verify `agy-acp auth login --oauth` (and default no-flag login) runs browser OAuth flow."""
+    import pytest
+
+    mp = monkeypatch
+    assert isinstance(mp, pytest.MonkeyPatch)
+    auth_file = tmp_path / "credentials.json"
+    mp.setenv("AGY_ACP_FAKE_OAUTH", "1")
+    mp.setenv("AGY_ACP_FAKE_OAUTH_EMAIL", "browser-user@example.com")
+    res = run_cli(
+        ["auth", "login", "--oauth", "--auth-file", str(auth_file), "--format", "json"],
+    )
+    assert res.exit_code == 0
+    payload = res.json()
+    assert payload["authenticated"] is True
+    assert payload["method"] == "oauth"
+    assert payload["identity"] == "browser-user@example.com"
+
+    # Also verify running `agy-acp auth login` with no flags defaults to browser OAuth login
+    mp.setenv("AGY_ACP_FAKE_OAUTH_EMAIL", "default-oauth@example.com")
+    res_default = run_cli(
+        ["auth", "login", "--auth-file", str(auth_file), "--format", "json"],
+    )
+    assert res_default.exit_code == 0
+    payload_default = res_default.json()
+    assert payload_default["authenticated"] is True
+    assert payload_default["method"] == "oauth"
+    assert payload_default["identity"] == "default-oauth@example.com"
+    assert payload_default["generation"] == 2
