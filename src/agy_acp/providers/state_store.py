@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     reasoning_effort TEXT NOT NULL DEFAULT 'medium',
     cancelled INTEGER NOT NULL DEFAULT 0,
     last_step_idx INTEGER NOT NULL DEFAULT -1,
+    context_tokens INTEGER NOT NULL DEFAULT 0,
     title TEXT,
     mcp_servers_json TEXT NOT NULL DEFAULT '[]',
     meta_json TEXT NOT NULL DEFAULT '{}',
@@ -106,6 +107,10 @@ class SqliteStateStoreProvider:
         self._db_path.chmod(0o600)
         with self._connect() as conn:
             conn.executescript(_SCHEMA_SQL)
+            with contextlib.suppress(sqlite3.OperationalError):
+                conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN context_tokens INTEGER NOT NULL DEFAULT 0"
+                )
 
     @contextlib.contextmanager
     def _connect(self) -> Generator[sqlite3.Connection]:
@@ -127,6 +132,7 @@ class SqliteStateStoreProvider:
     @staticmethod
     def _row_to_session(row: sqlite3.Row) -> dict[str, Any]:
         auth_cfg: dict[str, Any] = json.loads(row["auth_config_json"] or "{}")
+        row_keys = row.keys()
         return {
             "sessionId": str(row["session_id"]),
             "agyConversationId": row["agy_conversation_id"],
@@ -137,6 +143,7 @@ class SqliteStateStoreProvider:
             "reasoning_effort": str(row["reasoning_effort"]),
             "cancelled": bool(row["cancelled"]),
             "lastStepIdx": int(row["last_step_idx"]),
+            "contextTokens": int(row["context_tokens"]) if "context_tokens" in row_keys else 0,
             "title": row["title"],
             "mcp_servers": json.loads(row["mcp_servers_json"] or "[]"),
             "meta": json.loads(row["meta_json"] or "{}"),
@@ -158,6 +165,7 @@ class SqliteStateStoreProvider:
         effort = str(state.get("reasoning_effort", existing.get("reasoning_effort", "medium")))
         cancelled = int(bool(state.get("cancelled", existing.get("cancelled", False))))
         last_step_idx = int(state.get("lastStepIdx", existing.get("lastStepIdx", -1)))
+        context_tokens = int(state.get("contextTokens", existing.get("contextTokens", 0)))
         title = state.get("title", existing.get("title"))
         mcp_servers = state.get("mcp_servers", existing.get("mcp_servers", []))
         meta = state.get("meta", existing.get("meta", {}))
@@ -174,9 +182,9 @@ class SqliteStateStoreProvider:
                 """
                 INSERT INTO sessions (
                     session_id, agy_conversation_id, cwd, mode, model, reasoning_effort,
-                    cancelled, last_step_idx, title, mcp_servers_json, meta_json,
+                    cancelled, last_step_idx, context_tokens, title, mcp_servers_json, meta_json,
                     auth_config_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id) DO UPDATE SET
                     agy_conversation_id = excluded.agy_conversation_id,
                     cwd = excluded.cwd,
@@ -185,6 +193,7 @@ class SqliteStateStoreProvider:
                     reasoning_effort = excluded.reasoning_effort,
                     cancelled = excluded.cancelled,
                     last_step_idx = excluded.last_step_idx,
+                    context_tokens = excluded.context_tokens,
                     title = excluded.title,
                     mcp_servers_json = excluded.mcp_servers_json,
                     meta_json = excluded.meta_json,
@@ -200,6 +209,7 @@ class SqliteStateStoreProvider:
                     effort,
                     cancelled,
                     last_step_idx,
+                    context_tokens,
                     title,
                     json.dumps(mcp_servers),
                     json.dumps(meta),
@@ -258,6 +268,14 @@ class SqliteStateStoreProvider:
         """Persist or update a conversation step row in SQLite."""
         now = datetime.now(UTC).isoformat()
         serialized = data if isinstance(data, str) else json.dumps(data)
+        step_ctx = 0
+        if isinstance(data, dict) and isinstance(data.get("usage"), dict):
+            usage_obj = data["usage"]
+            step_ctx = (
+                int(usage_obj.get("input_tokens", 0))
+                + int(usage_obj.get("cache_read_tokens", 0))
+                + int(usage_obj.get("output_tokens", 0))
+            )
         with self._connect() as conn:
             conn.execute(
                 """
@@ -271,14 +289,26 @@ class SqliteStateStoreProvider:
                 """,
                 (session_id, idx, step_type, status, serialized, now),
             )
-            conn.execute(
-                """
-                UPDATE sessions
-                SET last_step_idx = MAX(last_step_idx, ?), updated_at = ?
-                WHERE session_id = ?
-                """,
-                (idx, now, session_id),
-            )
+            if step_ctx > 0:
+                conn.execute(
+                    """
+                    UPDATE sessions
+                    SET last_step_idx = MAX(last_step_idx, ?),
+                        context_tokens = ?,
+                        updated_at = ?
+                    WHERE session_id = ?
+                    """,
+                    (idx, step_ctx, now, session_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE sessions
+                    SET last_step_idx = MAX(last_step_idx, ?), updated_at = ?
+                    WHERE session_id = ?
+                    """,
+                    (idx, now, session_id),
+                )
 
     def get_steps_since(self, session_id: str, *, after_idx: int = -1) -> list[dict[str, Any]]:
         """Query `steps` for `session_id` with `idx > after_idx` ordered by `idx ASC`."""

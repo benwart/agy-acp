@@ -521,7 +521,7 @@ async def test_resolve_kiro_tool_identity_and_sync_mcp_servers(tmp_path: Path) -
         ),
         encoding="utf-8",
     )
-    agent_servers = load_kiro_agent_mcp_servers("kirocrew", cwd=str(tmp_path))
+    agent_servers = load_kiro_agent_mcp_servers("kirocrew", cwd=str(tmp_path), include_home=False)
     assert len(agent_servers) == 2
 
     mcp_cfg_file = tmp_path / "mcp_config.json"
@@ -536,3 +536,233 @@ async def test_resolve_kiro_tool_identity_and_sync_mcp_servers(tmp_path: Path) -
     assert "rea" in merged["mcpServers"]
     assert merged["mcpServers"]["kirocrew-core"]["command"] == "/usr/local/bin/kirocrew"
     assert merged["mcpServers"]["kirocrew-core"]["args"] == ["mcp-core"]
+
+
+async def test_stream_prompt_tracks_last_step_context_tokens_and_ignores_system_message_as_tool(
+    tmp_path: Path,
+) -> None:
+    """Verify stream_prompt extracts context_tokens from last step and ignores system_message."""
+    events = [
+        {"event": "init", "init": {"conversation_id": "conv-ctx-1", "model": "gemini-4-argon"}},
+        {
+            "event": "step_update",
+            "step_update": {
+                "step_index": 1,
+                "step_type": "agent_response",
+                "state": "DONE",
+                "usage": {
+                    "input_tokens": 23917,
+                    "output_tokens": 159,
+                    "thinking_tokens": 112,
+                    "cache_read_tokens": 0,
+                    "total_tokens": 24076,
+                },
+            },
+        },
+        {
+            "event": "step_update",
+            "step_update": {
+                "step_index": 3,
+                "step_type": "agent_response",
+                "state": "DONE",
+                "text": "Final answer",
+                "usage": {
+                    "input_tokens": 3334,
+                    "output_tokens": 1009,
+                    "thinking_tokens": 989,
+                    "cache_read_tokens": 25837,
+                    "total_tokens": 4343,
+                },
+            },
+        },
+        {
+            "event": "step_update",
+            "step_update": {
+                "step_index": 4,
+                "step_type": "system_message",
+                "state": "DONE",
+            },
+        },
+        {
+            "event": "result",
+            "result": {
+                "status": "SUCCESS",
+                "conversation_id": "conv-ctx-1",
+                "response": "Final answer",
+                "usage": {
+                    "input_tokens": 415816,
+                    "output_tokens": 19955,
+                    "thinking_tokens": 15000,
+                    "cache_read_tokens": 5748702,
+                    "total_tokens": 6199473,
+                },
+            },
+        },
+    ]
+    script_lines = ["#!/bin/sh"] + [f"printf '%s\\n' '{json.dumps(e)}'" for e in events]
+    fake_agy = _write_executable(tmp_path / "agy", "\n".join(script_lines) + "\n")
+
+    provider = AgyCliProvider(bin_path=fake_agy, save_dir=tmp_path)
+    await provider.start_or_resume_agent(session_id="sess-ctx-1", cwd=str(tmp_path))
+    tool_calls: list[ToolCallEvent] = []
+    usage_events: list[int] = []
+
+    async def _on_tool_call(ev: ToolCallEvent) -> bool:
+        tool_calls.append(ev)
+        return True
+
+    async def _on_usage(ctx_tokens: int) -> None:
+        usage_events.append(ctx_tokens)
+
+    outcome = await provider.stream_prompt(
+        cwd=str(tmp_path),
+        prompt="Run multi-step task",
+        session_id="sess-ctx-1",
+        on_tool_call=_on_tool_call,
+        on_usage=_on_usage,
+    )
+    assert tool_calls == []
+    # Active context window occupancy streamed at step 1 (24076) and step 3 (30180)
+    assert usage_events == [24076, 30180]
+    assert outcome.usage["context_tokens"] == 30180
+    persisted = provider.state_store.get_session("sess-ctx-1")
+    assert persisted is not None
+    assert persisted["contextTokens"] == 30180
+
+
+async def test_stream_prompt_mid_turn_steer_interrupts_and_continues_conversation(
+    tmp_path: Path,
+) -> None:
+    """Verify mid-turn steer interrupts running agy, emits steering_consumed, and resumes conv."""
+    fake_agy = _write_executable(
+        tmp_path / "agy",
+        "#!/usr/bin/env python3\n"
+        "import json, pathlib, signal, sys, time\n"
+        "signal.signal(signal.SIGINT, lambda *_: sys.exit(0))\n"
+        "args = sys.argv[1:]\n"
+        "prompt = args[args.index('-p') + 1] if '-p' in args else ''\n"
+        "conv = args[args.index('--conversation') + 1] if '--conversation' in args else ''\n"
+        "if 'INITIAL_LONG_TASK' in prompt:\n"
+        "    init_ev = {'event': 'init', 'init': {'conversation_id': 'conv-steer-777'}}\n"
+        "    print(json.dumps(init_ev), flush=True)\n"
+        "    print(json.dumps({\n"
+        "        'event': 'step_update',\n"
+        "        'step_update': {\n"
+        "            'step_index': 1,\n"
+        "            'state': 'ACTIVE',\n"
+        "            'step_type': 'agent_response',\n"
+        "            'text_delta': 'Working on initial task... ',\n"
+        "        },\n"
+        "    }), flush=True)\n"
+        "    tool_info = {'name': 'run_command', 'parameters': {'CommandLine': 'sleep 30'}}\n"
+        "    print(json.dumps({\n"
+        "        'event': 'step_update',\n"
+        "        'step_update': {\n"
+        "            'step_index': 2,\n"
+        "            'state': 'ACTIVE',\n"
+        "            'step_type': 'tool',\n"
+        "            'tool_name': 'run_command',\n"
+        "            'tool_info': tool_info,\n"
+        "        },\n"
+        "    }), flush=True)\n"
+        "    time.sleep(10)\n"
+        "else:\n"
+        "    img_ok = False\n"
+        "    for token in prompt.split():\n"
+        "        if token.endswith('.png') and pathlib.Path(token).is_file():\n"
+        "            img_ok = True\n"
+        "    cid = conv or 'conv-steer-777'\n"
+        "    print(json.dumps({'event': 'init', 'init': {'conversation_id': cid}}), flush=True)\n"
+        "    first_line = prompt.splitlines()[0]\n"
+        "    delta = f'Steered on {conv} (image_exists={img_ok}): {first_line}'\n"
+        "    print(json.dumps({\n"
+        "        'event': 'step_update',\n"
+        "        'step_update': {\n"
+        "            'step_index': 3,\n"
+        "            'state': 'DONE',\n"
+        "            'step_type': 'agent_response',\n"
+        "            'text_delta': delta,\n"
+        "        },\n"
+        "    }), flush=True)\n"
+        "    print(json.dumps({\n"
+        "        'event': 'result',\n"
+        "        'result': {\n"
+        "            'conversation_id': cid,\n"
+        "            'status': 'SUCCESS',\n"
+        "            'response': 'Steered response',\n"
+        "            'usage': {'input_tokens': 25, 'output_tokens': 12, 'total_tokens': 37},\n"
+        "        },\n"
+        "    }), flush=True)\n",
+    )
+
+    provider = AgyCliProvider(bin_path=fake_agy, save_dir=tmp_path)
+    await provider.start_or_resume_agent(session_id="sess-steer-1", cwd=str(tmp_path))
+
+    first_tool_started = anyio.Event()
+    texts: list[str] = []
+    tool_updates: list[ToolCallEvent] = []
+    consumed_steers: list[str] = []
+
+    async def _on_text(chunk: str) -> None:
+        texts.append(chunk)
+
+    async def _on_tool_call(ev: ToolCallEvent) -> bool:
+        _ = ev
+        first_tool_started.set()
+        return True
+
+    async def _on_tool_update(ev: ToolCallEvent) -> None:
+        tool_updates.append(ev)
+
+    async def _on_steer_consumed(raw_content: str) -> None:
+        consumed_steers.append(raw_content)
+
+    temp_img = tmp_path / "staged-steer-img.png"
+    temp_img.write_bytes(b"\x89PNG\r\n\x1a\n")
+    raw_steer_msg = (
+        "<user_message>\n![image](/tmp/upload.png)\n\n"
+        "Here are the errors from the IDE\n</user_message>"
+    )
+    steered_prompt = (
+        f"Here are the errors from the IDE\n\n"
+        f"[User attached an image: {temp_img} — inspect it with view_file if needed]"
+    )
+
+    outcome: Any = None
+
+    async def _run_turn() -> None:
+        nonlocal outcome
+        outcome = await provider.stream_prompt(
+            cwd=str(tmp_path),
+            prompt="INITIAL_LONG_TASK",
+            session_id="sess-steer-1",
+            on_text=_on_text,
+            on_tool_call=_on_tool_call,
+            on_tool_update=_on_tool_update,
+            on_steer_consumed=_on_steer_consumed,
+        )
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(_run_turn)
+        await first_tool_started.wait()
+        assert provider.is_turn_active("sess-steer-1") is True
+        queued = await provider.steer_session(
+            "sess-steer-1",
+            raw_message=raw_steer_msg,
+            prompt=steered_prompt,
+            temp_files=[temp_img],
+        )
+        assert queued is True
+
+    assert outcome is not None
+    assert outcome.stop_reason == "end_turn"
+    assert outcome.conversation_id == "conv-steer-777"
+    assert consumed_steers == [raw_steer_msg]
+    assert any(u.status in {"completed", "failed"} for u in tool_updates)
+    full_text = "".join(texts)
+    assert "Working on initial task..." in full_text
+    assert (
+        "Steered on conv-steer-777 (image_exists=True): Here are the errors from the IDE"
+        in full_text
+    )
+    assert not temp_img.exists()

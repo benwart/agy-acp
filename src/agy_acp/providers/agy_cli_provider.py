@@ -85,6 +85,15 @@ class PromptOutcome:
     resolved_model: str = ""
 
 
+@dataclass(frozen=True)
+class QueuedSteer:
+    """Mid-turn steering message queued for an active `agy` turn."""
+
+    raw_message: str
+    prompt: str
+    temp_files: list[Path] = field(default_factory=list)
+
+
 def _pairs_to_dict(items: Any) -> dict[str, str]:
     """Convert a list of `{"name": ..., "value": ...}` dicts or a mapping into `dict[str, str]`."""
     if isinstance(items, dict):
@@ -504,6 +513,10 @@ class AgyCliProvider:
             )
         self._active_processes: dict[str, anyio.abc.Process] = {}
         self._cancelled_sessions: set[str] = set()
+        self._active_turns: set[str] = set()
+        self._steer_queues: dict[str, list[QueuedSteer]] = {}
+        self._in_permission_request: dict[str, int] = {}
+        self._turn_conv_ids: dict[str, str] = {}
 
     def sync_mcp_servers(self, mcp_servers: list[dict[str, Any]]) -> list[str]:
         """Synchronize MCP server configurations into `agy`'s `mcp_config.json`."""
@@ -694,10 +707,57 @@ class AgyCliProvider:
         self._store.upsert_session(state)
         return sid
 
+    def is_turn_active(self, session_id: str) -> bool:
+        """Return whether `session_id` currently has an active `stream_prompt` turn."""
+        return session_id in self._active_turns or session_id in self._active_processes
+
+    def _pop_queued_steers(self, session_id: str) -> list[QueuedSteer]:
+        """Pop and return all queued mid-turn steers for `session_id`."""
+        queue = self._steer_queues.pop(session_id, [])
+        return list(queue)
+
+    def _interrupt_process_for_steer(self, session_id: str) -> None:
+        """Interrupt the active `agy` subprocess for `session_id` when safe to steer."""
+        if self._in_permission_request.get(session_id, 0) > 0:
+            return
+        proc = self._active_processes.get(session_id)
+        if proc is not None and proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError, OSError):
+                proc.send_signal(signal.SIGINT)
+            with contextlib.suppress(ProcessLookupError, OSError):
+                proc.terminate()
+
+    async def steer_session(
+        self,
+        session_id: str,
+        *,
+        raw_message: str,
+        prompt: str,
+        temp_files: list[Path] | None = None,
+    ) -> bool:
+        """Queue a mid-turn steer and interrupt the active `agy` subprocess to continue."""
+        await anyio.sleep(0)
+        if not self.is_turn_active(session_id) or session_id in self._cancelled_sessions:
+            return False
+        self._steer_queues.setdefault(session_id, []).append(
+            QueuedSteer(
+                raw_message=raw_message,
+                prompt=prompt,
+                temp_files=list(temp_files or []),
+            )
+        )
+        if self._turn_conv_ids.get(session_id):
+            self._interrupt_process_for_steer(session_id)
+        return True
+
     async def cancel_session(self, session_id: str) -> bool:
         """Send SIGINT/terminate to an active `agy` subprocess for `session_id`."""
         await anyio.sleep(0)
         self._cancelled_sessions.add(session_id)
+        for steer in self._pop_queued_steers(session_id):
+            for tmp in steer.temp_files:
+                with contextlib.suppress(OSError):
+                    tmp.unlink(missing_ok=True)
         proc = self._active_processes.get(session_id)
         if proc is not None and proc.returncode is None:
             with contextlib.suppress(ProcessLookupError, OSError):
@@ -724,6 +784,8 @@ class AgyCliProvider:
         on_text: Callable[[str], Awaitable[None]] | None = None,
         on_tool_call: Callable[[ToolCallEvent], Awaitable[bool]] | None = None,
         on_tool_update: Callable[[ToolCallEvent], Awaitable[None]] | None = None,
+        on_usage: Callable[[int], Awaitable[None]] | None = None,
+        on_steer_consumed: Callable[[str], Awaitable[None]] | None = None,
     ) -> PromptOutcome:
         """Spawn `agy --output-format stream-json` via `anyio.open_process` and stream events."""
         sid = session_id or "default"
@@ -742,364 +804,474 @@ class AgyCliProvider:
                 },
             )
 
-        prompt_arg, temp_file = prepare_prompt_arg(prompt, session_id=sid)
-        args = build_agy_args(
-            cwd=cwd,
-            prompt_arg=prompt_arg,
-            conversation_id=conversation_id,
-            model=model,
-            mode=mode,
-            effort=effort,
-            skip_permissions=skip_permissions,
-            sandbox=sandbox,
-            output_format="stream-json",
-        )
         merged_env = {**os.environ, **(env or {})}
         effective_cwd = cwd if cwd and Path(cwd).is_dir() else None
 
         resolved_conv_id = conversation_id or ""
         resolved_model = model or ""
-        emitted_thoughts_by_step: dict[int, int] = {}
-
-        emitted_texts_by_step: dict[int, int] = {}
-        active_tool_calls: dict[int, str] = {}
-        rejected_tool_steps: set[int] = set()
-        streamed_any_text = False
+        current_prompt = prompt
+        current_model = model
         collected_texts: list[str] = []
-        plain_stdout_lines: list[str] = []
-        stderr_chunks: list[str] = []
         final_result_obj: dict[str, Any] = {}
+        last_step_context_tokens: int = 0
         usage: dict[str, int] = {
             "input_tokens": 0,
             "output_tokens": 0,
             "thinking_tokens": 0,
             "cache_read_tokens": 0,
             "total_tokens": 0,
+            "context_tokens": 0,
         }
+        steer_temp_files: list[Path] = []
+        self._active_turns.add(sid)
+        self._turn_conv_ids[sid] = resolved_conv_id
 
-        async def _handle_step_update(step: dict[str, Any]) -> None:
-            nonlocal streamed_any_text
-            step_idx = int(step.get("step_index", step.get("idx", 0)))
-            step_type = str(step.get("step_type", step.get("type_name", "")))
-            status_raw = str(step.get("status", step.get("state", "RUNNING"))).upper()
-
-            if self._store.get_session(sid) is not None:
-                self._store.upsert_step(
-                    session_id=sid,
-                    idx=step_idx,
-                    step_type=step_type or "step",
-                    status=status_raw,
-                    data=step,
+        try:
+            while True:
+                prompt_arg, temp_file = prepare_prompt_arg(current_prompt, session_id=sid)
+                args = build_agy_args(
+                    cwd=cwd,
+                    prompt_arg=prompt_arg,
+                    conversation_id=resolved_conv_id or None,
+                    model=current_model,
+                    mode=mode,
+                    effort=effort,
+                    skip_permissions=skip_permissions,
+                    sandbox=sandbox,
+                    output_format="stream-json",
                 )
+                emitted_thoughts_by_step: dict[int, int] = {}
+                emitted_texts_by_step: dict[int, int] = {}
+                active_tool_calls: dict[int, ToolCallEvent] = {}
+                completed_tool_steps: set[int] = set()
+                rejected_tool_steps: set[int] = set()
+                streamed_any_text = False
+                plain_stdout_lines: list[str] = []
+                stderr_chunks: list[str] = []
+                run_result_obj: dict[str, Any] = {}
 
-            thinking_delta = step.get("thinking_delta")
-            thinking_full = step.get("thinking")
-            if isinstance(thinking_delta, str) and thinking_delta:
-                if on_thought is not None:
-                    await on_thought(thinking_delta)
-            elif isinstance(thinking_full, str) and thinking_full:
-                prev_len = emitted_thoughts_by_step.get(step_idx, 0)
-                if len(thinking_full) > prev_len:
-                    delta = thinking_full[prev_len:]
-                    emitted_thoughts_by_step[step_idx] = len(thinking_full)
-                    if on_thought is not None:
-                        await on_thought(delta)
+                async def _handle_step_update(
+                    step: dict[str, Any],
+                    *,
+                    _emitted_thoughts: dict[int, int] = emitted_thoughts_by_step,
+                    _emitted_texts: dict[int, int] = emitted_texts_by_step,
+                    _active_tools: dict[int, ToolCallEvent] = active_tool_calls,
+                    _completed_tools: set[int] = completed_tool_steps,
+                    _rejected_tools: set[int] = rejected_tool_steps,
+                    _run_prompt: str = current_prompt,
+                ) -> None:
+                    nonlocal streamed_any_text, last_step_context_tokens
+                    step_idx = int(step.get("step_index", step.get("idx", 0)))
+                    step_type = str(step.get("step_type", step.get("type_name", "")))
+                    status_raw = str(step.get("status", step.get("state", "RUNNING"))).upper()
 
-            tool_info = step.get("tool_info")
-            tool_name = str(
-                step.get("tool_name")
-                or (tool_info.get("tool_name") if isinstance(tool_info, dict) else "")
-                or (tool_info.get("name") if isinstance(tool_info, dict) else "")
-                or ""
-            )
-            is_tool_step = bool(
-                tool_name
-                or isinstance(tool_info, dict)
-                or (
-                    step_type
-                    and step_type.lower()
-                    not in {
-                        "agent_response",
-                        "planner_response",
-                        "user_input",
-                        "thinking",
-                        "text",
-                        "checkpoint",
-                        "ephemeral_message",
-                    }
-                )
-            )
+                    step_usage = step.get("usage")
+                    step_ctx = 0
+                    if isinstance(step_usage, dict):
+                        step_ctx = (
+                            int(step_usage.get("input_tokens", 0))
+                            + int(step_usage.get("cache_read_tokens", 0))
+                            + int(step_usage.get("output_tokens", 0))
+                        )
+                        if step_ctx > 0:
+                            last_step_context_tokens = step_ctx
 
-            if is_tool_step:
-                raw_args: dict[str, Any] = {}
-                if isinstance(tool_info, dict):
-                    params = tool_info.get("arguments") or tool_info.get("parameters")
-                    if isinstance(params, dict):
-                        raw_args = params
-                elif isinstance(step.get("arguments"), dict):
-                    raw_args = dict(step["arguments"])
+                    if self._store.get_session(sid) is not None:
+                        self._store.upsert_step(
+                            session_id=sid,
+                            idx=step_idx,
+                            step_type=step_type or "step",
+                            status=status_raw,
+                            data=step,
+                        )
+                    if step_ctx > 0 and on_usage is not None:
+                        await on_usage(step_ctx)
 
-                kiro_tool_name, mcp_server_name, kiro_tool_id = _resolve_kiro_tool_identity(
-                    step_type, tool_name, raw_args
-                )
-                kind, title, locations = _classify_tool_step(step_type, tool_name, raw_args)
-                raw_args = _normalize_tool_arguments(raw_args, tool_name=tool_name)
-                is_done = any(
-                    tok in status_raw for tok in ("DONE", "COMPLETED", "SUCCESS", "ERROR", "FAILED")
-                )
-                is_failed = any(tok in status_raw for tok in ("ERROR", "FAILED", "CANCELED")) or (
-                    isinstance(tool_info, dict) and bool(tool_info.get("call_error"))
-                )
+                    thinking_delta = step.get("thinking_delta")
+                    thinking_full = step.get("thinking")
+                    if isinstance(thinking_delta, str) and thinking_delta:
+                        if on_thought is not None:
+                            await on_thought(thinking_delta)
+                    elif isinstance(thinking_full, str) and thinking_full:
+                        prev_len = _emitted_thoughts.get(step_idx, 0)
+                        if len(thinking_full) > prev_len:
+                            delta = thinking_full[prev_len:]
+                            _emitted_thoughts[step_idx] = len(thinking_full)
+                            if on_thought is not None:
+                                await on_thought(delta)
 
-                if step_idx not in active_tool_calls:
-                    tc_id = f"tc_{uuid.uuid4().hex[:12]}"
-                    active_tool_calls[step_idx] = tc_id
-                    start_event = ToolCallEvent(
-                        tool_call_id=tc_id,
-                        title=title,
-                        kind=kind,
-                        status="in_progress",
-                        raw_input=raw_args or ({"command": prompt} if kind == "execute" else {}),
-                        locations=locations,
-                        kiro_tool_name=kiro_tool_name,
-                        mcp_server_name=mcp_server_name,
-                        kiro_tool_id=kiro_tool_id,
+                    tool_info = step.get("tool_info")
+                    tool_name = str(
+                        step.get("tool_name")
+                        or (tool_info.get("tool_name") if isinstance(tool_info, dict) else "")
+                        or (tool_info.get("name") if isinstance(tool_info, dict) else "")
+                        or ""
+                    )
+                    is_tool_step = bool(
+                        tool_name
+                        or isinstance(tool_info, dict)
+                        or (
+                            step_type
+                            and step_type.lower()
+                            not in {
+                                "agent_response",
+                                "planner_response",
+                                "user_input",
+                                "thinking",
+                                "text",
+                                "checkpoint",
+                                "ephemeral_message",
+                                "system_message",
+                                "system",
+                                "error",
+                                "summary",
+                                "compaction",
+                            }
+                        )
                     )
 
-                    allowed = True
-                    if on_tool_call is not None:
-                        allowed = await on_tool_call(start_event)
-                    if not allowed:
-                        rejected_tool_steps.add(step_idx)
-                        if on_tool_update is not None:
-                            await on_tool_update(
-                                ToolCallEvent(
-                                    tool_call_id=tc_id,
-                                    title=title,
-                                    kind=kind,
-                                    status="failed",
-                                    raw_input=raw_args,
-                                    output="Tool execution rejected by user.",
-                                    locations=locations,
-                                    kiro_tool_name=kiro_tool_name,
-                                    mcp_server_name=mcp_server_name,
-                                    kiro_tool_id=kiro_tool_id,
-                                )
-                            )
-                        return
+                    if is_tool_step:
+                        raw_args: dict[str, Any] = {}
+                        if isinstance(tool_info, dict):
+                            params = tool_info.get("arguments") or tool_info.get("parameters")
+                            if isinstance(params, dict):
+                                raw_args = params
+                        elif isinstance(step.get("arguments"), dict):
+                            raw_args = dict(step["arguments"])
 
-                if is_done and step_idx not in rejected_tool_steps:
-                    tc_id = active_tool_calls[step_idx]
-                    tool_output = ""
-                    if isinstance(tool_info, dict):
-                        tool_output = str(
-                            tool_info.get("output")
-                            or tool_info.get("call_error")
-                            or step.get("output", "")
+                        kiro_tool_name, mcp_server_name, kiro_tool_id = _resolve_kiro_tool_identity(
+                            step_type, tool_name, raw_args
                         )
-                    else:
-                        tool_output = str(step.get("output", ""))
-                    if on_tool_update is not None:
-                        await on_tool_update(
-                            ToolCallEvent(
+                        kind, title, locations = _classify_tool_step(step_type, tool_name, raw_args)
+                        raw_args = _normalize_tool_arguments(raw_args, tool_name=tool_name)
+                        is_done = any(
+                            tok in status_raw
+                            for tok in ("DONE", "COMPLETED", "SUCCESS", "ERROR", "FAILED")
+                        )
+                        is_failed = any(
+                            tok in status_raw for tok in ("ERROR", "FAILED", "CANCELED")
+                        ) or (isinstance(tool_info, dict) and bool(tool_info.get("call_error")))
+
+                        if step_idx not in _active_tools:
+                            tc_id = f"tc_{uuid.uuid4().hex[:12]}"
+                            start_event = ToolCallEvent(
                                 tool_call_id=tc_id,
                                 title=title,
                                 kind=kind,
-                                status="failed" if is_failed else "completed",
-                                raw_input=raw_args,
-                                output=tool_output,
+                                status="in_progress",
+                                raw_input=raw_args
+                                or ({"command": _run_prompt} if kind == "execute" else {}),
                                 locations=locations,
                                 kiro_tool_name=kiro_tool_name,
                                 mcp_server_name=mcp_server_name,
                                 kiro_tool_id=kiro_tool_id,
                             )
-                        )
+                            _active_tools[step_idx] = start_event
 
-            text_delta = step.get("text_delta")
-            text_full = step.get("text") or step.get("response") or step.get("content")
-            if isinstance(text_delta, str) and text_delta:
-                streamed_any_text = True
-                collected_texts.append(text_delta)
-                if on_text is not None:
-                    await on_text(text_delta)
-            elif isinstance(text_full, str) and text_full and not is_tool_step:
-                prev_len = emitted_texts_by_step.get(step_idx, 0)
-                if len(text_full) > prev_len:
-                    delta = text_full[prev_len:]
-                    emitted_texts_by_step[step_idx] = len(text_full)
-                    streamed_any_text = True
-                    collected_texts.append(delta)
-                    if on_text is not None:
-                        await on_text(delta)
-
-        async def _consume_stdout(proc: anyio.abc.Process) -> None:
-            nonlocal resolved_conv_id, resolved_model, final_result_obj, streamed_any_text
-            if proc.stdout is None:
-                return
-            buffer = ""
-            async for chunk in TextReceiveStream(proc.stdout):
-                buffer += chunk
-                while "\n" in buffer:
-                    raw_line, buffer = buffer.split("\n", 1)
-                    line = raw_line.strip()
-                    if not line:
-                        continue
-                    try:
-                        payload = json.loads(line)
-                    except json.JSONDecodeError:
-                        plain_stdout_lines.append(line)
-                        continue
-                    if not isinstance(payload, dict):
-                        continue
-
-                    event_type = str(payload.get("event", ""))
-                    if event_type == "init" or "init" in payload:
-                        init_obj = payload.get("init")
-                        if isinstance(init_obj, dict):
-                            if init_obj.get("conversation_id"):
-                                resolved_conv_id = str(init_obj["conversation_id"])
-                            if init_obj.get("model"):
-                                resolved_model = str(init_obj["model"])
-                        if not resolved_conv_id and payload.get("conversation_id"):
-                            resolved_conv_id = str(payload["conversation_id"])
-
-                    elif event_type == "step_update" or "step_update" in payload:
-                        step_obj = payload.get("step_update")
-                        await _handle_step_update(
-                            step_obj if isinstance(step_obj, dict) else payload
-                        )
-                    elif event_type == "result" or "result" in payload or "status" in payload:
-                        res_obj = payload.get("result")
-                        final_result_obj = res_obj if isinstance(res_obj, dict) else payload
-                        if final_result_obj.get("conversation_id"):
-                            resolved_conv_id = str(final_result_obj["conversation_id"])
-                        raw_usage = final_result_obj.get("usage")
-                        if isinstance(raw_usage, dict):
-                            usage["input_tokens"] = int(raw_usage.get("input_tokens", 0))
-                            usage["output_tokens"] = int(raw_usage.get("output_tokens", 0))
-                            usage["thinking_tokens"] = int(raw_usage.get("thinking_tokens", 0))
-                            usage["cache_read_tokens"] = int(raw_usage.get("cache_read_tokens", 0))
-                            usage["total_tokens"] = int(
-                                raw_usage.get(
-                                    "total_tokens",
-                                    usage["input_tokens"]
-                                    + usage["output_tokens"]
-                                    + usage["thinking_tokens"]
-                                    + usage["cache_read_tokens"],
+                            allowed = True
+                            if on_tool_call is not None:
+                                self._in_permission_request[sid] = (
+                                    self._in_permission_request.get(sid, 0) + 1
                                 )
-                            )
-                        resp_text = final_result_obj.get("response")
-                        if isinstance(resp_text, str) and resp_text and not streamed_any_text:
+                                try:
+                                    allowed = await on_tool_call(start_event)
+                                finally:
+                                    remaining = max(0, self._in_permission_request.get(sid, 1) - 1)
+                                    self._in_permission_request[sid] = remaining
+                                    if (
+                                        remaining == 0
+                                        and self._steer_queues.get(sid)
+                                        and self._turn_conv_ids.get(sid)
+                                    ):
+                                        self._interrupt_process_for_steer(sid)
+                            if not allowed:
+                                _rejected_tools.add(step_idx)
+                                if on_tool_update is not None:
+                                    await on_tool_update(
+                                        ToolCallEvent(
+                                            tool_call_id=tc_id,
+                                            title=title,
+                                            kind=kind,
+                                            status="failed",
+                                            raw_input=raw_args,
+                                            output="Tool execution rejected by user.",
+                                            locations=locations,
+                                            kiro_tool_name=kiro_tool_name,
+                                            mcp_server_name=mcp_server_name,
+                                            kiro_tool_id=kiro_tool_id,
+                                        )
+                                    )
+                                return
+
+                        if is_done and step_idx not in _rejected_tools:
+                            _completed_tools.add(step_idx)
+                            tc_id = _active_tools[step_idx].tool_call_id
+                            tool_output = ""
+                            if isinstance(tool_info, dict):
+                                tool_output = str(
+                                    tool_info.get("output")
+                                    or tool_info.get("call_error")
+                                    or step.get("output", "")
+                                )
+                            else:
+                                tool_output = str(step.get("output", ""))
+                            if on_tool_update is not None:
+                                await on_tool_update(
+                                    ToolCallEvent(
+                                        tool_call_id=tc_id,
+                                        title=title,
+                                        kind=kind,
+                                        status="failed" if is_failed else "completed",
+                                        raw_input=raw_args,
+                                        output=tool_output,
+                                        locations=locations,
+                                        kiro_tool_name=kiro_tool_name,
+                                        mcp_server_name=mcp_server_name,
+                                        kiro_tool_id=kiro_tool_id,
+                                    )
+                                )
+
+                    text_delta = step.get("text_delta")
+                    text_full = step.get("text") or step.get("response") or step.get("content")
+                    if isinstance(text_delta, str) and text_delta:
+                        streamed_any_text = True
+                        collected_texts.append(text_delta)
+                        if on_text is not None:
+                            await on_text(text_delta)
+                    elif isinstance(text_full, str) and text_full and not is_tool_step:
+                        prev_len = _emitted_texts.get(step_idx, 0)
+                        if len(text_full) > prev_len:
+                            delta = text_full[prev_len:]
+                            _emitted_texts[step_idx] = len(text_full)
                             streamed_any_text = True
-                            collected_texts.append(resp_text)
+                            collected_texts.append(delta)
                             if on_text is not None:
-                                await on_text(resp_text)
+                                await on_text(delta)
 
-            trailing = buffer.strip()
-            if trailing:
-                with contextlib.suppress(json.JSONDecodeError):
-                    payload = json.loads(trailing)
-                    if isinstance(payload, dict):
-                        res_obj = payload.get("result")
-                        final_result_obj = res_obj if isinstance(res_obj, dict) else payload
+                async def _consume_stdout(
+                    proc: anyio.abc.Process,
+                    *,
+                    _plain_lines: list[str] = plain_stdout_lines,
+                ) -> None:
+                    nonlocal resolved_conv_id, resolved_model, run_result_obj, streamed_any_text
+                    if proc.stdout is None:
+                        return
+                    buffer = ""
+                    async for chunk in TextReceiveStream(proc.stdout):
+                        buffer += chunk
+                        while "\n" in buffer:
+                            raw_line, buffer = buffer.split("\n", 1)
+                            line = raw_line.strip()
+                            if not line:
+                                continue
+                            try:
+                                payload = json.loads(line)
+                            except json.JSONDecodeError:
+                                _plain_lines.append(line)
+                                continue
+                            if not isinstance(payload, dict):
+                                continue
 
-        async def _consume_stderr(proc: anyio.abc.Process) -> None:
-            if proc.stderr is None:
-                return
-            async for chunk in TextReceiveStream(proc.stderr):
-                stderr_chunks.append(chunk)
+                            event_type = str(payload.get("event", ""))
+                            if event_type == "init" or "init" in payload:
+                                init_obj = payload.get("init")
+                                if isinstance(init_obj, dict):
+                                    if init_obj.get("conversation_id"):
+                                        resolved_conv_id = str(init_obj["conversation_id"])
+                                    if init_obj.get("model"):
+                                        resolved_model = str(init_obj["model"])
+                                if not resolved_conv_id and payload.get("conversation_id"):
+                                    resolved_conv_id = str(payload["conversation_id"])
+                                if resolved_conv_id:
+                                    self._turn_conv_ids[sid] = resolved_conv_id
+                                    if self._steer_queues.get(sid):
+                                        self._interrupt_process_for_steer(sid)
 
-        proc: anyio.abc.Process | None = None
-        try:
-            log_acp_event(
-                "agy.spawn",
-                save_dir_or_db=self._store.db_path,
-                session_id=sid,
-                bin_path=self.bin_path,
-                args=args,
-                cwd=effective_cwd,
-            )
-            proc = await anyio.open_process(
-                [self.bin_path, *args],
-                cwd=effective_cwd,
-                env=merged_env,
-            )
-            self._active_processes[sid] = proc
-            async with proc:
-                async with anyio.create_task_group() as tg:
-                    tg.start_soon(_consume_stdout, proc)
-                    tg.start_soon(_consume_stderr, proc)
-                await proc.wait()
-            log_acp_event(
-                "agy.exit",
-                save_dir_or_db=self._store.db_path,
-                session_id=sid,
-                returncode=proc.returncode,
-                stderr="".join(stderr_chunks).strip(),
-                result_status=final_result_obj.get("status"),
-                result_error=final_result_obj.get("error"),
-            )
-        except anyio.get_cancelled_exc_class():
-            if proc is not None and proc.returncode is None:
-                with contextlib.suppress(ProcessLookupError, OSError):
-                    proc.send_signal(signal.SIGINT)
-                with contextlib.suppress(ProcessLookupError, OSError):
-                    proc.terminate()
-            raise
+                            elif event_type == "step_update" or "step_update" in payload:
+                                step_obj = payload.get("step_update")
+                                await _handle_step_update(
+                                    step_obj if isinstance(step_obj, dict) else payload
+                                )
+                            elif (
+                                event_type == "result" or "result" in payload or "status" in payload
+                            ):
+                                res_obj = payload.get("result")
+                                run_result_obj = res_obj if isinstance(res_obj, dict) else payload
+                                if run_result_obj.get("conversation_id"):
+                                    resolved_conv_id = str(run_result_obj["conversation_id"])
+                                    self._turn_conv_ids[sid] = resolved_conv_id
+                                raw_usage = run_result_obj.get("usage")
+                                if isinstance(raw_usage, dict):
+                                    in_tok = int(raw_usage.get("input_tokens", 0))
+                                    out_tok = int(raw_usage.get("output_tokens", 0))
+                                    think_tok = int(raw_usage.get("thinking_tokens", 0))
+                                    cache_tok = int(raw_usage.get("cache_read_tokens", 0))
+                                    tot_tok = int(
+                                        raw_usage.get(
+                                            "total_tokens",
+                                            in_tok + out_tok + think_tok + cache_tok,
+                                        )
+                                    )
+                                    usage["input_tokens"] += in_tok
+                                    usage["output_tokens"] += out_tok
+                                    usage["thinking_tokens"] += think_tok
+                                    usage["cache_read_tokens"] += cache_tok
+                                    usage["total_tokens"] += tot_tok
+                                resp_text = run_result_obj.get("response")
+                                if (
+                                    isinstance(resp_text, str)
+                                    and resp_text
+                                    and not streamed_any_text
+                                ):
+                                    streamed_any_text = True
+                                    collected_texts.append(resp_text)
+                                    if on_text is not None:
+                                        await on_text(resp_text)
+
+                    trailing = buffer.strip()
+                    if trailing:
+                        with contextlib.suppress(json.JSONDecodeError):
+                            payload = json.loads(trailing)
+                            if isinstance(payload, dict):
+                                res_obj = payload.get("result")
+                                run_result_obj = res_obj if isinstance(res_obj, dict) else payload
+
+                async def _consume_stderr(
+                    proc: anyio.abc.Process,
+                    *,
+                    _stderr_chunks: list[str] = stderr_chunks,
+                ) -> None:
+                    if proc.stderr is None:
+                        return
+                    async for chunk in TextReceiveStream(proc.stderr):
+                        _stderr_chunks.append(chunk)
+
+                proc: anyio.abc.Process | None = None
+                try:
+                    log_acp_event(
+                        "agy.spawn",
+                        save_dir_or_db=self._store.db_path,
+                        session_id=sid,
+                        bin_path=self.bin_path,
+                        args=args,
+                        cwd=effective_cwd,
+                    )
+                    proc = await anyio.open_process(
+                        [self.bin_path, *args],
+                        cwd=effective_cwd,
+                        env=merged_env,
+                    )
+                    self._active_processes[sid] = proc
+                    if self._steer_queues.get(sid) and self._turn_conv_ids.get(sid):
+                        self._interrupt_process_for_steer(sid)
+                    async with proc:
+                        async with anyio.create_task_group() as tg:
+                            tg.start_soon(_consume_stdout, proc)
+                            tg.start_soon(_consume_stderr, proc)
+                        await proc.wait()
+                    log_acp_event(
+                        "agy.exit",
+                        save_dir_or_db=self._store.db_path,
+                        session_id=sid,
+                        returncode=proc.returncode,
+                        stderr="".join(stderr_chunks).strip(),
+                        result_status=run_result_obj.get("status"),
+                        result_error=run_result_obj.get("error"),
+                    )
+                except anyio.get_cancelled_exc_class():
+                    if proc is not None and proc.returncode is None:
+                        with contextlib.suppress(ProcessLookupError, OSError):
+                            proc.send_signal(signal.SIGINT)
+                        with contextlib.suppress(ProcessLookupError, OSError):
+                            proc.terminate()
+                    raise
+                finally:
+                    self._active_processes.pop(sid, None)
+                    if temp_file is not None:
+                        with contextlib.suppress(OSError):
+                            temp_file.unlink(missing_ok=True)
+
+                final_result_obj = run_result_obj
+                was_cancelled = sid in self._cancelled_sessions or (
+                    not self._steer_queues.get(sid)
+                    and str(final_result_obj.get("status", "")).upper() in {"CANCELLED", "CANCELED"}
+                )
+                self._cancelled_sessions.discard(sid)
+                if was_cancelled:
+                    return PromptOutcome(
+                        conversation_id=resolved_conv_id,
+                        stop_reason="cancelled",
+                        response="".join(collected_texts),
+                        usage=usage,
+                        raw_result=final_result_obj,
+                    )
+
+                err_msg = str(final_result_obj.get("error", ""))
+                if (
+                    current_model
+                    and str(final_result_obj.get("status", "")).upper() == "ERROR"
+                    and "invalid model" in err_msg.lower()
+                ):
+                    log_acp_event(
+                        "agy.model_fallback",
+                        save_dir_or_db=self._store.db_path,
+                        session_id=sid,
+                        rejected_model=current_model,
+                        error=err_msg,
+                    )
+                    current_model = None
+                    continue
+
+                if not streamed_any_text and plain_stdout_lines:
+                    fallback_text = "\n".join(plain_stdout_lines)
+                    collected_texts.append(fallback_text)
+                    if on_text is not None:
+                        await on_text(fallback_text)
+
+                if self._steer_queues.get(sid):
+                    if on_tool_update is not None:
+                        for step_idx, tc_start in active_tool_calls.items():
+                            if (
+                                step_idx not in completed_tool_steps
+                                and step_idx not in rejected_tool_steps
+                            ):
+                                await on_tool_update(
+                                    ToolCallEvent(
+                                        tool_call_id=tc_start.tool_call_id,
+                                        title=tc_start.title,
+                                        kind=tc_start.kind,
+                                        status="completed",
+                                        raw_input=tc_start.raw_input,
+                                        output="Interrupted by user steering.",
+                                        locations=tc_start.locations,
+                                        kiro_tool_name=tc_start.kiro_tool_name,
+                                        mcp_server_name=tc_start.mcp_server_name,
+                                        kiro_tool_id=tc_start.kiro_tool_id,
+                                    )
+                                )
+                    steers = self._pop_queued_steers(sid)
+                    for s in steers:
+                        steer_temp_files.extend(s.temp_files)
+                    if resolved_conv_id:
+                        persisted = self._store.get_session(sid)
+                        if persisted is not None:
+                            persisted["agyConversationId"] = resolved_conv_id
+                            self._store.upsert_session(persisted)
+                    if on_steer_consumed is not None:
+                        await on_steer_consumed("\n".join(s.raw_message for s in steers))
+                    current_prompt = "\n\n".join(s.prompt for s in steers if s.prompt)
+                    continue
+
+                break
         finally:
-            self._active_processes.pop(sid, None)
-            if temp_file is not None:
+            self._active_turns.discard(sid)
+            self._turn_conv_ids.pop(sid, None)
+            self._in_permission_request.pop(sid, None)
+            for leftover in self._pop_queued_steers(sid):
+                steer_temp_files.extend(leftover.temp_files)
+            for tmp_path in steer_temp_files:
                 with contextlib.suppress(OSError):
-                    temp_file.unlink(missing_ok=True)
-
-        was_cancelled = sid in self._cancelled_sessions or (
-            str(final_result_obj.get("status", "")).upper() in {"CANCELLED", "CANCELED"}
-        )
-        self._cancelled_sessions.discard(sid)
-        if was_cancelled:
-            return PromptOutcome(
-                conversation_id=resolved_conv_id,
-                stop_reason="cancelled",
-                response="".join(collected_texts),
-                usage=usage,
-                raw_result=final_result_obj,
-            )
-
-        err_msg = str(final_result_obj.get("error", ""))
-        if (
-            model
-            and str(final_result_obj.get("status", "")).upper() == "ERROR"
-            and "invalid model" in err_msg.lower()
-        ):
-            log_acp_event(
-                "agy.model_fallback",
-                save_dir_or_db=self._store.db_path,
-                session_id=sid,
-                rejected_model=model,
-                error=err_msg,
-            )
-            return await self.stream_prompt(
-                cwd=cwd,
-                prompt=prompt,
-                session_id=session_id,
-                conversation_id=conversation_id,
-                model=None,
-                mode=mode,
-                effort=effort,
-                skip_permissions=skip_permissions,
-                sandbox=sandbox,
-                env=env,
-                on_thought=on_thought,
-                on_text=on_text,
-                on_tool_call=on_tool_call,
-                on_tool_update=on_tool_update,
-            )
-
-        if not streamed_any_text and plain_stdout_lines:
-            fallback_text = "\n".join(plain_stdout_lines)
-            collected_texts.append(fallback_text)
-            if on_text is not None:
-                await on_text(fallback_text)
+                    tmp_path.unlink(missing_ok=True)
 
         full_response = "".join(collected_texts)
         if usage["input_tokens"] == 0 and prompt:
@@ -1113,6 +1285,16 @@ class AgyCliProvider:
                 + usage["thinking_tokens"]
                 + usage["cache_read_tokens"]
             )
+        usage["context_tokens"] = (
+            last_step_context_tokens
+            if last_step_context_tokens > 0
+            else (
+                usage["input_tokens"]
+                + usage["output_tokens"]
+                + usage["thinking_tokens"]
+                + usage["cache_read_tokens"]
+            )
+        )
 
         return PromptOutcome(
             conversation_id=resolved_conv_id,

@@ -12,7 +12,7 @@ from typing import Any
 import anyio
 
 from agy_acp.logic.acp_dispatcher import AcpDispatcher
-from agy_acp.logic.auth_manager import AuthManager
+from agy_acp.logic.auth_manager import AuthManager, ensure_kiro_identity_store
 from agy_acp.logic.session_manager import SessionManager
 from agy_acp.providers.acp_logger import log_acp_event, snapshot_relevant_env
 
@@ -36,6 +36,8 @@ async def default(
     **extra_kwargs: Any,
 ) -> int:
     """Start the Agent Client Protocol (ACP) JSON-RPC 2.0 server over stdio."""
+    if save_dir is None:
+        ensure_kiro_identity_store()
     log_acp_event(
         "serve.start",
         save_dir_or_db=save_dir,

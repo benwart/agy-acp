@@ -131,3 +131,33 @@ async def test_oauth_browser_flow_pkce_loopback_and_token_exchange(tmp_path: Pat
     stored = json.loads(auth_file.read_text(encoding="utf-8"))
     assert stored["oauth_token"]["access_token"] == "ya29.fake-access-token"
     assert stored["oauth_token"]["refresh_token"] == "1//fake-refresh-token"
+
+
+def test_ensure_kiro_identity_store_seeds_stable_identity_claims(tmp_path: Path) -> None:
+    """Verify ensure_kiro_identity_store seeds stable Kiro identity claims when auth_kv is empty."""
+    import json
+    import sqlite3
+
+    from agy_acp.logic.auth_manager import ensure_kiro_identity_store
+
+    db_path = tmp_path / "kiro-cli" / "data.sqlite3"
+    seeded = ensure_kiro_identity_store(db_path)
+    assert seeded is True
+    assert db_path.is_file()
+
+    conn = sqlite3.connect(db_path)
+    auth_rows = dict(conn.execute("SELECT key, value FROM auth_kv").fetchall())
+    assert "agy-acp:identity" in auth_rows
+    claim_blob = json.loads(auth_rows["agy-acp:identity"])
+    assert claim_blob["start_url"] == "https://one.google.com/ai"
+    assert claim_blob["region"] == "us-east-1"
+    assert claim_blob["oauth_flow"] == "PKCE"
+    assert claim_blob["client_id"] == "agy-acp"
+
+    state_rows = dict(conn.execute("SELECT key, value FROM state").fetchall())
+    assert "auth.idc.start-url" in state_rows
+    assert "auth.idc.region" in state_rows
+
+    # Subsequent call when already populated is a no-op returning False
+    assert ensure_kiro_identity_store(db_path) is False
+    conn.close()

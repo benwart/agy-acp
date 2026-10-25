@@ -40,6 +40,52 @@ class QuotaTracker:
         self.thinking_tokens: int = initial["thinking_tokens"]
         self.total_tokens: int = initial["total_tokens"]
         self._total_tokens: int = self.total_tokens
+        self._session_context_tokens: dict[str, int] = {}
+
+    def get_session_context_tokens(self, session_id: str) -> int | None:
+        """Return the active context window token count for `session_id`, if recorded."""
+        cached = self._session_context_tokens.get(session_id)
+        if cached is not None:
+            return cached
+        if self._store is not None and session_id:
+            session = self._store.get_session(session_id)
+            if session is not None:
+                persisted = int(session.get("contextTokens", 0))
+                if persisted > 0:
+                    self._session_context_tokens[session_id] = persisted
+                    return persisted
+        return None
+
+    def build_usage_update_notification(
+        self,
+        *,
+        session_id: str,
+        context_tokens: int,
+    ) -> dict[str, Any]:
+        """Record `context_tokens` for `session_id` and build an ACP `usage_update` frame."""
+        active_context_tokens = max(0, int(context_tokens))
+        self._session_context_tokens[session_id] = active_context_tokens
+        if self._store is not None and session_id:
+            session = self._store.get_session(session_id)
+            if (
+                session is not None
+                and int(session.get("contextTokens", 0)) != active_context_tokens
+            ):
+                session["contextTokens"] = active_context_tokens
+                self._store.upsert_session(session)
+        return {
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "usage_update",
+                    "used": active_context_tokens,
+                    "size": self.CONTEXT_WINDOW_SIZE,
+                    "cost": {"amount": 0.0, "currency": "USD"},
+                },
+            },
+        }
 
     def record_token_usage(
         self,
@@ -273,6 +319,7 @@ class QuotaTracker:
         output_tokens: int,
         cached_read_tokens: int = 0,
         thinking_tokens: int = 0,
+        context_tokens: int | None = None,
     ) -> list[dict[str, Any]]:
         """Build `usage_update` and `_kiro.dev/metadata` notifications for KiroCrew."""
         self.record_token_usage(
@@ -281,6 +328,16 @@ class QuotaTracker:
             cached_read_tokens=cached_read_tokens,
             thinking_tokens=thinking_tokens,
         )
+        active_context_tokens = (
+            max(0, int(context_tokens))
+            if context_tokens is not None
+            else (input_tokens + output_tokens + cached_read_tokens + thinking_tokens)
+        )
+        usage_notification = self.build_usage_update_notification(
+            session_id=session_id,
+            context_tokens=active_context_tokens,
+        )
+
         five_hour = await self.get_five_hour_quota()
         seven_day = await self.get_seven_day_quota()
         credits_info = await self._provider.fetch_credits()
@@ -291,22 +348,10 @@ class QuotaTracker:
             model_id=model_id,
             g1_overage_credits=g1_overage,
         )
-        context_usage_pct = round((self._total_tokens / self.CONTEXT_WINDOW_SIZE) * 100.0, 4)
+        context_usage_pct = round((active_context_tokens / self.CONTEXT_WINDOW_SIZE) * 100.0, 4)
 
         notifications: list[dict[str, Any]] = [
-            {
-                "jsonrpc": "2.0",
-                "method": "session/update",
-                "params": {
-                    "sessionId": session_id,
-                    "update": {
-                        "sessionUpdate": "usage_update",
-                        "used": self._total_tokens,
-                        "size": self.CONTEXT_WINDOW_SIZE,
-                        "cost": {"amount": 0.0, "currency": "USD"},
-                    },
-                },
-            },
+            usage_notification,
             {
                 "jsonrpc": "2.0",
                 "method": "_kiro.dev/metadata",

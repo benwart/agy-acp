@@ -191,3 +191,50 @@ async def test_session_manager_kirocrew_spawn_agent_and_agent_modes(tmp_path: Pa
 
     assert await mgr.set_mode(session_id=sid, mode_id="custom-reviewer") == {}
     assert mgr.get_session(sid)["agent"] == "custom-reviewer"
+
+
+async def test_format_steer_message_and_markdown_local_images(tmp_path: Path) -> None:
+    """Verify markdown image links in prompts/steers are staged to temp dir with view_file hint."""
+    from agy_acp.logic.session_manager import _format_prompt_blocks, _format_steer_message
+
+    uploads_dir = tmp_path / "uploads"
+    uploads_dir.mkdir(parents=True)
+    img_file = uploads_dir / "4bd8ebef_pasted-image.png"
+    png_bytes = b"\x89PNG\r\n\x1a\nfake-png-payload"
+    img_file.write_bytes(png_bytes)
+
+    raw_steer = (
+        f"<user_message>\n![image]({img_file})\n\nHere are the errors from the IDE\n</user_message>"
+    )
+    formatted, staged_files = _format_steer_message(raw_steer)
+    try:
+        assert "<user_message>" not in formatted
+        assert "</user_message>" not in formatted
+        assert "Here are the errors from the IDE" in formatted
+        assert len(staged_files) == 1
+        staged_path = staged_files[0]
+        assert staged_path.is_file()
+        assert staged_path.read_bytes() == png_bytes
+        assert (staged_path.stat().st_mode & 0o777) == 0o600
+        assert (
+            f"[User attached an image: {staged_path} — inspect it with view_file if needed]"
+            in formatted
+        )
+    finally:
+        for f in staged_files:
+            f.unlink(missing_ok=True)
+
+    # Also verify _format_prompt_blocks extracts markdown local images from text blocks
+    prompt_text, prompt_files = _format_prompt_blocks(
+        [{"type": "text", "text": f"Check this screenshot: ![screenshot]({img_file})"}]
+    )
+    try:
+        assert len(prompt_files) == 1
+        assert prompt_files[0].read_bytes() == png_bytes
+        assert (
+            f"[User attached an image: {prompt_files[0]} — inspect it with view_file if needed]"
+            in prompt_text
+        )
+    finally:
+        for f in prompt_files:
+            f.unlink(missing_ok=True)

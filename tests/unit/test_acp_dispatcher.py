@@ -83,8 +83,21 @@ class _StubAgyCliProvider(AgyCliProvider):
         on_text: Callable[[str], Awaitable[None]] | None = None,
         on_tool_call: Callable[[ToolCallEvent], Awaitable[bool]] | None = None,
         on_tool_update: Callable[[ToolCallEvent], Awaitable[None]] | None = None,
+        on_usage: Callable[[int], Awaitable[None]] | None = None,
+        on_steer_consumed: Callable[[str], Awaitable[None]] | None = None,
     ) -> PromptOutcome:
-        _ = (cwd, session_id, model, mode, effort, skip_permissions, sandbox, env)
+        _ = (
+            cwd,
+            session_id,
+            model,
+            mode,
+            effort,
+            skip_permissions,
+            sandbox,
+            env,
+            on_usage,
+            on_steer_consumed,
+        )
         if on_thought is not None:
             await on_thought("Analyzing prompt...")
         if "tool" in prompt.lower():
@@ -428,4 +441,271 @@ async def test_kiro_commands_execute_quota_effort_mcp_and_tools() -> None:
             }
         )
     )
-    assert steer_resp == {"jsonrpc": "2.0", "id": 25, "result": {}}
+    assert steer_resp == {"jsonrpc": "2.0", "id": 25, "result": {"queued": False}}
+
+
+async def test_session_prompt_wires_active_context_tokens_to_metadata() -> None:
+    """Verify AcpDispatcher passes usage.context_tokens to QuotaTracker wire notifications."""
+
+    class _MultiStepCliProvider(_StubAgyCliProvider):
+        async def stream_prompt(self, **kwargs: Any) -> PromptOutcome:
+            on_usage = kwargs.get("on_usage")
+            if on_usage is not None:
+                await on_usage(18_500)
+            return PromptOutcome(
+                conversation_id="conv-multi-1",
+                stop_reason="end_turn",
+                response="Done",
+                usage={
+                    "input_tokens": 415_816,
+                    "output_tokens": 19_955,
+                    "thinking_tokens": 15_000,
+                    "cache_read_tokens": 5_748_702,
+                    "total_tokens": 6_199_473,
+                    "context_tokens": 30_180,
+                },
+            )
+
+    emitted: list[dict[str, Any]] = []
+
+    async def _sink(msg: dict[str, Any]) -> None:
+        emitted.append(msg)
+
+    cli = _MultiStepCliProvider()
+    dispatcher = AcpDispatcher(
+        notification_sink=_sink,
+        session_manager=SessionManager(cli_provider=cli),
+        quota_tracker=QuotaTracker(
+            provider=QuotaProvider(cli_provider=cli),
+            state_store=cli.state_store,
+        ),
+    )
+    new_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 29,
+                "method": "session/new",
+                "params": {"cwd": "/tmp", "mcpServers": []},
+            }
+        )
+    )
+    assert new_resp is not None
+    sid = new_resp["result"]["sessionId"]
+    emitted.clear()
+
+    resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 30,
+                "method": "session/prompt",
+                "params": {"sessionId": sid, "prompt": [{"type": "text", "text": "go"}]},
+            }
+        )
+    )
+    assert resp is not None
+    usage_notifs = [
+        n["params"]["update"]
+        for n in emitted
+        if n.get("method") == "session/update"
+        and n["params"]["update"].get("sessionUpdate") == "usage_update"
+    ]
+    meta_notif = next(n["params"] for n in emitted if n.get("method") == "_kiro.dev/metadata")
+    assert [u["used"] for u in usage_notifs] == [18_500, 30_180]
+    assert meta_notif["contextUsagePercentage"] == 3.018
+
+    # Verify _kiro.dev/commands/execute (/usage) and session/load re-emit persisted context_tokens
+    emitted.clear()
+    fresh_dispatcher = AcpDispatcher(
+        notification_sink=_sink,
+        session_manager=SessionManager(cli_provider=cli),
+        quota_tracker=QuotaTracker(
+            provider=QuotaProvider(cli_provider=cli),
+            state_store=cli.state_store,
+        ),
+    )
+    cmd_resp = await fresh_dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 31,
+                "method": "_kiro.dev/commands/execute",
+                "params": {"sessionId": sid, "command": {"command": "usage", "args": {}}},
+            }
+        )
+    )
+    assert cmd_resp is not None
+    cmd_usage = [
+        n["params"]["update"]
+        for n in emitted
+        if n.get("method") == "session/update"
+        and n["params"]["update"].get("sessionUpdate") == "usage_update"
+    ]
+    assert len(cmd_usage) == 1
+    assert cmd_usage[0]["used"] == 30_180
+
+    emitted.clear()
+    load_resp = await fresh_dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 32,
+                "method": "session/load",
+                "params": {"sessionId": sid, "cwd": "/tmp", "mcpServers": []},
+            }
+        )
+    )
+    assert load_resp is not None
+    load_usage = [
+        n["params"]["update"]
+        for n in emitted
+        if n.get("method") == "session/update"
+        and n["params"]["update"].get("sessionUpdate") == "usage_update"
+    ]
+    assert len(load_usage) == 1
+    assert load_usage[0]["used"] == 30_180
+
+
+async def test_mid_turn_steer_and_steering_with_image_attachment(tmp_path: Any) -> None:
+    """Verify AcpDispatcher handles _session/steer & _session/steering during an active turn."""
+    import anyio
+
+    turn_started = anyio.Event()
+    received_prompts: list[str] = []
+
+    class _SteerableStubCliProvider(_StubAgyCliProvider):
+        async def stream_prompt(self, **kwargs: Any) -> PromptOutcome:
+            sid = str(kwargs.get("session_id") or "default")
+            prompt = str(kwargs.get("prompt") or "")
+            on_text = kwargs.get("on_text")
+            on_steer_consumed = kwargs.get("on_steer_consumed")
+            self._active_turns.add(sid)
+            try:
+                received_prompts.append(prompt)
+                if on_text is not None:
+                    await on_text("Initial chunk. ")
+                turn_started.set()
+                while not self._steer_queues.get(sid):
+                    await anyio.sleep(0.01)
+                steers = self._pop_queued_steers(sid)
+                if steers and on_steer_consumed is not None:
+                    await on_steer_consumed("\n".join(s.raw_message for s in steers))
+                for s in steers:
+                    received_prompts.append(s.prompt)
+                    if on_text is not None:
+                        await on_text(f"Steered: {s.prompt}")
+                return PromptOutcome(
+                    conversation_id="conv-steered-1",
+                    stop_reason="end_turn",
+                    response="Initial chunk. Steered.",
+                    usage={
+                        "input_tokens": 10,
+                        "output_tokens": 6,
+                        "thinking_tokens": 0,
+                        "cache_read_tokens": 0,
+                        "total_tokens": 16,
+                    },
+                )
+            finally:
+                self._active_turns.discard(sid)
+
+    emitted: list[dict[str, Any]] = []
+
+    async def _sink(msg: dict[str, Any]) -> None:
+        emitted.append(msg)
+
+    cli = _SteerableStubCliProvider(save_dir=tmp_path)
+    dispatcher = AcpDispatcher(
+        notification_sink=_sink,
+        session_manager=SessionManager(save_dir=tmp_path, cli_provider=cli),
+        quota_tracker=QuotaTracker(
+            provider=QuotaProvider(cli_provider=cli),
+            state_store=cli.state_store,
+        ),
+    )
+    new_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 40,
+                "method": "session/new",
+                "params": {"cwd": str(tmp_path), "mcpServers": []},
+            }
+        )
+    )
+    assert new_resp is not None
+    sid = new_resp["result"]["sessionId"]
+    emitted.clear()
+
+    img_file = tmp_path / "pasted-ide-error.png"
+    img_file.write_bytes(b"\x89PNG\r\n\x1a\nide-error")
+    raw_steer_message = (
+        f"<user_message>\n![image]({img_file})\n\nHere are the errors from the IDE\n</user_message>"
+    )
+
+    prompt_resp: dict[str, Any] | None = None
+
+    async def _run_prompt() -> None:
+        nonlocal prompt_resp
+        prompt_resp = await dispatcher.handle_message(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 41,
+                    "method": "session/prompt",
+                    "params": {
+                        "sessionId": sid,
+                        "prompt": [{"type": "text", "text": "Start working"}],
+                    },
+                }
+            )
+        )
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(_run_prompt)
+        await turn_started.wait()
+        steer_resp = await dispatcher.handle_message(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 42,
+                    "method": "_session/steer",
+                    "params": {
+                        "sessionId": sid,
+                        "message": raw_steer_message,
+                    },
+                }
+            )
+        )
+        assert steer_resp == {"jsonrpc": "2.0", "id": 42, "result": {"queued": True}}
+
+    assert prompt_resp is not None
+    assert prompt_resp["result"]["stopReason"] == "end_turn"
+    updates = [n["params"]["update"] for n in emitted if n.get("method") == "session/update"]
+    queued_updates = [u for u in updates if u.get("sessionUpdate") == "steering_queued"]
+    consumed_updates = [u for u in updates if u.get("sessionUpdate") == "steering_consumed"]
+    assert len(queued_updates) == 1
+    assert queued_updates[0]["content"] == raw_steer_message
+    assert len(consumed_updates) == 1
+    assert consumed_updates[0]["content"] == raw_steer_message
+    assert len(received_prompts) == 2
+    assert "Here are the errors from the IDE" in received_prompts[1]
+    assert "[User attached an image:" in received_prompts[1]
+    assert "inspect it with view_file if needed]" in received_prompts[1]
+
+    # When no turn is active, _session/steering returns outcome: failed
+    idle_steering = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 43,
+                "method": "_session/steering",
+                "params": {
+                    "sessionId": sid,
+                    "prompt": [{"type": "text", "text": "Too late"}],
+                },
+            }
+        )
+    )
+    assert idle_steering == {"jsonrpc": "2.0", "id": 43, "result": {"outcome": "failed"}}

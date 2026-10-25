@@ -6,6 +6,8 @@ import base64
 import contextlib
 import copy
 import os
+import re
+import shutil
 import tempfile
 import uuid
 from collections.abc import Awaitable, Callable, Generator
@@ -45,6 +47,66 @@ _MIME_TO_EXT: dict[str, str] = {
     "image/svg+xml": "svg",
 }
 
+_IMAGE_EXTS: frozenset[str] = frozenset(
+    {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".tiff"}
+)
+_MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
+_USER_MESSAGE_BLOCK_RE = re.compile(r"<user_message>\s*(.*?)\s*</user_message>", re.DOTALL)
+
+
+def _stage_local_image_file(src_path: Path) -> Path | None:
+    """Copy a local image file into the 0600 `agy-acp-images` temp directory for `agy` access."""
+    with contextlib.suppress(OSError):
+        if not src_path.is_file():
+            return None
+        ext = src_path.suffix.lower().lstrip(".") or "png"
+        img_dir = Path(tempfile.gettempdir()) / "agy-acp-images"
+        img_dir.mkdir(parents=True, exist_ok=True)
+        dest_path = img_dir / f"img-{uuid.uuid4().hex[:12]}.{ext}"
+        fd = os.open(dest_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with src_path.open("rb") as src_file, os.fdopen(fd, "wb", closefd=False) as dst_file:
+                shutil.copyfileobj(src_file, dst_file)
+        finally:
+            os.close(fd)
+        dest_path.chmod(0o600)
+        return dest_path
+    return None
+
+
+def _extract_markdown_local_images(text: str) -> tuple[list[str], list[Path]]:
+    """Find local markdown image links (`![...](/path/img.png)`) and stage them to temp files."""
+    hints: list[str] = []
+    staged: list[Path] = []
+    seen_targets: set[str] = set()
+    for match in _MARKDOWN_IMAGE_RE.finditer(text):
+        raw_target = match.group(1).strip().strip("<>\"'")
+        if raw_target.startswith("file://"):
+            raw_target = raw_target[len("file://") :]
+        if not raw_target or raw_target in seen_targets:
+            continue
+        candidate = Path(raw_target)
+        if candidate.suffix.lower() not in _IMAGE_EXTS:
+            continue
+        seen_targets.add(raw_target)
+        staged_path = _stage_local_image_file(candidate)
+        if staged_path is not None:
+            staged.append(staged_path)
+            hints.append(
+                f"[User attached an image: {staged_path} — inspect it with view_file if needed]"
+            )
+    return hints, staged
+
+
+def _format_steer_message(raw_message: str) -> tuple[str, list[Path]]:
+    """Unwrap `<user_message>` steer text and stage any referenced local markdown images."""
+    matches = _USER_MESSAGE_BLOCK_RE.findall(raw_message)
+    body = "\n\n".join(m.strip() for m in matches if m.strip()) if matches else raw_message.strip()
+    hints, staged_images = _extract_markdown_local_images(body)
+    parts = [body] if body else []
+    parts.extend(hints)
+    return "\n\n".join(parts).strip(), staged_images
+
 
 def _write_dsh_gate_marker_if_configured() -> None:
     """Write `<nonce>\\tloaded\\n` with 0600 permissions when DSH gate env vars are set."""
@@ -77,6 +139,9 @@ def _format_prompt_blocks(
             text = str(block.get("text", ""))
             if text:
                 parts.append(text)
+                md_hints, md_images = _extract_markdown_local_images(text)
+                parts.extend(md_hints)
+                temp_images.extend(md_images)
         elif btype == "resource_link":
             uri = str(block.get("uri", ""))
             name = str(block.get("name") or uri)
@@ -464,6 +529,8 @@ class SessionManager:
         on_text: Callable[[str], Awaitable[None]] | None = None,
         on_tool_call: Callable[[ToolCallEvent], Awaitable[bool]] | None = None,
         on_tool_update: Callable[[ToolCallEvent], Awaitable[None]] | None = None,
+        on_usage: Callable[[int], Awaitable[None]] | None = None,
+        on_steer_consumed: Callable[[str], Awaitable[None]] | None = None,
     ) -> dict[str, Any]:
         """Execute a streaming turn (`session/prompt`) via the `agy` CLI subprocess."""
         if self.consume_cancellation(session_id):
@@ -495,6 +562,8 @@ class SessionManager:
                     on_text=on_text,
                     on_tool_call=on_tool_call,
                     on_tool_update=on_tool_update,
+                    on_usage=on_usage,
+                    on_steer_consumed=on_steer_consumed,
                 )
         finally:
             for img_path in temp_images:
@@ -509,11 +578,14 @@ class SessionManager:
         ):
             return {"stopReason": "cancelled"}
 
-        if session and (outcome.conversation_id or outcome.resolved_model):
+        ctx_tokens = int(outcome.usage.get("context_tokens", 0))
+        if session and (outcome.conversation_id or outcome.resolved_model or ctx_tokens > 0):
             if outcome.conversation_id:
                 session["agyConversationId"] = outcome.conversation_id
             if outcome.resolved_model and session.get("model") in {DEFAULT_MODEL_ID, "auto", ""}:
                 session["model"] = outcome.resolved_model
+            if ctx_tokens > 0:
+                session["contextTokens"] = ctx_tokens
             self._store.upsert_session(session)
 
         return {
@@ -565,6 +637,36 @@ class SessionManager:
                 yield scope
             finally:
                 self.unregister_cancel_scope(session_id, scope)
+
+    async def steer(
+        self,
+        *,
+        session_id: str,
+        message: str | None = None,
+        prompt_blocks: list[dict[str, Any]] | None = None,
+    ) -> bool:
+        """Queue a mid-turn steer (`_session/steer` or `_session/steering`) into an active turn."""
+        if not self._cli.is_turn_active(session_id):
+            return False
+
+        if message is not None:
+            formatted_prompt, temp_files = _format_steer_message(message)
+            raw_message = message
+        else:
+            formatted_prompt, temp_files = _format_prompt_blocks(prompt_blocks or [])
+            raw_message = formatted_prompt
+
+        queued = await self._cli.steer_session(
+            session_id,
+            raw_message=raw_message,
+            prompt=formatted_prompt,
+            temp_files=temp_files,
+        )
+        if not queued:
+            for img_path in temp_files:
+                with contextlib.suppress(OSError):
+                    img_path.unlink(missing_ok=True)
+        return queued
 
     async def cancel(self, *, session_id: str) -> bool:
         """Cancel an in-flight prompt turn (`session/cancel`) and persist in SQLite."""

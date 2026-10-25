@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
+import sqlite3
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -13,6 +16,95 @@ from typing import Any
 
 from agy_acp.providers.credential_store import CredentialStoreProvider
 from agy_acp.providers.oauth_provider import OAuthBrowserFlowProvider
+
+_KIRO_IDENTITY_CLAIM_FIELDS: frozenset[str] = frozenset(
+    {"client_id", "oauth_flow", "region", "scopes", "start_url"}
+)
+_KIRO_IDENTITY_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS migrations (
+    id INTEGER PRIMARY KEY,
+    version INTEGER NOT NULL,
+    migration_time INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS auth_kv (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
+CREATE TABLE IF NOT EXISTS state (
+    key TEXT PRIMARY KEY,
+    value BLOB
+);
+"""
+
+
+def resolve_kiro_identity_db_path() -> Path:
+    """Return the platform-specific Kiro CLI SQLite identity store path."""
+    home = Path.home()
+    if sys.platform == "darwin":
+        return home / "Library" / "Application Support" / "kiro-cli" / "data.sqlite3"
+    if sys.platform == "win32":
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        base = Path(local_appdata) if local_appdata else (home / "AppData" / "Local")
+        return base / "kiro-cli" / "data.sqlite3"
+    return home / ".local" / "share" / "kiro-cli" / "data.sqlite3"
+
+
+def ensure_kiro_identity_store(db_path: Path | None = None) -> bool:
+    """Seed stable Kiro identity claims into `data.sqlite3` if `auth_kv` has no claim rows."""
+    target = Path(db_path) if db_path is not None else resolve_kiro_identity_db_path()
+    try:
+        if target.is_symlink():
+            return False
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.exists():
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT, 0o600)
+            os.close(fd)
+        with contextlib.suppress(OSError):
+            target.chmod(0o600)
+
+        with contextlib.closing(sqlite3.connect(str(target), timeout=5.0)) as conn:
+            conn.executescript(_KIRO_IDENTITY_SCHEMA_SQL)
+            rows = conn.execute("SELECT key, value FROM auth_kv").fetchall()
+            for _, raw_val in rows:
+                with contextlib.suppress(ValueError, TypeError):
+                    parsed = json.loads(raw_val if isinstance(raw_val, str) else str(raw_val))
+                    if isinstance(parsed, dict) and any(
+                        field in parsed for field in _KIRO_IDENTITY_CLAIM_FIELDS
+                    ):
+                        return False
+
+            identity_blob = json.dumps(
+                {
+                    "client_id": "agy-acp",
+                    "oauth_flow": "PKCE",
+                    "region": "us-east-1",
+                    "start_url": "https://one.google.com/ai",
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            with conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO migrations (id, version, migration_time) "
+                    "VALUES (1, 1, 1700000000)"
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO auth_kv (key, value) VALUES (?, ?)",
+                    ("agy-acp:identity", identity_blob),
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO state (key, value) VALUES (?, ?)",
+                    ("auth.idc.start-url", '"https://one.google.com/ai"'),
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO state (key, value) VALUES (?, ?)",
+                    ("auth.idc.region", '"us-east-1"'),
+                )
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        return True
+    except OSError, sqlite3.Error:
+        return False
 
 
 @dataclass(frozen=True)

@@ -195,6 +195,7 @@ class AcpDispatcher:
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 cached_read_tokens=0,
+                context_tokens=self._quota_tracker.get_session_context_tokens(session_id),
             ):
                 await self._emit_notification(wire_update)
             return {
@@ -344,6 +345,29 @@ class AcpDispatcher:
                 }
             )
 
+        async def _on_usage(ctx_tokens: int) -> None:
+            await self._emit_notification(
+                self._quota_tracker.build_usage_update_notification(
+                    session_id=session_id,
+                    context_tokens=ctx_tokens,
+                )
+            )
+
+        async def _on_steer_consumed(raw_content: str) -> None:
+            await self._emit_notification(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "steering_consumed",
+                            "content": raw_content,
+                        },
+                    },
+                }
+            )
+
         turn_result = await self._session_manager.prompt(
             session_id=session_id,
             prompt_blocks=prompt_blocks,
@@ -351,6 +375,8 @@ class AcpDispatcher:
             on_text=_on_text,
             on_tool_call=_on_tool_call,
             on_tool_update=_on_tool_update,
+            on_usage=_on_usage,
+            on_steer_consumed=_on_steer_consumed,
         )
 
         stop_reason = str(turn_result.get("stopReason", "end_turn"))
@@ -363,6 +389,8 @@ class AcpDispatcher:
         output_tokens = max(1, int(usage_dict.get("output_tokens", 0)))
         cached_read_tokens = int(usage_dict.get("cache_read_tokens", 0))
         thinking_tokens = int(usage_dict.get("thinking_tokens", 0))
+        raw_ctx = usage_dict.get("context_tokens")
+        context_tokens = int(raw_ctx) if raw_ctx is not None and int(raw_ctx) > 0 else None
 
         model_id = self._resolve_session_model(session_id)
         for wire_update in await self._quota_tracker.build_kirocrew_wire_updates(
@@ -372,6 +400,7 @@ class AcpDispatcher:
             output_tokens=output_tokens,
             cached_read_tokens=cached_read_tokens,
             thinking_tokens=thinking_tokens,
+            context_tokens=context_tokens,
         ):
             await self._emit_notification(wire_update)
 
@@ -424,6 +453,14 @@ class AcpDispatcher:
             meta=meta,
         )
         await self._emit_available_commands_update(desc["sessionId"])
+        persisted_ctx = self._quota_tracker.get_session_context_tokens(desc["sessionId"])
+        if persisted_ctx is not None and persisted_ctx > 0:
+            await self._emit_notification(
+                self._quota_tracker.build_usage_update_notification(
+                    session_id=desc["sessionId"],
+                    context_tokens=persisted_ctx,
+                )
+            )
         return {
             "jsonrpc": "2.0",
             "id": message_id,
@@ -458,6 +495,14 @@ class AcpDispatcher:
                 },
             }
         await self._emit_available_commands_update(desc["sessionId"])
+        persisted_ctx = self._quota_tracker.get_session_context_tokens(desc["sessionId"])
+        if persisted_ctx is not None and persisted_ctx > 0:
+            await self._emit_notification(
+                self._quota_tracker.build_usage_update_notification(
+                    session_id=desc["sessionId"],
+                    context_tokens=persisted_ctx,
+                )
+            )
         return {
             "jsonrpc": "2.0",
             "id": message_id,
@@ -547,6 +592,15 @@ class AcpDispatcher:
 
         if cmd_name in {"quota", "usage", "credits"}:
             md = await self._quota_tracker.format_slash_command_response(f"/{cmd_name}")
+            if session_id:
+                persisted_ctx = self._quota_tracker.get_session_context_tokens(session_id)
+                if persisted_ctx is not None and persisted_ctx > 0:
+                    await self._emit_notification(
+                        self._quota_tracker.build_usage_update_notification(
+                            session_id=session_id,
+                            context_tokens=persisted_ctx,
+                        )
+                    )
             return {
                 "jsonrpc": "2.0",
                 "id": message_id,
@@ -605,6 +659,60 @@ class AcpDispatcher:
                 "text": "",
                 "stopReason": "end_turn",
             },
+        }
+
+    async def _handle_session_steer(
+        self,
+        method: str,
+        message_id: Any,
+        params: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Handle `_session/steer` and `_session/steering` during an active turn."""
+        session_id = str(params.get("sessionId", ""))
+        if method == "_session/steering":
+            raw_prompt = params.get("prompt")
+            prompt_blocks: list[dict[str, Any]] = (
+                [b for b in raw_prompt if isinstance(b, dict)]
+                if isinstance(raw_prompt, list)
+                else []
+            )
+            queued = await self._session_manager.steer(
+                session_id=session_id,
+                prompt_blocks=prompt_blocks,
+            )
+            if message_id is None:
+                return None
+            return {
+                "jsonrpc": "2.0",
+                "id": message_id,
+                "result": {"outcome": "injected" if queued else "failed"},
+            }
+
+        raw_message = str(params.get("message", ""))
+        queued = await self._session_manager.steer(
+            session_id=session_id,
+            message=raw_message,
+        )
+        if queued:
+            await self._emit_notification(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "steering_queued",
+                            "content": raw_message,
+                        },
+                    },
+                }
+            )
+        if message_id is None:
+            return None
+        return {
+            "jsonrpc": "2.0",
+            "id": message_id,
+            "result": {"queued": queued},
         }
 
     async def _handle_session_set_config_option(
@@ -771,13 +879,11 @@ class AcpDispatcher:
             await self._session_manager.cancel(session_id=session_id)
             return None
         if method in {"_session/steer", "_session/steering"}:
-            if msg_id is None:
-                return None
-            return {
-                "jsonrpc": "2.0",
-                "id": msg_id,
-                "result": {},
-            }
+            return await self._handle_session_steer(
+                method,
+                msg_id,
+                raw_params if isinstance(raw_params, dict) else {},
+            )
         if method in {"session/close", "_kiro.dev/session/terminate", "_kiro/session/delete"}:
             params = raw_params if isinstance(raw_params, dict) else {}
             session_id = str(params.get("sessionId", ""))

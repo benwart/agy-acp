@@ -452,3 +452,49 @@ async def test_kiro_credit_conversion_picks_min_of_7d_and_5h_with_matching_reset
     assert meta_params["quotaCredits"] == 190.0
     assert meta_params["creditsBottleneckWindow"] == "5h"
     assert meta_params["creditsResetTime"] == "2026-10-24T07:52:04Z"
+
+
+async def test_context_usage_reflects_active_session_context_not_global_ledger_and_compacts(
+    tmp_path: Any,
+) -> None:
+    """Verify wire context usage uses current session context_tokens, not global lifetime total."""
+    from agy_acp.providers.state_store import SqliteStateStoreProvider
+
+    store = SqliteStateStoreProvider(tmp_path / "state.db")
+    # Seed 8.13M global historical tokens from prior sessions/tool loops
+    store.record_tokens(
+        input_tokens=911_566,
+        output_tokens=36_221,
+        cached_read_tokens=7_167_559,
+        thinking_tokens=15_532,
+    )
+    tracker = QuotaTracker(
+        provider=QuotaProvider(cli_provider=_StubAgyCliProvider(save_dir=tmp_path)),
+        state_store=store,
+    )
+
+    # Short session turn with multi-step billed tokens vs actual active context window (24,311)
+    updates = await tracker.build_kirocrew_wire_updates(
+        session_id="session-short-1",
+        model_id="gemini-4-argon-medium",
+        input_tokens=148_431,
+        output_tokens=6_399,
+        cached_read_tokens=1_277_177,
+        thinking_tokens=500,
+        context_tokens=24_311,
+    )
+    usage_update = updates[0]["params"]["update"]
+    meta_params = updates[1]["params"]
+    assert usage_update["used"] == 24_311
+    assert meta_params["contextUsagePercentage"] == 2.4311
+
+    # Subsequent /compact turn shrinks active context window to 3,200 tokens
+    compact_updates = await tracker.build_kirocrew_wire_updates(
+        session_id="session-short-1",
+        model_id="gemini-4-argon-medium",
+        input_tokens=10,
+        output_tokens=50,
+        context_tokens=3_200,
+    )
+    assert compact_updates[0]["params"]["update"]["used"] == 3_200
+    assert compact_updates[1]["params"]["contextUsagePercentage"] == 0.32
