@@ -779,3 +779,350 @@ def test_normalize_tool_arguments_populates_tool_use_purpose() -> None:
     assert normalized["command"] == "uv run pytest"
     assert normalized["description"] == "Unit test execution"
     assert normalized["__toolUsePurpose"] == "Unit test execution"
+
+
+async def test_stream_prompt_ignores_error_message_step_type(tmp_path: Path) -> None:
+    """Verify `step_type: 'error_message'` does not emit a fake tool call or permission prompt."""
+    fake_agy = _write_executable(
+        tmp_path / "agy",
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        "print(json.dumps({'event': 'init', 'init': {'conversation_id': 'conv-err-step'}}))\n"
+        "print(json.dumps({\n"
+        "    'event': 'step_update',\n"
+        "    'step_update': {\n"
+        "        'step_index': 1,\n"
+        "        'state': 'DONE',\n"
+        "        'step_type': 'error_message',\n"
+        "    },\n"
+        "}))\n"
+        "print(json.dumps({\n"
+        "    'event': 'result',\n"
+        "    'result': {\n"
+        "        'conversation_id': 'conv-err-step',\n"
+        "        'status': 'SUCCESS',\n"
+        "        'response': 'ok',\n"
+        "    },\n"
+        "}))\n",
+    )
+    provider = AgyCliProvider(bin_path=fake_agy, save_dir=tmp_path)
+    tool_calls: list[ToolCallEvent] = []
+    tool_updates: list[ToolCallEvent] = []
+
+    async def _on_tool_call(ev: ToolCallEvent) -> bool:
+        tool_calls.append(ev)
+        return True
+
+    async def _on_tool_update(ev: ToolCallEvent) -> None:
+        tool_updates.append(ev)
+
+    outcome = await provider.stream_prompt(
+        cwd=str(tmp_path),
+        prompt="check",
+        session_id="sess-err-step",
+        on_tool_call=_on_tool_call,
+        on_tool_update=_on_tool_update,
+    )
+    assert outcome.stop_reason == "end_turn"
+    assert tool_calls == []
+    assert tool_updates == []
+
+
+async def test_stream_prompt_extracts_subagent_info_and_tracks_roster_lifecycle(
+    tmp_path: Path,
+) -> None:
+    """Verify `subagent_info.subagents` populates tool I/O and drives `on_subagent_list`."""
+    list_output = "You have 2 active subagent(s):\n" + json.dumps(
+        [
+            {
+                "role": "Codebase Researcher",
+                "type": "research",
+                "conversationId": "sub-1",
+                "state": "running",
+                "stateDetail": "read_file",
+            },
+            {
+                "role": "Orchestrator",
+                "type": "self",
+                "conversationId": "sub-3",
+                "state": "waiting_for_dependents",
+                "stateDetail": "",
+            },
+        ]
+    )
+    events = [
+        {"event": "init", "init": {"conversation_id": "conv-sub-1"}},
+        {
+            "event": "step_update",
+            "step_update": {
+                "step_index": 1,
+                "state": "DONE",
+                "step_type": "subagent",
+                "tool_name": "invoke_subagent",
+                "subagent_info": {
+                    "subagents": [
+                        {
+                            "type_name": "research",
+                            "role": "Codebase Researcher",
+                            "initial_prompt": "Inspect auth flow",
+                            "conversation_id": "sub-1",
+                            "log_uri": "file:///tmp/sub-1.jsonl",
+                        },
+                        {
+                            "type_name": "self",
+                            "role": "Test Runner",
+                            "initial_prompt": "Run pytest",
+                            "conversation_id": "sub-2",
+                        },
+                    ]
+                },
+            },
+        },
+        {
+            "event": "step_update",
+            "step_update": {
+                "step_index": 2,
+                "state": "DONE",
+                "step_type": "tool",
+                "tool_name": "manage_subagents",
+                "tool_info": {
+                    "name": "manage_subagents",
+                    "parameters": {"Action": "list"},
+                    "output": list_output,
+                },
+            },
+        },
+        {
+            "event": "step_update",
+            "step_update": {
+                "step_index": 3,
+                "state": "DONE",
+                "step_type": "tool",
+                "tool_name": "manage_subagents",
+                "tool_info": {
+                    "name": "manage_subagents",
+                    "parameters": {"Action": "kill", "ConversationIds": ["sub-1"]},
+                    "output": "Terminated sub-1.",
+                },
+            },
+        },
+        {
+            "event": "result",
+            "result": {
+                "conversation_id": "conv-sub-1",
+                "status": "SUCCESS",
+                "response": "All subagents handled.",
+            },
+        },
+    ]
+    script_lines = ["#!/usr/bin/env python3", "import json"]
+    for ev in events:
+        script_lines.append(f"print(json.dumps({ev!r}), flush=True)")
+    fake_agy = _write_executable(tmp_path / "agy", "\n".join(script_lines) + "\n")
+
+    provider = AgyCliProvider(bin_path=fake_agy, save_dir=tmp_path)
+    tool_calls: list[ToolCallEvent] = []
+    tool_updates: list[ToolCallEvent] = []
+    roster_snapshots: list[list[dict[str, Any]]] = []
+
+    async def _on_tool_call(ev: ToolCallEvent) -> bool:
+        tool_calls.append(ev)
+        return True
+
+    async def _on_tool_update(ev: ToolCallEvent) -> None:
+        tool_updates.append(ev)
+
+    async def _on_subagent_list(subagents: list[dict[str, Any]]) -> None:
+        roster_snapshots.append(json.loads(json.dumps(subagents)))
+
+    outcome = await provider.stream_prompt(
+        cwd=str(tmp_path),
+        prompt="spawn workers",
+        session_id="sess-sub-1",
+        on_tool_call=_on_tool_call,
+        on_tool_update=_on_tool_update,
+        on_subagent_list=_on_subagent_list,
+    )
+    assert outcome.stop_reason == "end_turn"
+
+    invoke_call = tool_calls[0]
+    assert invoke_call.title == "invoke_subagent"
+    assert invoke_call.raw_input["Role"] == "Codebase Researcher"
+    assert invoke_call.raw_input["TypeName"] == "research"
+    assert invoke_call.raw_input["Prompt"] == "Inspect auth flow"
+    assert invoke_call.raw_input["__toolUsePurpose"] == "Codebase Researcher"
+
+    invoke_update = tool_updates[0]
+    assert invoke_update.status == "completed"
+    parsed_output = json.loads(invoke_update.output)
+    assert len(parsed_output) == 2
+    assert parsed_output[0]["conversationId"] == "sub-1"
+    assert parsed_output[0]["logUri"] == "file:///tmp/sub-1.jsonl"
+    assert parsed_output[1]["conversationId"] == "sub-2"
+
+    # Snapshot 0: invoke_subagent spawns sub-1 and sub-2 as running
+    assert len(roster_snapshots) == 4
+    snap0 = {entry["sessionId"]: entry for entry in roster_snapshots[0]}
+    assert snap0["sub-1"] == {
+        "sessionId": "sub-1",
+        "sessionName": "Codebase Researcher",
+        "role": "Codebase Researcher",
+        "agentName": "research",
+        "initialQuery": "Inspect auth flow",
+        "status": {"type": "running", "message": ""},
+    }
+    assert snap0["sub-2"]["status"] == {"type": "running", "message": ""}
+
+    # Snapshot 1: manage_subagents list updates sub-1, completes sub-2, and adds sub-3
+    snap1 = {entry["sessionId"]: entry for entry in roster_snapshots[1]}
+    assert snap1["sub-1"]["status"] == {"type": "running", "message": "read_file"}
+    assert snap1["sub-2"]["status"] == {"type": "completed", "message": ""}
+    assert snap1["sub-3"]["status"] == {
+        "type": "running",
+        "message": "waiting for subagents",
+    }
+    assert snap1["sub-3"]["initialQuery"] == "Orchestrator"
+
+    # Snapshot 2: manage_subagents kill marks sub-1 cancelled
+    snap2 = {entry["sessionId"]: entry for entry in roster_snapshots[2]}
+    assert snap2["sub-1"]["status"] == {"type": "cancelled", "message": ""}
+    assert snap2["sub-3"]["status"]["type"] == "running"
+
+    # Snapshot 3: end_turn closes remaining running sub-3 as completed
+    snap3 = {entry["sessionId"]: entry for entry in roster_snapshots[3]}
+    assert snap3["sub-1"]["status"] == {"type": "cancelled", "message": ""}
+    assert snap3["sub-2"]["status"] == {"type": "completed", "message": ""}
+    assert snap3["sub-3"]["status"] == {"type": "completed", "message": ""}
+
+
+async def test_stream_prompt_subagent_kill_all_no_active_and_cancelled_turn(
+    tmp_path: Path,
+) -> None:
+    """Verify `kill_all`, `'no active subagents'`, and cancelled turns close tracked subagents."""
+    events = [
+        {"event": "init", "init": {"conversation_id": "conv-sub-cancel"}},
+        {
+            "event": "step_update",
+            "step_update": {
+                "step_index": 1,
+                "state": "DONE",
+                "step_type": "subagent",
+                "tool_name": "invoke_subagent",
+                "subagent_info": {
+                    "subagents": [
+                        {
+                            "type_name": "research",
+                            "role": "Worker A",
+                            "initial_prompt": "Task A",
+                            "conversation_id": "sub-a",
+                        }
+                    ]
+                },
+            },
+        },
+        {
+            "event": "step_update",
+            "step_update": {
+                "step_index": 2,
+                "state": "DONE",
+                "step_type": "tool",
+                "tool_name": "manage_subagents",
+                "tool_info": {
+                    "name": "manage_subagents",
+                    "parameters": {"Action": "list"},
+                    "output": "You have no active subagents.",
+                },
+            },
+        },
+        {
+            "event": "step_update",
+            "step_update": {
+                "step_index": 3,
+                "state": "DONE",
+                "step_type": "subagent",
+                "tool_name": "invoke_subagent",
+                "subagent_info": {
+                    "subagents": [
+                        {
+                            "type_name": "self",
+                            "role": "Worker B",
+                            "initial_prompt": "Task B",
+                            "conversation_id": "sub-b",
+                        },
+                        {
+                            "type_name": "self",
+                            "role": "Worker C",
+                            "initial_prompt": "Task C",
+                            "conversation_id": "sub-c",
+                        },
+                    ]
+                },
+            },
+        },
+        {
+            "event": "step_update",
+            "step_update": {
+                "step_index": 4,
+                "state": "DONE",
+                "step_type": "tool",
+                "tool_name": "manage_subagents",
+                "tool_info": {
+                    "name": "manage_subagents",
+                    "parameters": {"Action": "kill_all"},
+                    "output": "All subagents killed.",
+                },
+            },
+        },
+        {
+            "event": "step_update",
+            "step_update": {
+                "step_index": 5,
+                "state": "DONE",
+                "step_type": "subagent",
+                "tool_name": "invoke_subagent",
+                "subagent_info": {
+                    "subagents": [
+                        {
+                            "type_name": "self",
+                            "role": "Worker D",
+                            "initial_prompt": "Task D",
+                            "conversation_id": "sub-d",
+                        }
+                    ]
+                },
+            },
+        },
+        {
+            "event": "result",
+            "result": {
+                "conversation_id": "conv-sub-cancel",
+                "status": "CANCELLED",
+                "response": "",
+            },
+        },
+    ]
+    script_lines = ["#!/usr/bin/env python3", "import json"]
+    for ev in events:
+        script_lines.append(f"print(json.dumps({ev!r}), flush=True)")
+    fake_agy = _write_executable(tmp_path / "agy", "\n".join(script_lines) + "\n")
+
+    provider = AgyCliProvider(bin_path=fake_agy, save_dir=tmp_path)
+    roster_snapshots: list[list[dict[str, Any]]] = []
+
+    async def _on_subagent_list(subagents: list[dict[str, Any]]) -> None:
+        roster_snapshots.append(json.loads(json.dumps(subagents)))
+
+    outcome = await provider.stream_prompt(
+        cwd=str(tmp_path),
+        prompt="spawn and cancel",
+        session_id="sess-sub-cancel",
+        on_subagent_list=_on_subagent_list,
+    )
+    assert outcome.stop_reason == "cancelled"
+    assert len(roster_snapshots) == 6
+    assert roster_snapshots[1][0]["status"] == {"type": "completed", "message": ""}
+    snap_kill_all = {e["sessionId"]: e["status"] for e in roster_snapshots[3]}
+    assert snap_kill_all["sub-b"] == {"type": "cancelled", "message": ""}
+    assert snap_kill_all["sub-c"] == {"type": "cancelled", "message": ""}
+    snap_final = {e["sessionId"]: e["status"] for e in roster_snapshots[5]}
+    assert snap_final["sub-d"] == {"type": "cancelled", "message": ""}

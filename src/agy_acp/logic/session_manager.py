@@ -686,6 +686,7 @@ class SessionManager:
         on_tool_update: Callable[[ToolCallEvent], Awaitable[None]] | None = None,
         on_usage: Callable[[int], Awaitable[None]] | None = None,
         on_steer_consumed: Callable[[str], Awaitable[None]] | None = None,
+        on_subagent_list: Callable[[list[dict[str, Any]]], Awaitable[None]] | None = None,
     ) -> dict[str, Any]:
         """Execute a streaming turn (`session/prompt`) via the `agy` CLI subprocess."""
         if self.consume_cancellation(session_id):
@@ -731,6 +732,7 @@ class SessionManager:
                     on_tool_update=on_tool_update,
                     on_usage=on_usage,
                     on_steer_consumed=on_steer_consumed,
+                    on_subagent_list=on_subagent_list,
                 )
         finally:
             for img_path in temp_images:

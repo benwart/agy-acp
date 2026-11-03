@@ -85,6 +85,7 @@ class _StubAgyCliProvider(AgyCliProvider):
         on_tool_update: Callable[[ToolCallEvent], Awaitable[None]] | None = None,
         on_usage: Callable[[int], Awaitable[None]] | None = None,
         on_steer_consumed: Callable[[str], Awaitable[None]] | None = None,
+        on_subagent_list: Callable[[list[dict[str, Any]]], Awaitable[None]] | None = None,
     ) -> PromptOutcome:
         _ = (
             cwd,
@@ -97,6 +98,7 @@ class _StubAgyCliProvider(AgyCliProvider):
             env,
             on_usage,
             on_steer_consumed,
+            on_subagent_list,
         )
         if on_thought is not None:
             await on_thought("Analyzing prompt...")
@@ -1037,3 +1039,115 @@ async def test_compact_slash_command_emits_compaction_status_and_resets_context(
     )
     assert calls[3]["conversation_id"] == "conv-post-compact-2"
     assert "[Compacted Session Summary]" not in calls[3]["prompt"]
+
+
+async def test_session_prompt_emits_kiro_subagent_list_update_notifications() -> None:
+    """Verify `AcpDispatcher` emits `_kiro.dev/subagent/list_update` with `sessionId`."""
+
+    class _SubagentStubCliProvider(_StubAgyCliProvider):
+        async def stream_prompt(self, **kwargs: Any) -> PromptOutcome:
+            on_subagent_list = kwargs.get("on_subagent_list")
+            if on_subagent_list is not None:
+                await on_subagent_list(
+                    [
+                        {
+                            "sessionId": "sub-conv-1",
+                            "sessionName": "Codebase Researcher",
+                            "role": "Codebase Researcher",
+                            "agentName": "research",
+                            "initialQuery": "Audit subagent wire frames",
+                            "status": {"type": "running", "message": "read_file"},
+                        }
+                    ]
+                )
+                await on_subagent_list(
+                    [
+                        {
+                            "sessionId": "sub-conv-1",
+                            "sessionName": "Codebase Researcher",
+                            "role": "Codebase Researcher",
+                            "agentName": "research",
+                            "initialQuery": "Audit subagent wire frames",
+                            "status": {"type": "completed", "message": ""},
+                        }
+                    ]
+                )
+            return PromptOutcome(
+                conversation_id="conv-sub-wire-1",
+                stop_reason="end_turn",
+                response="Done",
+                usage={"input_tokens": 50, "output_tokens": 20, "total_tokens": 70},
+            )
+
+    emitted: list[dict[str, Any]] = []
+
+    async def _sink(msg: dict[str, Any]) -> None:
+        emitted.append(msg)
+
+    cli = _SubagentStubCliProvider()
+    dispatcher = AcpDispatcher(
+        notification_sink=_sink,
+        session_manager=SessionManager(cli_provider=cli),
+        quota_tracker=QuotaTracker(
+            provider=QuotaProvider(cli_provider=cli),
+            state_store=cli.state_store,
+        ),
+    )
+    new_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 70,
+                "method": "session/new",
+                "params": {"cwd": "/tmp", "mcpServers": []},
+            }
+        )
+    )
+    assert new_resp is not None
+    sid = new_resp["result"]["sessionId"]
+    emitted.clear()
+
+    prompt_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 71,
+                "method": "session/prompt",
+                "params": {"sessionId": sid, "prompt": [{"type": "text", "text": "spawn"}]},
+            }
+        )
+    )
+    assert prompt_resp is not None
+    assert prompt_resp["result"]["stopReason"] == "end_turn"
+
+    subagent_frames = [
+        n["params"] for n in emitted if n.get("method") == "_kiro.dev/subagent/list_update"
+    ]
+    assert subagent_frames == [
+        {
+            "sessionId": sid,
+            "subagents": [
+                {
+                    "sessionId": "sub-conv-1",
+                    "sessionName": "Codebase Researcher",
+                    "role": "Codebase Researcher",
+                    "agentName": "research",
+                    "initialQuery": "Audit subagent wire frames",
+                    "status": {"type": "running", "message": "read_file"},
+                }
+            ],
+        },
+        {
+            "sessionId": sid,
+            "subagents": [
+                {
+                    "sessionId": "sub-conv-1",
+                    "sessionName": "Codebase Researcher",
+                    "role": "Codebase Researcher",
+                    "agentName": "research",
+                    "initialQuery": "Audit subagent wire frames",
+                    "status": {"type": "completed", "message": ""},
+                }
+            ],
+        },
+    ]

@@ -470,6 +470,18 @@ class AcpDispatcher:
                 }
             )
 
+        async def _on_subagent_list(subagents: list[dict[str, Any]]) -> None:
+            await self._emit_notification(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "_kiro.dev/subagent/list_update",
+                    "params": {
+                        "sessionId": session_id,
+                        "subagents": subagents,
+                    },
+                }
+            )
+
         turn_result = await self._session_manager.prompt(
             session_id=session_id,
             prompt_blocks=prompt_blocks,
@@ -479,6 +491,7 @@ class AcpDispatcher:
             on_tool_update=_on_tool_update,
             on_usage=_on_usage,
             on_steer_consumed=_on_steer_consumed,
+            on_subagent_list=_on_subagent_list,
         )
 
         stop_reason = str(turn_result.get("stopReason", "end_turn"))

@@ -443,7 +443,247 @@ def _normalize_tool_arguments(
         clean_summary = summary.strip()
         normalized.setdefault("description", clean_summary)
         normalized.setdefault("__toolUsePurpose", clean_summary)
+    elif tool_name.lower() == "invoke_subagent":
+        role = normalized.get("Role")
+        if isinstance(role, str) and role.strip():
+            clean_role = role.strip()
+            normalized.setdefault("description", clean_role)
+            normalized.setdefault("__toolUsePurpose", clean_role)
     return normalized
+
+
+_NON_TOOL_STEP_TYPES: frozenset[str] = frozenset(
+    {
+        "agent_response",
+        "planner_response",
+        "user_input",
+        "thinking",
+        "text",
+        "checkpoint",
+        "ephemeral_message",
+        "system_message",
+        "system",
+        "error",
+        "error_message",
+        "summary",
+        "compaction",
+    }
+)
+
+_ACTIVE_SUBAGENT_STATES: frozenset[str] = frozenset(
+    {
+        "running",
+        "waiting_for_dependents",
+        "pending",
+        "queued",
+        "starting",
+        "in_progress",
+        "working",
+    }
+)
+_COMPLETED_SUBAGENT_STATES: frozenset[str] = frozenset({"idle", "completed", "done", "succeeded"})
+_FAILED_SUBAGENT_STATES: frozenset[str] = frozenset({"failed", "error"})
+_CANCELLED_SUBAGENT_STATES: frozenset[str] = frozenset(
+    {"cancelled", "canceled", "killed", "stopped"}
+)
+
+
+def _extract_subagent_entries(step: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract `subagent_info.subagents` entries from an `agy` step update."""
+    subagent_info = step.get("subagent_info")
+    if not isinstance(subagent_info, dict):
+        return []
+    raw_list = subagent_info.get("subagents")
+    if not isinstance(raw_list, list):
+        return []
+    return [item for item in raw_list if isinstance(item, dict)]
+
+
+def _synthesize_subagent_arguments(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    """Synthesize `invoke_subagent` input fields from `subagent_info.subagents`."""
+    if not entries:
+        return {}
+    first = entries[0]
+    synthesized: dict[str, Any] = {}
+    type_name = str(first.get("type_name") or first.get("type") or "").strip()
+    role = str(first.get("role") or "").strip()
+    initial_prompt = str(first.get("initial_prompt") or "").strip()
+    if type_name:
+        synthesized["TypeName"] = type_name
+    if role:
+        synthesized["Role"] = role
+    if initial_prompt:
+        synthesized["Prompt"] = initial_prompt
+    return synthesized
+
+
+def _format_subagent_tool_output(entries: list[dict[str, Any]]) -> str:
+    """Format `subagent_info.subagents` into a JSON tool output string."""
+    summary: list[dict[str, str]] = []
+    for item in entries:
+        entry: dict[str, str] = {
+            "conversationId": str(item.get("conversation_id") or item.get("conversationId") or ""),
+            "role": str(item.get("role") or ""),
+            "type": str(item.get("type_name") or item.get("type") or ""),
+        }
+        log_uri = str(item.get("log_uri") or item.get("transcript") or "")
+        if log_uri:
+            entry["logUri"] = log_uri
+        summary.append(entry)
+    return json.dumps(summary[0] if len(summary) == 1 else summary)
+
+
+def _parse_manage_subagents_list(output: str) -> list[dict[str, Any]] | None:
+    """Parse the active subagent JSON array from `manage_subagents(Action='list')` output."""
+    start = output.find("[")
+    end = output.rfind("]")
+    if start != -1 and end > start:
+        with contextlib.suppress(json.JSONDecodeError):
+            parsed = json.loads(output[start : end + 1])
+            if isinstance(parsed, list):
+                return [item for item in parsed if isinstance(item, dict)]
+    if "no active subagent" in output.lower():
+        return []
+    return None
+
+
+class _SubagentRosterTracker:
+    """Translate `agy` subagent steps into KiroCrew `_kiro.dev/subagent/list_update` snapshots."""
+
+    def __init__(self) -> None:
+        self._entries: dict[str, dict[str, Any]] = {}
+        self._last_snapshot: list[dict[str, Any]] | None = None
+
+    def _emit_if_changed(self) -> list[dict[str, Any]] | None:
+        if not self._entries:
+            return None
+        snapshot = [
+            {
+                **entry,
+                "status": dict(entry["status"]),
+            }
+            for entry in self._entries.values()
+        ]
+        if snapshot == self._last_snapshot:
+            return None
+        self._last_snapshot = [
+            {
+                **entry,
+                "status": dict(entry["status"]),
+            }
+            for entry in snapshot
+        ]
+        return snapshot
+
+    def record_spawn(self, entries: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
+        """Register or refresh spawned subagents as `running`."""
+        for item in entries:
+            conv_id = str(item.get("conversation_id") or item.get("conversationId") or "").strip()
+            if not conv_id:
+                continue
+            role = str(item.get("role") or "").strip()
+            agent_name = str(item.get("type_name") or item.get("type") or "").strip()
+            initial_query = str(item.get("initial_prompt") or "").strip()
+            existing = self._entries.get(conv_id)
+            if existing is not None:
+                role = role or str(existing.get("role") or "")
+                agent_name = agent_name or str(existing.get("agentName") or "")
+                initial_query = initial_query or str(existing.get("initialQuery") or "")
+            session_name = role or agent_name or conv_id
+            self._entries[conv_id] = {
+                "sessionId": conv_id,
+                "sessionName": session_name,
+                "role": role,
+                "agentName": agent_name,
+                "initialQuery": initial_query or session_name,
+                "status": {"type": "running", "message": ""},
+            }
+        return self._emit_if_changed()
+
+    def record_manage_step(
+        self,
+        raw_args: dict[str, Any],
+        output: str,
+    ) -> list[dict[str, Any]] | None:
+        """Apply a completed `manage_subagents` step (`list`, `kill`, `kill_all`) to the roster."""
+        action = str(raw_args.get("Action") or raw_args.get("action") or "").strip().lower()
+        if action == "list":
+            return self._record_manage_list(output)
+        if action == "kill_all":
+            for entry in self._entries.values():
+                if entry["status"].get("type") == "running":
+                    entry["status"] = {"type": "cancelled", "message": ""}
+            return self._emit_if_changed()
+        if action == "kill":
+            raw_ids = raw_args.get("ConversationIds") or raw_args.get("conversationIds") or []
+            target_ids = (
+                {str(cid).strip() for cid in raw_ids if str(cid).strip()}
+                if isinstance(raw_ids, list)
+                else set()
+            )
+            for cid in target_ids:
+                if cid in self._entries:
+                    self._entries[cid]["status"] = {"type": "cancelled", "message": ""}
+            return self._emit_if_changed()
+        return None
+
+    def _record_manage_list(self, output: str) -> list[dict[str, Any]] | None:
+        listed = _parse_manage_subagents_list(output)
+        if listed is None:
+            return None
+        seen_ids: set[str] = set()
+        for item in listed:
+            conv_id = str(item.get("conversationId") or item.get("conversation_id") or "").strip()
+            if not conv_id:
+                continue
+            seen_ids.add(conv_id)
+            raw_state = str(item.get("state") or "running").strip().lower()
+            detail = str(item.get("stateDetail") or "").strip()
+            if raw_state in _ACTIVE_SUBAGENT_STATES:
+                msg = detail or (
+                    "waiting for subagents" if raw_state == "waiting_for_dependents" else ""
+                )
+                status = {"type": "running", "message": msg}
+            elif raw_state in _COMPLETED_SUBAGENT_STATES:
+                status = {"type": "completed", "message": ""}
+            elif raw_state in _FAILED_SUBAGENT_STATES:
+                status = {"type": "failed", "message": detail}
+            elif raw_state in _CANCELLED_SUBAGENT_STATES:
+                status = {"type": "cancelled", "message": ""}
+            else:
+                status = {"type": "running", "message": detail}
+
+            role = str(item.get("role") or "").strip()
+            agent_name = str(item.get("type") or item.get("type_name") or "").strip()
+            existing = self._entries.get(conv_id)
+            if existing is not None:
+                role = role or str(existing.get("role") or "")
+                agent_name = agent_name or str(existing.get("agentName") or "")
+                initial_query = str(existing.get("initialQuery") or "")
+            else:
+                initial_query = ""
+            session_name = role or agent_name or conv_id
+            self._entries[conv_id] = {
+                "sessionId": conv_id,
+                "sessionName": session_name,
+                "role": role,
+                "agentName": agent_name,
+                "initialQuery": initial_query or session_name,
+                "status": status,
+            }
+
+        for conv_id, entry in self._entries.items():
+            if conv_id not in seen_ids and entry["status"].get("type") == "running":
+                entry["status"] = {"type": "completed", "message": ""}
+        return self._emit_if_changed()
+
+    def finalize_turn(self, *, cancelled: bool) -> list[dict[str, Any]] | None:
+        """Close any remaining `running` subagents at the end of a turn."""
+        terminal_type = "cancelled" if cancelled else "completed"
+        for entry in self._entries.values():
+            if entry["status"].get("type") == "running":
+                entry["status"] = {"type": terminal_type, "message": ""}
+        return self._emit_if_changed()
 
 
 def _classify_tool_step(
@@ -856,6 +1096,7 @@ class AgyCliProvider:
         on_tool_update: Callable[[ToolCallEvent], Awaitable[None]] | None = None,
         on_usage: Callable[[int], Awaitable[None]] | None = None,
         on_steer_consumed: Callable[[str], Awaitable[None]] | None = None,
+        on_subagent_list: Callable[[list[dict[str, Any]]], Awaitable[None]] | None = None,
     ) -> PromptOutcome:
         """Spawn `agy --output-format stream-json` via `anyio.open_process` and stream events."""
         sid = session_id or "default"
@@ -893,6 +1134,7 @@ class AgyCliProvider:
             "context_tokens": 0,
         }
         steer_temp_files: list[Path] = []
+        subagent_tracker = _SubagentRosterTracker()
         self._active_turns.add(sid)
         self._turn_conv_ids[sid] = resolved_conv_id
 
@@ -980,27 +1222,11 @@ class AgyCliProvider:
                     is_tool_step = bool(
                         tool_name
                         or isinstance(tool_info, dict)
-                        or (
-                            step_type
-                            and step_type.lower()
-                            not in {
-                                "agent_response",
-                                "planner_response",
-                                "user_input",
-                                "thinking",
-                                "text",
-                                "checkpoint",
-                                "ephemeral_message",
-                                "system_message",
-                                "system",
-                                "error",
-                                "summary",
-                                "compaction",
-                            }
-                        )
+                        or (step_type and step_type.lower() not in _NON_TOOL_STEP_TYPES)
                     )
 
                     if is_tool_step:
+                        subagent_entries = _extract_subagent_entries(step)
                         raw_args: dict[str, Any] = {}
                         if isinstance(tool_info, dict):
                             params = tool_info.get("arguments") or tool_info.get("parameters")
@@ -1008,6 +1234,8 @@ class AgyCliProvider:
                                 raw_args = params
                         elif isinstance(step.get("arguments"), dict):
                             raw_args = dict(step["arguments"])
+                        if not raw_args and subagent_entries:
+                            raw_args = _synthesize_subagent_arguments(subagent_entries)
 
                         kiro_tool_name, mcp_server_name, kiro_tool_id = _resolve_kiro_tool_identity(
                             step_type, tool_name, raw_args
@@ -1073,6 +1301,11 @@ class AgyCliProvider:
                                     )
                                 return
 
+                        if subagent_entries and not is_failed and on_subagent_list is not None:
+                            spawn_snapshot = subagent_tracker.record_spawn(subagent_entries)
+                            if spawn_snapshot is not None:
+                                await on_subagent_list(spawn_snapshot)
+
                         if is_done and step_idx not in _rejected_tools:
                             _completed_tools.add(step_idx)
                             tc_id = _active_tools[step_idx].tool_call_id
@@ -1085,6 +1318,8 @@ class AgyCliProvider:
                                 )
                             else:
                                 tool_output = str(step.get("output", ""))
+                            if not tool_output and subagent_entries:
+                                tool_output = _format_subagent_tool_output(subagent_entries)
                             if on_tool_update is not None:
                                 await on_tool_update(
                                     ToolCallEvent(
@@ -1100,6 +1335,17 @@ class AgyCliProvider:
                                         kiro_tool_id=kiro_tool_id,
                                     )
                                 )
+                            if (
+                                tool_name.lower() == "manage_subagents"
+                                and not is_failed
+                                and on_subagent_list is not None
+                            ):
+                                manage_snapshot = subagent_tracker.record_manage_step(
+                                    raw_args,
+                                    tool_output,
+                                )
+                                if manage_snapshot is not None:
+                                    await on_subagent_list(manage_snapshot)
 
                     text_delta = step.get("text_delta")
                     text_full = step.get("text") or step.get("response") or step.get("content")
@@ -1254,6 +1500,11 @@ class AgyCliProvider:
                             proc.send_signal(signal.SIGINT)
                         with contextlib.suppress(ProcessLookupError, OSError):
                             proc.terminate()
+                    if on_subagent_list is not None:
+                        cancelled_snap = subagent_tracker.finalize_turn(cancelled=True)
+                        if cancelled_snap is not None:
+                            with anyio.CancelScope(shield=True), contextlib.suppress(Exception):
+                                await on_subagent_list(cancelled_snap)
                     raise
                 finally:
                     self._active_processes.pop(sid, None)
@@ -1268,6 +1519,10 @@ class AgyCliProvider:
                 )
                 self._cancelled_sessions.discard(sid)
                 if was_cancelled:
+                    if on_subagent_list is not None:
+                        cancelled_snap = subagent_tracker.finalize_turn(cancelled=True)
+                        if cancelled_snap is not None:
+                            await on_subagent_list(cancelled_snap)
                     return PromptOutcome(
                         conversation_id=resolved_conv_id,
                         stop_reason="cancelled",
@@ -1365,6 +1620,11 @@ class AgyCliProvider:
                 + usage["cache_read_tokens"]
             )
         )
+
+        if on_subagent_list is not None:
+            completed_snap = subagent_tracker.finalize_turn(cancelled=False)
+            if completed_snap is not None:
+                await on_subagent_list(completed_snap)
 
         return PromptOutcome(
             conversation_id=resolved_conv_id,
