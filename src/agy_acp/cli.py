@@ -7,7 +7,7 @@ import traceback
 from collections.abc import Sequence
 from pathlib import Path
 
-from agy_acp import __version__
+from agy_acp import KIRO_CLI_COMPAT_VERSION, __version__
 from agy_acp.commands import AnyioApp, register_commands
 from agy_acp.commands.serve import default as serve_default
 from agy_acp.providers.acp_logger import log_acp_event, snapshot_relevant_env
@@ -17,7 +17,7 @@ __all__ = ["app", "main"]
 app = AnyioApp(
     name="agy-acp",
     help="Google Antigravity SDK wrapper exposing an ACP server for KiroCrew.",
-    version=__version__,
+    version=f"{__version__} kiro-cli {KIRO_CLI_COMPAT_VERSION}",
 )
 app.default(serve_default)
 register_commands(app)

@@ -132,6 +132,9 @@ class SqliteStateStoreProvider:
     @staticmethod
     def _row_to_session(row: sqlite3.Row) -> dict[str, Any]:
         auth_cfg: dict[str, Any] = json.loads(row["auth_config_json"] or "{}")
+        mcp_servers: list[dict[str, Any]] = json.loads(row["mcp_servers_json"] or "[]")
+        raw_wire = auth_cfg.get("_wire_mcp_servers")
+        wire_mcp_servers = raw_wire if isinstance(raw_wire, list) else list(mcp_servers)
         row_keys = row.keys()
         return {
             "sessionId": str(row["session_id"]),
@@ -139,13 +142,16 @@ class SqliteStateStoreProvider:
             "cwd": str(row["cwd"]),
             "mode": str(row["mode"]),
             "agent": auth_cfg.get("_agent"),
+            "switchedModel": auth_cfg.get("_switched_model"),
+            "compactedSummary": auth_cfg.get("_compacted_summary"),
             "model": str(row["model"]),
             "reasoning_effort": str(row["reasoning_effort"]),
             "cancelled": bool(row["cancelled"]),
             "lastStepIdx": int(row["last_step_idx"]),
             "contextTokens": int(row["context_tokens"]) if "context_tokens" in row_keys else 0,
             "title": row["title"],
-            "mcp_servers": json.loads(row["mcp_servers_json"] or "[]"),
+            "mcp_servers": mcp_servers,
+            "wire_mcp_servers": wire_mcp_servers,
             "meta": json.loads(row["meta_json"] or "{}"),
             "auth_config": auth_cfg,
             "createdAt": str(row["created_at"]),
@@ -175,6 +181,18 @@ class SqliteStateStoreProvider:
                 auth_config["_agent"] = str(state["agent"])
             else:
                 auth_config.pop("_agent", None)
+        if "wire_mcp_servers" in state and isinstance(state["wire_mcp_servers"], list):
+            auth_config["_wire_mcp_servers"] = list(state["wire_mcp_servers"])
+        if "switchedModel" in state:
+            if state["switchedModel"]:
+                auth_config["_switched_model"] = str(state["switchedModel"])
+            else:
+                auth_config.pop("_switched_model", None)
+        if "compactedSummary" in state:
+            if state["compactedSummary"]:
+                auth_config["_compacted_summary"] = str(state["compactedSummary"])
+            else:
+                auth_config.pop("_compacted_summary", None)
         created_at = str(existing.get("createdAt") or now)
 
         with self._connect() as conn:

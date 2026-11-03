@@ -15,7 +15,11 @@ from agy_acp.commands.docs import build as docs_build_cmd
 def test_cli_scaffold_help_and_version(capsys: pytest.CaptureFixture[str]) -> None:
     """Verify Cyclopts scaffold registers subcommands, group docstrings, and version."""
     app(["--version"], result_action="return_value")
-    assert __version__ in capsys.readouterr().out
+    version_out = capsys.readouterr().out.strip()
+    assert __version__ in version_out
+    last_token = version_out.split()[-1]
+    major, minor, patch = (int(part) for part in last_token.split(".")[:3])
+    assert (major, minor, patch) >= (2, 28, 0)
 
     app(["--help"], result_action="return_value")
     root_help = capsys.readouterr().out
@@ -128,7 +132,9 @@ def test_kirocrew_prerequisite_and_dashboard_cli_commands(
     assert "model_name" in models_data["models"][0]
     assert "context_window_tokens" in models_data["models"][0]
 
-    rc_usage = main(["chat", "--no-interactive", "--agent", "kirocrew-lite", "/usage"])
+    rc_usage = main(
+        ["chat", "--no-interactive", "--agent-engine", "v2", "--agent", "kirocrew-lite", "/usage"]
+    )
     assert rc_usage == 0
     usage_out = capsys.readouterr().out
     assert "Estimated Usage" in usage_out

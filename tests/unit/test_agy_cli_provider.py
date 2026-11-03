@@ -766,3 +766,16 @@ async def test_stream_prompt_mid_turn_steer_interrupts_and_continues_conversatio
         in full_text
     )
     assert not temp_img.exists()
+
+
+def test_normalize_tool_arguments_populates_tool_use_purpose() -> None:
+    """Verify `toolSummary` populates both `description` and KiroCrew `__toolUsePurpose`."""
+    from agy_acp.providers.agy_cli_provider import _normalize_tool_arguments
+
+    normalized = _normalize_tool_arguments(
+        {"CommandLine": "uv run pytest", "toolSummary": "Unit test execution"},
+        tool_name="run_command",
+    )
+    assert normalized["command"] == "uv run pytest"
+    assert normalized["description"] == "Unit test execution"
+    assert normalized["__toolUsePurpose"] == "Unit test execution"

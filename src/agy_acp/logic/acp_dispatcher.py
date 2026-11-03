@@ -9,7 +9,7 @@ from typing import Any
 
 import anyio
 
-from agy_acp import __version__
+from agy_acp import KIRO_CLI_COMPAT_VERSION, __version__
 from agy_acp.logic.auth_manager import AuthManager
 from agy_acp.logic.quota_tracker import QuotaTracker
 from agy_acp.logic.session_manager import DEFAULT_MODEL_ID, SessionManager
@@ -30,6 +30,10 @@ AVAILABLE_SLASH_COMMANDS: list[dict[str, str]] = [
     {
         "name": "credits",
         "description": "Display remaining Antigravity G1 credits",
+    },
+    {
+        "name": "compact",
+        "description": "Compact conversation history to free context window space",
     },
 ]
 
@@ -56,6 +60,13 @@ class AcpDispatcher:
         self._quota_tracker = quota_tracker or QuotaTracker(
             state_store=self._session_manager.state_store
         )
+        self._post_response_notifications: list[dict[str, Any]] = []
+
+    def pop_post_response_notifications(self) -> list[dict[str, Any]]:
+        """Drain notifications queued to flush immediately after a JSON-RPC response frame."""
+        queued = list(self._post_response_notifications)
+        self._post_response_notifications.clear()
+        return queued
 
     async def _emit_notification(self, notification: dict[str, Any]) -> None:
         """Emit a JSON-RPC 2.0 notification to the configured sink if present."""
@@ -93,6 +104,25 @@ class AcpDispatcher:
             if isinstance(block, dict) and block.get("type") == "text"
         ]
         return "\n".join(part for part in parts if part).strip()
+
+    @staticmethod
+    def _extract_compact_command(prompt_text: str) -> tuple[bool, str]:
+        """Return `(is_compact, instructions)` if `prompt_text` invokes `/compact`."""
+        if not prompt_text:
+            return False, ""
+        candidate = prompt_text.strip()
+        marker = "[CURRENT USER REQUEST"
+        idx = prompt_text.rfind(marker)
+        if idx != -1:
+            close_bracket = prompt_text.find("]", idx)
+            if close_bracket != -1:
+                candidate = prompt_text[close_bracket + 1 :].strip()
+        lower = candidate.lower()
+        if lower == "/compact":
+            return True, ""
+        if lower.startswith(("/compact ", "/compact\n", "/compact\t")):
+            return True, candidate[len("/compact") :].strip()
+        return False, ""
 
     @staticmethod
     def _extract_slash_command(prompt_text: str) -> str:
@@ -155,6 +185,78 @@ class AcpDispatcher:
             [b for b in raw_prompt if isinstance(b, dict)] if isinstance(raw_prompt, list) else []
         )
         prompt_text = self._extract_prompt_text(prompt_blocks)
+        is_compact, compact_instructions = self._extract_compact_command(prompt_text)
+        if is_compact:
+            compact_res = await self._session_manager.compact_session(
+                session_id=session_id,
+                instructions=compact_instructions,
+            )
+            status_type = str(compact_res.get("status", "completed"))
+            summary_text = str(compact_res.get("summary", ""))
+            compacted_ctx = int(compact_res.get("contextTokens", 0))
+            input_tokens = max(1, int(compact_res.get("inputTokens", 1)))
+            output_tokens = max(1, int(compact_res.get("outputTokens", 1)))
+            await self._emit_notification(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "_kiro.dev/compaction/status",
+                    "params": {
+                        "sessionId": session_id,
+                        "status": {"type": status_type},
+                        "summary": summary_text,
+                    },
+                }
+            )
+            if summary_text:
+                await self._emit_notification(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "sessionId": session_id,
+                            "update": {
+                                "sessionUpdate": "agent_message_chunk",
+                                "content": {"type": "text", "text": summary_text},
+                            },
+                        },
+                    }
+                )
+            model_id = self._resolve_session_model(session_id)
+            for wire_update in await self._quota_tracker.build_kirocrew_wire_updates(
+                session_id=session_id,
+                model_id=model_id,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cached_read_tokens=0,
+                context_tokens=compacted_ctx,
+            ):
+                await self._emit_notification(wire_update)
+                if wire_update.get("method") == "_kiro.dev/metadata":
+                    post_params = dict(wire_update.get("params", {}))
+                    post_params["meteringUsage"] = [
+                        {"unit": "credit", "unitPlural": "credits", "value": 0.0}
+                    ]
+                    self._post_response_notifications.append(
+                        {
+                            "jsonrpc": "2.0",
+                            "method": "_kiro.dev/metadata",
+                            "params": post_params,
+                        }
+                    )
+            return {
+                "jsonrpc": "2.0",
+                "id": message_id,
+                "result": {
+                    "stopReason": "end_turn",
+                    "usage": {
+                        "inputTokens": input_tokens,
+                        "outputTokens": output_tokens,
+                        "cachedReadTokens": 0,
+                        "cachedWriteTokens": 0,
+                    },
+                },
+            }
+
         slash_cmd = self._extract_slash_command(prompt_text)
 
         if slash_cmd in SLASH_QUOTA_COMMANDS:
@@ -434,6 +536,20 @@ class AcpDispatcher:
             }
         )
 
+    async def _emit_mcp_servers_initialized(self, session_id: str) -> None:
+        """Emit `_kiro.dev/mcp/server_initialized` for every configured session MCP server."""
+        for server_name in self._session_manager.get_session_mcp_server_names(session_id):
+            await self._emit_notification(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "_kiro.dev/mcp/server_initialized",
+                    "params": {
+                        "sessionId": session_id,
+                        "serverName": server_name,
+                    },
+                }
+            )
+
     async def _handle_session_new(
         self,
         message_id: Any,
@@ -453,6 +569,7 @@ class AcpDispatcher:
             meta=meta,
         )
         await self._emit_available_commands_update(desc["sessionId"])
+        await self._emit_mcp_servers_initialized(desc["sessionId"])
         persisted_ctx = self._quota_tracker.get_session_context_tokens(desc["sessionId"])
         if persisted_ctx is not None and persisted_ctx > 0:
             await self._emit_notification(
@@ -495,6 +612,7 @@ class AcpDispatcher:
                 },
             }
         await self._emit_available_commands_update(desc["sessionId"])
+        await self._emit_mcp_servers_initialized(desc["sessionId"])
         persisted_ctx = self._quota_tracker.get_session_context_tokens(desc["sessionId"])
         if persisted_ctx is not None and persisted_ctx > 0:
             await self._emit_notification(
@@ -515,6 +633,8 @@ class AcpDispatcher:
         params: dict[str, Any],
     ) -> dict[str, Any]:
         """Handle `session/set_mode`, updating session mode and emitting `current_mode_update`."""
+        from agy_acp.logic.session_manager import VALID_MODE_IDS
+
         session_id = str(params.get("sessionId", ""))
         mode_id = str(params.get("modeId", ""))
         try:
@@ -532,6 +652,22 @@ class AcpDispatcher:
                     "data": str(exc),
                 },
             }
+        if mode_id not in VALID_MODE_IDS:
+            session_state = self._session_manager.get_session(session_id)
+            switched_params: dict[str, Any] = {
+                "sessionId": session_id,
+                "agentName": mode_id,
+            }
+            switched_model = session_state.get("switchedModel")
+            if isinstance(switched_model, str) and switched_model:
+                switched_params["model"] = switched_model
+            await self._emit_notification(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "_kiro.dev/agent/switched",
+                    "params": switched_params,
+                }
+            )
         await self._emit_notification(
             {
                 "jsonrpc": "2.0",
@@ -545,6 +681,8 @@ class AcpDispatcher:
                 },
             }
         )
+        if mode_id not in VALID_MODE_IDS:
+            await self._emit_mcp_servers_initialized(session_id)
         return {
             "jsonrpc": "2.0",
             "id": message_id,
@@ -632,22 +770,37 @@ class AcpDispatcher:
                 },
             }
         if cmd_name == "mcp":
+            server_names = (
+                self._session_manager.get_session_mcp_server_names(session_id) if session_id else []
+            )
             return {
                 "jsonrpc": "2.0",
                 "id": message_id,
                 "result": {
                     "message": "MCP servers",
-                    "data": {"servers": []},
+                    "data": {
+                        "servers": [
+                            {"name": name, "status": "running", "toolCount": 1}
+                            for name in server_names
+                        ]
+                    },
                     "stopReason": "end_turn",
                 },
             }
         if cmd_name == "tools":
+            server_names = (
+                self._session_manager.get_session_mcp_server_names(session_id) if session_id else []
+            )
             return {
                 "jsonrpc": "2.0",
                 "id": message_id,
                 "result": {
                     "message": "Tools",
-                    "data": {"tools": []},
+                    "data": {
+                        "tools": [
+                            {"name": f"@{name}", "source": f"mcp:{name}"} for name in server_names
+                        ]
+                    },
                     "stopReason": "end_turn",
                 },
             }
@@ -812,7 +965,8 @@ class AcpDispatcher:
                     "agentInfo": {
                         "name": "agy-acp",
                         "title": "Google Antigravity ACP Harness",
-                        "version": __version__,
+                        "version": KIRO_CLI_COMPAT_VERSION,
+                        "_meta": {"agyAcpVersion": __version__},
                     },
                     "authMethods": [],
                 },

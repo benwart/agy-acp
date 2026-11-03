@@ -172,8 +172,57 @@ async def test_format_kirocrew_usage_and_slash_response() -> None:
     assert updates[0]["params"]["update"]["size"] == 1000000
     assert updates[1]["method"] == "_kiro.dev/metadata"
     assert updates[1]["params"]["modelId"] == "gemini-3.8-flash"
+    assert updates[1]["params"]["meteringUsage"] == [
+        {"unit": "credit", "unitPlural": "credits", "value": 0.0}
+    ]
     assert "five_hour" in updates[1]["params"]["_meta"]["quota"]
     assert "seven_day" in updates[1]["params"]["_meta"]["quota"]
+
+    class _DroppingQuotaProvider(QuotaProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fractions = [0.95, 0.94]
+
+        async def fetch_quota_groups(self) -> list[dict[str, Any]]:
+            frac = self.fractions.pop(0) if self.fractions else 0.94
+            return [
+                {
+                    "group": "Gemini Models",
+                    "buckets": [
+                        {
+                            "id": "gemini-5h",
+                            "group": "Gemini Models",
+                            "name": "Five Hour Limit Remaining",
+                            "window": "5h",
+                            "remaining_fraction": frac,
+                            "reset_time": "2026-10-24T07:52:04Z",
+                        }
+                    ],
+                }
+            ]
+
+        async def fetch_credits(self) -> dict[str, Any]:
+            return {"remaining_credits": 0, "upgrade_uri": "https://one.google.com/ai"}
+
+    dropping_tracker = QuotaTracker(provider=_DroppingQuotaProvider())
+    first_turn = await dropping_tracker.build_kirocrew_wire_updates(
+        session_id="sess-metering",
+        model_id="gemini-3.8-flash",
+        input_tokens=100,
+        output_tokens=50,
+    )
+    second_turn = await dropping_tracker.build_kirocrew_wire_updates(
+        session_id="sess-metering",
+        model_id="gemini-3.8-flash",
+        input_tokens=100,
+        output_tokens=50,
+    )
+    assert first_turn[1]["params"]["meteringUsage"] == [
+        {"unit": "credit", "unitPlural": "credits", "value": 0.0}
+    ]
+    assert second_turn[1]["params"]["meteringUsage"] == [
+        {"unit": "credit", "unitPlural": "credits", "value": 2.0}
+    ]
 
     md = await tracker.format_slash_command_response("/quota")
     assert "5h" in md and "Five Hour" in md

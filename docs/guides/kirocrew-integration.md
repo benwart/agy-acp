@@ -5,6 +5,8 @@
 KiroCrew resolves ACP backend binaries via environment variable overrides (`kiro_crew/acp/launch.py`). You can point any KiroCrew backend slot at `agy-acp`:
 
 ```bash
+export KIROCREW_KIRO_BIN="$HOME/.local/bin/agy-acp"
+# or:
 export OPENCODE_BIN="/Users/benwart/source/benwart/agy-acp/.venv/bin/agy-acp"
 # or:
 export CLAUDE_AGENT_ACP_BIN="/Users/benwart/source/benwart/agy-acp/.venv/bin/agy-acp"
@@ -40,3 +42,4 @@ agy-acp quota credits
 
 From inside KiroCrew chat:
 - Type `/quota`, `/usage`, or `/credits` to view a live Markdown table of your 5-hour and 7-day rolling limits and session token usage.
+- Type `/compact` (or `/compact <instructions>`) to summarize and compact the active conversation context.

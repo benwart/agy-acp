@@ -18,13 +18,14 @@ async def default(
     list_models: bool = False,
     format: str = "text",
     no_interactive: bool = False,
+    agent_engine: str | None = None,
     agent: str | None = None,
     model: str | None = None,
     **extra_kwargs: Any,
 ) -> int:
     """Execute KiroCrew `--list-models` catalog query or non-interactive `/usage` scrape."""
     await anyio.sleep(0)
-    _ = (format, no_interactive, agent, model, extra_kwargs)
+    _ = (format, no_interactive, agent_engine, agent, model, extra_kwargs)
 
     if list_models:
         provider = AgyCliProvider()

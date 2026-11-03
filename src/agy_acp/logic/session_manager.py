@@ -359,6 +359,22 @@ class SessionManager:
         """Return all persisted sessions from SQLite, optionally filtered by `cwd`."""
         return self._store.list_sessions(cwd=cwd)
 
+    def get_session_mcp_server_names(self, session_id: str) -> list[str]:
+        """Return ordered unique MCP server names configured for `session_id`."""
+        session = self._store.get_session(session_id)
+        if session is None:
+            return []
+        raw_servers = session.get("mcp_servers")
+        if not isinstance(raw_servers, list):
+            return []
+        names: list[str] = []
+        for entry in raw_servers:
+            if isinstance(entry, dict):
+                name = str(entry.get("name") or "").strip()
+                if name and name not in names:
+                    names.append(name)
+        return names
+
     async def create_session(
         self,
         *,
@@ -377,6 +393,7 @@ class SessionManager:
             initial_model = DEFAULT_MODEL_ID
         isolated_mcp = copy.deepcopy(mcp_servers) if mcp_servers is not None else []
         isolated_meta = copy.deepcopy(meta) if meta is not None else {}
+        auth_cfg = {"kiro_agent": self._default_agent} if self._default_agent else None
         sid = await self._cli.start_or_resume_agent(
             session_id=None,
             cwd=cwd,
@@ -384,13 +401,17 @@ class SessionManager:
             model=initial_model,
             mode=initial_mode,
             reasoning_effort=DEFAULT_REASONING_EFFORT,
+            auth_config=auth_cfg,
         )
+        synced_state = self._store.get_session(sid) or {}
         state = self._store.upsert_session(
             {
+                **synced_state,
                 "sessionId": sid,
                 "agyConversationId": None,
                 "cwd": cwd,
-                "mcp_servers": isolated_mcp,
+                "mcp_servers": synced_state.get("mcp_servers", isolated_mcp),
+                "wire_mcp_servers": synced_state.get("wire_mcp_servers", isolated_mcp),
                 "meta": isolated_meta,
                 "mode": initial_mode,
                 "agent": self._default_agent,
@@ -417,31 +438,35 @@ class SessionManager:
         await anyio.sleep(0)
         state = self._require_session(session_id)
 
-        effective_mcp = (
+        effective_wire_mcp = (
             copy.deepcopy(mcp_servers)
             if mcp_servers is not None
-            else copy.deepcopy(state.get("mcp_servers", []))
+            else copy.deepcopy(state.get("wire_mcp_servers", state.get("mcp_servers", [])))
         )
         model = str(state.get("model", self._default_model or DEFAULT_MODEL_ID))
         mode = str(state.get("mode", "auto"))
         agent = state.get("agent") or self._default_agent
         reasoning_effort = str(state.get("reasoning_effort", DEFAULT_REASONING_EFFORT))
+        auth_cfg = {"kiro_agent": str(agent)} if agent else None
 
         await self._cli.start_or_resume_agent(
             session_id=session_id,
             cwd=cwd,
-            mcp_servers=effective_mcp,
+            mcp_servers=effective_wire_mcp,
             model=model,
             mode=mode,
             reasoning_effort=reasoning_effort,
+            auth_config=auth_cfg,
         )
+        synced_state = self._store.get_session(session_id) or {}
 
         restored_state = self._store.upsert_session(
             {
                 **copy.deepcopy(state),
                 "sessionId": session_id,
                 "cwd": cwd,
-                "mcp_servers": effective_mcp,
+                "mcp_servers": synced_state.get("mcp_servers", effective_wire_mcp),
+                "wire_mcp_servers": synced_state.get("wire_mcp_servers", effective_wire_mcp),
                 "mode": mode,
                 "agent": agent,
                 "model": model,
@@ -471,17 +496,147 @@ class SessionManager:
 
     async def set_mode(self, *, session_id: str, mode_id: str) -> dict[str, Any]:
         """Update session approval mode or agent profile (`session/set_mode`) in SQLite."""
+        from agy_acp.providers.agy_cli_provider import (
+            _dedupe_mcp_servers,
+            load_kiro_agent_spec,
+            translate_mcp_server,
+        )
+
         await anyio.sleep(0)
         session = self._require_session(session_id)
+        cwd = str(session.get("cwd", ""))
         if mode_id in VALID_MODE_IDS:
             session["mode"] = mode_id
             session["agent"] = None
-        elif self._is_valid_agent_mode(mode_id, cwd=str(session.get("cwd", ""))):
+            session["switchedModel"] = None
+        elif self._is_valid_agent_mode(mode_id, cwd=cwd):
             session["agent"] = mode_id
+            spec = load_kiro_agent_spec(
+                mode_id,
+                cwd=cwd,
+                include_home=not self._cli.is_custom_store,
+            )
+            raw_wire = session.get("wire_mcp_servers", [])
+            wire_list = (
+                [translate_mcp_server(s) for s in raw_wire if isinstance(s, dict)]
+                if isinstance(raw_wire, list)
+                else []
+            )
+            agent_list = [translate_mcp_server(s) for s in spec["mcp_servers"]]
+            combined = _dedupe_mcp_servers([*wire_list, *agent_list])
+            wire_names = {str(s.get("name") or "") for s in wire_list}
+            prev_names = [
+                str(s.get("name") or "")
+                for s in session.get("mcp_servers", [])
+                if isinstance(s, dict) and s.get("name")
+            ]
+            combined_names = {str(s.get("name") or "") for s in combined}
+            removable = [
+                name
+                for name in [*spec["disabled_mcp_servers"], *prev_names]
+                if name and name not in wire_names and name not in combined_names
+            ]
+            if combined or removable:
+                self._cli.sync_mcp_servers(combined, remove_servers=removable)
+            session["mcp_servers"] = combined
+            pinned_model = spec.get("model")
+            if isinstance(pinned_model, str) and pinned_model:
+                session["model"] = pinned_model
+                session["switchedModel"] = pinned_model
+            else:
+                session["switchedModel"] = None
         else:
             raise ValueError(f"Mode '{mode_id}' not found")
         self._store.upsert_session(session)
         return {}
+
+    async def compact_session(
+        self,
+        *,
+        session_id: str,
+        instructions: str = "",
+    ) -> dict[str, Any]:
+        """Summarize and reset `session_id` conversation history for `/compact`."""
+        session = self._store.get_session(session_id)
+        if session is None:
+            return {
+                "status": "completed",
+                "summary": "Context is already empty.",
+                "contextTokens": 0,
+                "inputTokens": 1,
+                "outputTokens": 1,
+            }
+
+        prev_tokens = int(session.get("contextTokens", 0))
+        agy_conv_id = session.get("agyConversationId")
+        if not agy_conv_id:
+            existing_summary = session.get("compactedSummary")
+            if isinstance(existing_summary, str) and existing_summary.strip():
+                summary = existing_summary.strip()
+                compacted_tokens = max(1, len(summary.split()) * 2)
+            else:
+                summary = "Context is already empty."
+                compacted_tokens = 0
+            session["contextTokens"] = compacted_tokens
+            self._store.upsert_session(session)
+            return {
+                "status": "completed",
+                "summary": summary,
+                "contextTokens": compacted_tokens,
+                "inputTokens": 1,
+                "outputTokens": max(1, len(summary.split())),
+            }
+
+        compact_prompt = (
+            "Summarize our conversation so far into a concise handoff summary "
+            "preserving goals, key decisions, modified files, and next steps."
+        )
+        if instructions.strip():
+            compact_prompt = f"{compact_prompt}\n\nAdditional instructions: {instructions.strip()}"
+
+        cwd = str(session.get("cwd", ""))
+        model = str(session.get("model", DEFAULT_MODEL_ID))
+        try:
+            outcome = await self._cli.stream_prompt(
+                cwd=cwd,
+                prompt=compact_prompt,
+                session_id=session_id,
+                conversation_id=str(agy_conv_id),
+                model=model,
+                mode="read-only",
+                effort="low",
+            )
+        except Exception as exc:
+            return {
+                "status": "failed",
+                "summary": str(exc) or "Compaction failed.",
+                "contextTokens": prev_tokens,
+                "inputTokens": 1,
+                "outputTokens": 1,
+            }
+
+        if outcome.stop_reason == "cancelled":
+            return {
+                "status": "failed",
+                "summary": "Compaction cancelled.",
+                "contextTokens": prev_tokens,
+                "inputTokens": 1,
+                "outputTokens": 1,
+            }
+
+        summary = (outcome.response or "").strip() or "Conversation context compacted."
+        compacted_tokens = max(1, len(summary.split()) * 2)
+        session["agyConversationId"] = None
+        session["compactedSummary"] = summary
+        session["contextTokens"] = compacted_tokens
+        self._store.upsert_session(session)
+        return {
+            "status": "completed",
+            "summary": summary,
+            "contextTokens": compacted_tokens,
+            "inputTokens": max(1, int(outcome.usage.get("input_tokens", 1))),
+            "outputTokens": max(1, int(outcome.usage.get("output_tokens", len(summary.split())))),
+        }
 
     async def set_model(self, *, session_id: str, model_id: str) -> dict[str, Any]:
         """Update active model (`session/set_model`) in SQLite."""
@@ -545,8 +700,20 @@ class SessionManager:
         effort = str(session.get("reasoning_effort", DEFAULT_REASONING_EFFORT))
         agy_conv_id = session.get("agyConversationId")
         conversation_id = str(agy_conv_id) if agy_conv_id else None
+        compacted_summary = session.get("compactedSummary")
 
         formatted_prompt, temp_images = _format_prompt_blocks(prompt_blocks)
+        consumed_compacted_summary = False
+        if (
+            conversation_id is None
+            and isinstance(compacted_summary, str)
+            and compacted_summary.strip()
+        ):
+            formatted_prompt = (
+                f"[Compacted Session Summary]\n{compacted_summary.strip()}\n\n{formatted_prompt}"
+            ).strip()
+            consumed_compacted_summary = True
+
         outcome = None
         try:
             with self.turn_cancel_scope(session_id) as scope:
@@ -579,9 +746,16 @@ class SessionManager:
             return {"stopReason": "cancelled"}
 
         ctx_tokens = int(outcome.usage.get("context_tokens", 0))
-        if session and (outcome.conversation_id or outcome.resolved_model or ctx_tokens > 0):
+        if session and (
+            outcome.conversation_id
+            or outcome.resolved_model
+            or ctx_tokens > 0
+            or consumed_compacted_summary
+        ):
             if outcome.conversation_id:
                 session["agyConversationId"] = outcome.conversation_id
+            if consumed_compacted_summary:
+                session["compactedSummary"] = None
             if outcome.resolved_model and session.get("model") in {DEFAULT_MODEL_ID, "auto", ""}:
                 session["model"] = outcome.resolved_model
             if ctx_tokens > 0:

@@ -179,6 +179,9 @@ async def test_handle_initialize_capabilities() -> None:
     )
     assert resp is not None
     assert resp["result"]["agentCapabilities"]["loadSession"] is True
+    agent_version = resp["result"]["agentInfo"]["version"]
+    major, minor, patch = (int(part) for part in agent_version.split(".")[:3])
+    assert (major, minor, patch) >= (2, 28, 0)
 
 
 async def test_prompt_streams_chunks_and_usage() -> None:
@@ -709,3 +712,328 @@ async def test_mid_turn_steer_and_steering_with_image_attachment(tmp_path: Any) 
         )
     )
     assert idle_steering == {"jsonrpc": "2.0", "id": 43, "result": {"outcome": "failed"}}
+
+
+async def test_kirocrew_0111_mcp_init_agent_switched_and_commands_inventory(
+    tmp_path: Any,
+) -> None:
+    """Verify KiroCrew 0.11.1 MCP init frames, agent/switched, and /mcp + /tools inventory."""
+    agents_dir = tmp_path / ".kiro" / "agents"
+    agents_dir.mkdir(parents=True)
+    (agents_dir / "kirocrew-skill-view-a.json").write_text(
+        json.dumps(
+            {
+                "name": "kirocrew-skill-view-a",
+                "mcpServers": {
+                    "kirocrew-core": {"command": "echo", "args": ["core"]},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (agents_dir / "kirocrew-skill-view-b.json").write_text(
+        json.dumps(
+            {
+                "name": "kirocrew-skill-view-b",
+                "model": "gemini-3.8-flash",
+                "mcpServers": {
+                    "kirocrew-core": {"command": "echo", "args": ["core"]},
+                    "kirocrew-mate": {"command": "echo", "args": ["mate"]},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    emitted: list[dict[str, Any]] = []
+
+    async def _sink(msg: dict[str, Any]) -> None:
+        emitted.append(msg)
+
+    cli = _StubAgyCliProvider(save_dir=tmp_path)
+    dispatcher = AcpDispatcher(
+        notification_sink=_sink,
+        session_manager=SessionManager(
+            save_dir=tmp_path,
+            cli_provider=cli,
+            default_agent="kirocrew-skill-view-a",
+        ),
+        quota_tracker=QuotaTracker(
+            provider=QuotaProvider(cli_provider=cli),
+            state_store=cli.state_store,
+        ),
+    )
+
+    new_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 50,
+                "method": "session/new",
+                "params": {
+                    "cwd": str(tmp_path),
+                    "mcpServers": [{"name": "broker-stub", "command": "echo", "args": ["stub"]}],
+                },
+            }
+        )
+    )
+    assert new_resp is not None
+    sid = new_resp["result"]["sessionId"]
+    init_servers = [
+        n["params"]["serverName"]
+        for n in emitted
+        if n.get("method") == "_kiro.dev/mcp/server_initialized"
+        and n["params"].get("sessionId") == sid
+    ]
+    assert init_servers == ["broker-stub", "kirocrew-core"]
+
+    emitted.clear()
+    mode_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 51,
+                "method": "session/set_mode",
+                "params": {"sessionId": sid, "modeId": "kirocrew-skill-view-b"},
+            }
+        )
+    )
+    assert mode_resp == {"jsonrpc": "2.0", "id": 51, "result": {}}
+    switched = [n["params"] for n in emitted if n.get("method") == "_kiro.dev/agent/switched"]
+    assert switched == [
+        {
+            "sessionId": sid,
+            "agentName": "kirocrew-skill-view-b",
+            "model": "gemini-3.8-flash",
+        }
+    ]
+    mode_init_servers = [
+        n["params"]["serverName"]
+        for n in emitted
+        if n.get("method") == "_kiro.dev/mcp/server_initialized"
+        and n["params"].get("sessionId") == sid
+    ]
+    assert mode_init_servers == ["broker-stub", "kirocrew-core", "kirocrew-mate"]
+
+    mcp_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 52,
+                "method": "_kiro.dev/commands/execute",
+                "params": {"sessionId": sid, "command": {"command": "mcp", "args": {}}},
+            }
+        )
+    )
+    assert mcp_resp is not None
+    assert mcp_resp["result"]["data"]["servers"] == [
+        {"name": "broker-stub", "status": "running", "toolCount": 1},
+        {"name": "kirocrew-core", "status": "running", "toolCount": 1},
+        {"name": "kirocrew-mate", "status": "running", "toolCount": 1},
+    ]
+
+    tools_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 53,
+                "method": "_kiro.dev/commands/execute",
+                "params": {"sessionId": sid, "command": {"command": "tools", "args": {}}},
+            }
+        )
+    )
+    assert tools_resp is not None
+    tool_sources = {t["source"] for t in tools_resp["result"]["data"]["tools"]}
+    assert {
+        "mcp:broker-stub",
+        "mcp:kirocrew-core",
+        "mcp:kirocrew-mate",
+    }.issubset(tool_sources)
+
+
+async def test_compact_slash_command_emits_compaction_status_and_resets_context(
+    tmp_path: Any,
+) -> None:
+    """Verify `/compact` emits `_kiro.dev/compaction/status`, resets context, and hands off."""
+    from agy_acp.logic.acp_dispatcher import AVAILABLE_SLASH_COMMANDS
+
+    assert any(cmd["name"] == "compact" for cmd in AVAILABLE_SLASH_COMMANDS)
+
+    calls: list[dict[str, Any]] = []
+
+    class _CompactCliProvider(_StubAgyCliProvider):
+        async def stream_prompt(self, **kwargs: Any) -> PromptOutcome:
+            calls.append(dict(kwargs))
+            prompt_str = str(kwargs.get("prompt") or "")
+            if "Summarize our conversation" in prompt_str:
+                return PromptOutcome(
+                    conversation_id=str(kwargs.get("conversation_id") or "conv-1"),
+                    stop_reason="end_turn",
+                    response="Summary: auth module refactored; tests green.",
+                    usage={
+                        "input_tokens": 200,
+                        "output_tokens": 12,
+                        "thinking_tokens": 0,
+                        "cache_read_tokens": 0,
+                        "total_tokens": 212,
+                        "context_tokens": 30_392,
+                    },
+                )
+            if len(calls) == 1:
+                return PromptOutcome(
+                    conversation_id="conv-pre-compact-1",
+                    stop_reason="end_turn",
+                    response="Initial heavy turn.",
+                    usage={
+                        "input_tokens": 25_000,
+                        "output_tokens": 5_180,
+                        "thinking_tokens": 0,
+                        "cache_read_tokens": 0,
+                        "total_tokens": 30_180,
+                        "context_tokens": 30_180,
+                    },
+                )
+            return PromptOutcome(
+                conversation_id="conv-post-compact-2",
+                stop_reason="end_turn",
+                response="Continued cleanly from summary.",
+                usage={
+                    "input_tokens": 120,
+                    "output_tokens": 30,
+                    "thinking_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "total_tokens": 150,
+                    "context_tokens": 150,
+                },
+            )
+
+    emitted: list[dict[str, Any]] = []
+
+    async def _sink(msg: dict[str, Any]) -> None:
+        emitted.append(msg)
+
+    cli = _CompactCliProvider(save_dir=tmp_path)
+    dispatcher = AcpDispatcher(
+        notification_sink=_sink,
+        session_manager=SessionManager(save_dir=tmp_path, cli_provider=cli),
+        quota_tracker=QuotaTracker(
+            provider=QuotaProvider(cli_provider=cli),
+            state_store=cli.state_store,
+        ),
+    )
+
+    new_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 60,
+                "method": "session/new",
+                "params": {"cwd": str(tmp_path), "mcpServers": []},
+            }
+        )
+    )
+    assert new_resp is not None
+    sid = new_resp["result"]["sessionId"]
+
+    # Turn 1 builds up 30,180 context tokens on conv-pre-compact-1
+    await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 61,
+                "method": "session/prompt",
+                "params": {"sessionId": sid, "prompt": [{"type": "text", "text": "Build auth"}]},
+            }
+        )
+    )
+    emitted.clear()
+
+    # Turn 2 runs `/compact focus on auth` inside KiroCrew envelope
+    compact_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 62,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": sid,
+                    "prompt": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "[RUNTIME] KiroCrew\n"
+                                "[CURRENT USER REQUEST -- respond to this]\n"
+                                "/compact focus on auth"
+                            ),
+                        }
+                    ],
+                },
+            }
+        )
+    )
+    assert compact_resp is not None
+    assert compact_resp["result"]["stopReason"] == "end_turn"
+    assert "focus on auth" in calls[1]["prompt"]
+    assert calls[1]["conversation_id"] == "conv-pre-compact-1"
+
+    compaction_frames = [
+        n["params"] for n in emitted if n.get("method") == "_kiro.dev/compaction/status"
+    ]
+    assert compaction_frames == [
+        {
+            "sessionId": sid,
+            "status": {"type": "completed"},
+            "summary": "Summary: auth module refactored; tests green.",
+        }
+    ]
+    meta_frames = [n["params"] for n in emitted if n.get("method") == "_kiro.dev/metadata"]
+    assert len(meta_frames) == 1
+    assert meta_frames[0]["contextUsagePercentage"] < 0.1
+
+    post_notifs = dispatcher.pop_post_response_notifications()
+    assert len(post_notifs) == 1
+    assert post_notifs[0]["method"] == "_kiro.dev/metadata"
+    assert post_notifs[0]["params"]["sessionId"] == sid
+    assert (
+        post_notifs[0]["params"]["contextUsagePercentage"]
+        == (meta_frames[0]["contextUsagePercentage"])
+    )
+    assert post_notifs[0]["params"]["meteringUsage"] == [
+        {"unit": "credit", "unitPlural": "credits", "value": 0.0}
+    ]
+    assert dispatcher.pop_post_response_notifications() == []
+
+    # Turn 3 starts a fresh conversation (`conversation_id=None`) with compacted summary prepended
+    await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 63,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": sid,
+                    "prompt": [{"type": "text", "text": "Continue work"}],
+                },
+            }
+        )
+    )
+    assert calls[2]["conversation_id"] is None
+    assert "[Compacted Session Summary]" in calls[2]["prompt"]
+    assert "Summary: auth module refactored; tests green." in calls[2]["prompt"]
+
+    # Turn 4 resumes the new conversation without re-prepending the summary
+    await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 64,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": sid,
+                    "prompt": [{"type": "text", "text": "Next step"}],
+                },
+            }
+        )
+    )
+    assert calls[3]["conversation_id"] == "conv-post-compact-2"
+    assert "[Compacted Session Summary]" not in calls[3]["prompt"]

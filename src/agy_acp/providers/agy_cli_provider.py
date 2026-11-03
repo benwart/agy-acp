@@ -219,13 +219,26 @@ def build_agy_args(
     return args
 
 
-def load_kiro_agent_mcp_servers(
+def _dedupe_mcp_servers(servers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Deduplicate MCP server entries by non-empty `name`, preserving first-seen precedence."""
+    seen: set[str] = set()
+    unique: list[dict[str, Any]] = []
+    for srv in servers:
+        name = str(srv.get("name") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        unique.append(srv)
+    return unique
+
+
+def load_kiro_agent_spec(
     agent_name: str | None = None,
     *,
     cwd: str | None = None,
     include_home: bool = True,
-) -> list[dict[str, Any]]:
-    """Load `mcpServers` definitions from `<cwd>/.kiro/agents/<agent>.json` or `~/.kiro/agents`."""
+) -> dict[str, Any]:
+    """Load `model` and `mcpServers` (enabled + disabled) from `.kiro/agents/<agent>.json`."""
     candidates: list[str] = []
     if agent_name and agent_name not in {"auto", "approve", "read-only"}:
         candidates.append(agent_name)
@@ -239,8 +252,12 @@ def load_kiro_agent_mcp_servers(
         with contextlib.suppress(RuntimeError, OSError):
             search_dirs.append(Path.home() / ".kiro" / "agents")
 
+    pinned_model: str | None = None
     servers_by_name: dict[str, dict[str, Any]] = {}
+    disabled_names: list[str] = []
+
     for cand in candidates:
+        found_candidate = False
         for agents_dir in search_dirs:
             spec_path = agents_dir / f"{cand}.json"
             if not spec_path.is_file():
@@ -249,24 +266,50 @@ def load_kiro_agent_mcp_servers(
                 raw_spec = json.loads(spec_path.read_text(encoding="utf-8"))
                 if not isinstance(raw_spec, dict):
                     continue
+                found_candidate = True
+                raw_model = raw_spec.get("model")
+                if pinned_model is None and isinstance(raw_model, str) and raw_model.strip():
+                    pinned_model = raw_model.strip()
                 raw_mcp = raw_spec.get("mcpServers")
                 if isinstance(raw_mcp, dict):
                     for srv_name, srv_cfg in raw_mcp.items():
-                        if (
-                            isinstance(srv_name, str)
-                            and srv_name
-                            and isinstance(srv_cfg, dict)
-                            and not srv_cfg.get("disabled")
-                            and srv_name not in servers_by_name
-                        ):
+                        if not isinstance(srv_name, str) or not srv_name:
+                            continue
+                        if not isinstance(srv_cfg, dict):
+                            continue
+                        if srv_cfg.get("disabled"):
+                            if srv_name not in disabled_names:
+                                disabled_names.append(srv_name)
+                        elif srv_name not in servers_by_name and srv_name not in disabled_names:
                             servers_by_name[srv_name] = {"name": srv_name, **srv_cfg}
                 elif isinstance(raw_mcp, list):
                     for item in raw_mcp:
                         if isinstance(item, dict) and item.get("name"):
                             sname = str(item["name"])
-                            if sname not in servers_by_name:
+                            if item.get("disabled"):
+                                if sname not in disabled_names:
+                                    disabled_names.append(sname)
+                            elif sname not in servers_by_name and sname not in disabled_names:
                                 servers_by_name[sname] = dict(item)
-    return list(servers_by_name.values())
+        if found_candidate:
+            break
+
+    return {
+        "model": pinned_model,
+        "mcp_servers": list(servers_by_name.values()),
+        "disabled_mcp_servers": disabled_names,
+    }
+
+
+def load_kiro_agent_mcp_servers(
+    agent_name: str | None = None,
+    *,
+    cwd: str | None = None,
+    include_home: bool = True,
+) -> list[dict[str, Any]]:
+    """Load `mcpServers` definitions from `<cwd>/.kiro/agents/<agent>.json` or `~/.kiro/agents`."""
+    spec = load_kiro_agent_spec(agent_name, cwd=cwd, include_home=include_home)
+    return list(spec["mcp_servers"])
 
 
 def _resolve_kiro_tool_identity(
@@ -395,10 +438,11 @@ def _normalize_tool_arguments(
             if isinstance(val, str) and val:
                 normalized["path"] = val
                 break
-    if "description" not in normalized:
-        summary = normalized.get("toolSummary")
-        if isinstance(summary, str) and summary.strip():
-            normalized["description"] = summary.strip()
+    summary = normalized.get("toolSummary")
+    if isinstance(summary, str) and summary.strip():
+        clean_summary = summary.strip()
+        normalized.setdefault("description", clean_summary)
+        normalized.setdefault("__toolUsePurpose", clean_summary)
     return normalized
 
 
@@ -518,9 +562,19 @@ class AgyCliProvider:
         self._in_permission_request: dict[str, int] = {}
         self._turn_conv_ids: dict[str, str] = {}
 
-    def sync_mcp_servers(self, mcp_servers: list[dict[str, Any]]) -> list[str]:
+    @property
+    def is_custom_store(self) -> bool:
+        """Return whether this provider uses a non-default isolated state directory."""
+        return self._is_custom_store
+
+    def sync_mcp_servers(
+        self,
+        mcp_servers: list[dict[str, Any]],
+        *,
+        remove_servers: list[str] | None = None,
+    ) -> list[str]:
         """Synchronize MCP server configurations into `agy`'s `mcp_config.json`."""
-        if not mcp_servers:
+        if not mcp_servers and not remove_servers:
             return []
         existing_data: dict[str, Any] = {}
         if self._mcp_config_path.is_file():
@@ -533,8 +587,13 @@ class AgyCliProvider:
             servers_map = {}
             existing_data["mcpServers"] = servers_map
 
-        synced: list[str] = []
         changed = False
+        for removed in remove_servers or []:
+            if removed in servers_map:
+                servers_map.pop(removed, None)
+                changed = True
+
+        synced: list[str] = []
         for srv in mcp_servers:
             translated = translate_mcp_server(srv)
             name = str(translated.get("name") or "").strip()
@@ -680,25 +739,36 @@ class AgyCliProvider:
         existing = (self._store.get_session(sid) if session_id is not None else None) or {}
 
         raw_mcp = (
-            list(mcp_servers) if mcp_servers is not None else list(existing.get("mcp_servers", []))
+            list(mcp_servers)
+            if mcp_servers is not None
+            else list(existing.get("wire_mcp_servers", existing.get("mcp_servers", [])))
         )
         agent_name = str(
-            (auth_config or {}).get("kiro_agent") or os.environ.get("AGY_KIRO_AGENT") or "kirocrew"
+            (auth_config or {}).get("kiro_agent")
+            or existing.get("agent")
+            or os.environ.get("AGY_KIRO_AGENT")
+            or "kirocrew"
         )
-        agent_mcp = load_kiro_agent_mcp_servers(
+        spec = load_kiro_agent_spec(
             agent_name,
             cwd=cwd,
             include_home=not self._is_custom_store,
         )
-        combined_mcp = [*agent_mcp, *raw_mcp]
-        translated_mcp = [translate_mcp_server(srv) for srv in combined_mcp]
-        if translated_mcp:
-            self.sync_mcp_servers(translated_mcp)
+        wire_translated = _dedupe_mcp_servers([translate_mcp_server(srv) for srv in raw_mcp])
+        agent_translated = [translate_mcp_server(srv) for srv in spec["mcp_servers"]]
+        combined_mcp = _dedupe_mcp_servers([*wire_translated, *agent_translated])
+        wire_names = {str(s.get("name") or "") for s in wire_translated}
+        removable_disabled = [
+            name for name in spec["disabled_mcp_servers"] if name not in wire_names
+        ]
+        if combined_mcp or removable_disabled:
+            self.sync_mcp_servers(combined_mcp, remove_servers=removable_disabled)
         state: dict[str, Any] = {
             "sessionId": sid,
             "agyConversationId": existing.get("agyConversationId"),
             "cwd": cwd,
-            "mcp_servers": translated_mcp,
+            "mcp_servers": combined_mcp,
+            "wire_mcp_servers": wire_translated,
             "model": model or str(existing.get("model", "gemini-3.7-pro")),
             "mode": mode,
             "reasoning_effort": reasoning_effort,

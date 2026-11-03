@@ -41,6 +41,7 @@ class QuotaTracker:
         self.total_tokens: int = initial["total_tokens"]
         self._total_tokens: int = self.total_tokens
         self._session_context_tokens: dict[str, int] = {}
+        self._last_session_effective_credits: dict[str, float] = {}
 
     def get_session_context_tokens(self, session_id: str) -> int | None:
         """Return the active context window token count for `session_id`, if recorded."""
@@ -349,6 +350,14 @@ class QuotaTracker:
             g1_overage_credits=g1_overage,
         )
         context_usage_pct = round((active_context_tokens / self.CONTEXT_WINDOW_SIZE) * 100.0, 4)
+        effective_credits = float(kiro_credits["effective_credits"])
+        prev_credits = self._last_session_effective_credits.get(session_id)
+        self._last_session_effective_credits[session_id] = effective_credits
+        turn_credits = (
+            round(prev_credits - effective_credits, 4)
+            if prev_credits is not None and prev_credits > effective_credits
+            else 0.0
+        )
 
         notifications: list[dict[str, Any]] = [
             usage_notification,
@@ -359,7 +368,14 @@ class QuotaTracker:
                     "sessionId": session_id,
                     "contextUsagePercentage": context_usage_pct,
                     "contextWindowSize": self.CONTEXT_WINDOW_SIZE,
-                    "credits": kiro_credits["effective_credits"],
+                    "meteringUsage": [
+                        {
+                            "unit": "credit",
+                            "unitPlural": "credits",
+                            "value": turn_credits,
+                        }
+                    ],
+                    "credits": effective_credits,
                     "quotaCredits": kiro_credits["quota_credits"],
                     "creditsCapacity": kiro_credits["credit_capacity"],
                     "creditsBottleneckWindow": kiro_credits["bottleneck_window"],

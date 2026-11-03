@@ -193,6 +193,64 @@ async def test_session_manager_kirocrew_spawn_agent_and_agent_modes(tmp_path: Pa
     assert mgr.get_session(sid)["agent"] == "custom-reviewer"
 
 
+async def test_skill_view_agent_mcp_sync_and_pinned_model_on_set_mode(tmp_path: Path) -> None:
+    """Verify default_agent and set_mode sync agent-spec MCP servers and pinned model."""
+    import json
+
+    agents_dir = tmp_path / ".kiro" / "agents"
+    agents_dir.mkdir(parents=True)
+    (agents_dir / "kirocrew-skill-view-111.json").write_text(
+        json.dumps(
+            {
+                "name": "kirocrew-skill-view-111",
+                "mcpServers": {
+                    "crew-core": {"command": "echo", "args": ["core"]},
+                    "legacy-srv": {"command": "echo", "args": ["legacy"]},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (agents_dir / "kirocrew-skill-view-222.json").write_text(
+        json.dumps(
+            {
+                "name": "kirocrew-skill-view-222",
+                "model": "gemini-3.8-flash",
+                "mcpServers": {
+                    "crew-core": {"command": "echo", "args": ["core"]},
+                    "skill-extra": {"command": "echo", "args": ["extra"]},
+                    "legacy-srv": {"command": "echo", "args": ["legacy"], "disabled": True},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    mgr = SessionManager(
+        save_dir=tmp_path,
+        default_agent="kirocrew-skill-view-111",
+    )
+    desc = await mgr.create_session(cwd=str(tmp_path), mcp_servers=[])
+    sid = desc["sessionId"]
+
+    mcp_cfg = json.loads((tmp_path / "mcp_config.json").read_text(encoding="utf-8"))
+    assert "crew-core" in mcp_cfg["mcpServers"]
+    assert "legacy-srv" in mcp_cfg["mcpServers"]
+    assert [s["name"] for s in mgr.get_session(sid)["mcp_servers"]] == ["crew-core", "legacy-srv"]
+
+    await mgr.set_mode(session_id=sid, mode_id="kirocrew-skill-view-222")
+    session_after = mgr.get_session(sid)
+    assert session_after["agent"] == "kirocrew-skill-view-222"
+    assert session_after["model"] == "gemini-3.8-flash"
+    assert session_after.get("switchedModel") == "gemini-3.8-flash"
+    assert [s["name"] for s in session_after["mcp_servers"]] == ["crew-core", "skill-extra"]
+
+    mcp_cfg_after = json.loads((tmp_path / "mcp_config.json").read_text(encoding="utf-8"))
+    assert "crew-core" in mcp_cfg_after["mcpServers"]
+    assert "skill-extra" in mcp_cfg_after["mcpServers"]
+    assert "legacy-srv" not in mcp_cfg_after["mcpServers"]
+
+
 async def test_format_steer_message_and_markdown_local_images(tmp_path: Path) -> None:
     """Verify markdown image links in prompts/steers are staged to temp dir with view_file hint."""
     from agy_acp.logic.session_manager import _format_prompt_blocks, _format_steer_message

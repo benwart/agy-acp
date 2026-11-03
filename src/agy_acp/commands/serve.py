@@ -130,6 +130,8 @@ async def default(
             response = await dispatcher.handle_message(raw_line)
             if response is not None:
                 await _write_frame(dispatcher.serialize_frame(response))
+            for post_notif in dispatcher.pop_post_response_notifications():
+                await _write_frame(dispatcher.serialize_frame(post_notif))
         except Exception as exc:
             log_acp_event(
                 "serve.dispatch_error",
