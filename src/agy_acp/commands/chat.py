@@ -7,7 +7,7 @@ from typing import Any
 
 import anyio
 
-from agy_acp.logic.quota_tracker import QuotaTracker
+from agy_acp.logic.quota_tracker import QuotaTracker, format_local_reset_date
 from agy_acp.providers.agy_cli_provider import AgyCliProvider
 
 DEFAULT_CONTEXT_WINDOW_TOKENS = 1_000_000
@@ -54,7 +54,7 @@ async def default(
         used_credits = round(max(0.0, capacity - remaining), 1)
         plan_credits = round(capacity, 1)
         raw_reset = str(kiro_credits.get("reset_time", "") or "")
-        reset_date = raw_reset.split("T", 1)[0] if "T" in raw_reset else (raw_reset or "2026-10-24")
+        reset_date = format_local_reset_date(raw_reset) or "2026-10-24"
         md = await tracker.format_slash_command_response(prompt_text or "/usage")
         print(
             f"Estimated Usage | resets on {reset_date} | Antigravity\n"

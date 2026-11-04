@@ -139,3 +139,59 @@ def test_kirocrew_prerequisite_and_dashboard_cli_commands(
     usage_out = capsys.readouterr().out
     assert "Estimated Usage" in usage_out
     assert "covered in plan" in usage_out
+
+
+async def test_chat_usage_scrape_uses_local_reset_date(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify `agy-acp chat /usage` converts UTC reset timestamps to the local calendar date."""
+    import os
+    import time
+
+    from agy_acp.commands import chat as chat_cmd
+    from agy_acp.logic.quota_tracker import QuotaTracker
+    from agy_acp.providers.quota_provider import QuotaProvider
+
+    class _LateEveningUtcProvider(QuotaProvider):
+        async def fetch_quota_groups(self) -> list[dict[str, object]]:
+            return [
+                {
+                    "group": "Gemini Models",
+                    "buckets": [
+                        {
+                            "id": "gemini-5h",
+                            "group": "Gemini Models",
+                            "name": "Five Hour Limit Remaining",
+                            "window": "5h",
+                            "remaining_fraction": 0.90,
+                            "reset_time": "2026-11-04T06:21:14Z",
+                        }
+                    ],
+                }
+            ]
+
+        async def fetch_credits(self) -> dict[str, object]:
+            return {"remaining_credits": 0, "upgrade_uri": "https://one.google.com/ai"}
+
+    prev_tz = os.environ.get("TZ")
+    monkeypatch.setattr(
+        chat_cmd,
+        "QuotaTracker",
+        lambda: QuotaTracker(provider=_LateEveningUtcProvider()),
+    )
+    try:
+        os.environ["TZ"] = "America/Los_Angeles"
+        time.tzset()
+        rc = await chat_cmd.default("/usage", no_interactive=True)
+    finally:
+        if prev_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = prev_tz
+        time.tzset()
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Estimated Usage | resets on 2026-11-03 | Antigravity" in out
+    assert "2026-11-03 10:21 PM PST (" in out

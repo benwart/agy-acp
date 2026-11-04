@@ -11,7 +11,7 @@ from rich.console import Console
 from rich.progress_bar import ProgressBar
 from rich.text import Text
 
-from agy_acp.logic.quota_tracker import QuotaTracker
+from agy_acp.logic.quota_tracker import QuotaTracker, format_reset_countdown
 
 LOW_QUOTA_THRESHOLD_PERCENT: float = 5.0
 BAR_WIDTH: int = 28
@@ -35,32 +35,7 @@ def resolve_quota_bar_style(group_name: str, remaining_percent: float) -> str:
 
 def format_reset_time(reset_time: str, *, now: datetime | None = None) -> str:
     """Convert an ISO-8601 reset timestamp into a human-readable relative countdown."""
-    if not reset_time:
-        return "unknown"
-    try:
-        reset_dt = datetime.fromisoformat(reset_time.replace("Z", "+00:00"))
-    except ValueError:
-        return reset_time
-
-    active_now = now or datetime.now(UTC)
-    remaining_sec = int((reset_dt - active_now).total_seconds())
-    if remaining_sec <= 0:
-        return "now"
-
-    days, rem = divmod(remaining_sec, 86400)
-    hours, rem = divmod(rem, 3600)
-    minutes, seconds = divmod(rem, 60)
-
-    parts: list[str] = []
-    if days > 0:
-        parts.append(f"{days}d")
-    if hours > 0:
-        parts.append(f"{hours}h")
-    if minutes > 0:
-        parts.append(f"{minutes}m")
-    if not parts:
-        parts.append(f"{seconds}s")
-    return f"in {' '.join(parts)}"
+    return format_reset_countdown(reset_time, now=now)
 
 
 def format_over_under_trend(

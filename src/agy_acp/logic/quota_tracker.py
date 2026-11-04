@@ -2,10 +2,86 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, tzinfo
 from typing import Any
 
 from agy_acp.providers.quota_provider import QuotaProvider
 from agy_acp.providers.state_store import SqliteStateStoreProvider
+
+
+def _parse_reset_datetime(reset_time: str) -> datetime | None:
+    """Parse an ISO-8601 reset timestamp into a timezone-aware UTC-compatible datetime."""
+    if not reset_time:
+        return None
+    try:
+        parsed = datetime.fromisoformat(reset_time.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def format_reset_countdown(reset_time: str, *, now: datetime | None = None) -> str:
+    """Convert an ISO-8601 reset timestamp into a human-readable relative countdown."""
+    if not reset_time:
+        return "unknown"
+    reset_dt = _parse_reset_datetime(reset_time)
+    if reset_dt is None:
+        return reset_time
+
+    active_now = now or datetime.now(UTC)
+    remaining_sec = int((reset_dt - active_now).total_seconds())
+    if remaining_sec <= 0:
+        return "now"
+
+    days, rem = divmod(remaining_sec, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, seconds = divmod(rem, 60)
+
+    parts: list[str] = []
+    if days > 0:
+        parts.append(f"{days}d")
+    if hours > 0:
+        parts.append(f"{hours}h")
+    if minutes > 0:
+        parts.append(f"{minutes}m")
+    if not parts:
+        parts.append(f"{seconds}s")
+    return f"in {' '.join(parts)}"
+
+
+def format_local_reset_time(
+    reset_time: str,
+    *,
+    now: datetime | None = None,
+    local_tz: tzinfo | None = None,
+) -> str:
+    """Format an ISO-8601 reset timestamp in local system time with a relative countdown."""
+    if not reset_time:
+        return "unknown"
+    reset_dt = _parse_reset_datetime(reset_time)
+    if reset_dt is None:
+        return reset_time
+
+    local_dt = reset_dt.astimezone(local_tz)
+    hour_12 = local_dt.hour % 12 or 12
+    am_pm = "AM" if local_dt.hour < 12 else "PM"
+    tz_label = local_dt.tzname() or local_dt.strftime("%z")
+    countdown = format_reset_countdown(reset_time, now=now)
+    return f"{local_dt:%Y-%m-%d} {hour_12}:{local_dt:%M} {am_pm} {tz_label} ({countdown})"
+
+
+def format_local_reset_date(
+    reset_time: str,
+    *,
+    local_tz: tzinfo | None = None,
+) -> str:
+    """Format an ISO-8601 reset timestamp as a local `YYYY-MM-DD` date string."""
+    if not reset_time:
+        return ""
+    reset_dt = _parse_reset_datetime(reset_time)
+    if reset_dt is None:
+        return reset_time.split("T", 1)[0]
+    return f"{reset_dt.astimezone(local_tz):%Y-%m-%d}"
 
 
 class QuotaTracker:
@@ -412,7 +488,13 @@ class QuotaTracker:
 
         return notifications
 
-    async def format_slash_command_response(self, command: str) -> str:
+    async def format_slash_command_response(
+        self,
+        command: str,
+        *,
+        now: datetime | None = None,
+        local_tz: tzinfo | None = None,
+    ) -> str:
         """Render `/quota`, `/usage`, or `/credits` Markdown table for KiroCrew chat."""
         normalized = command.strip().lower() or "/quota"
         if not normalized.startswith("/"):
@@ -431,10 +513,15 @@ class QuotaTracker:
         ]
         for bucket in [*five_hour, *seven_day]:
             window_label = "Five Hour (5h)" if bucket["window"] == "5h" else "Weekly (7d)"
+            reset_display = format_local_reset_time(
+                str(bucket["reset_time"]),
+                now=now,
+                local_tz=local_tz,
+            )
             lines.append(
                 f"| {bucket['group']} | {window_label} | {bucket['name']} | "
                 f"{bucket['remaining_percent']:.1f}% | {bucket['used_percent']:.1f}% | "
-                f"{bucket['reset_time']} |"
+                f"{reset_display} |"
             )
 
         lines.extend(

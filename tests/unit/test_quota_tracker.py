@@ -547,3 +547,40 @@ async def test_context_usage_reflects_active_session_context_not_global_ledger_a
     )
     assert compact_updates[0]["params"]["update"]["used"] == 3_200
     assert compact_updates[1]["params"]["contextUsagePercentage"] == 0.32
+
+
+async def test_slash_command_renders_local_reset_time_and_countdown() -> None:
+    """Verify /usage formats UTC reset_time into local wall-clock time plus countdown."""
+    from datetime import UTC, datetime
+    from zoneinfo import ZoneInfo
+
+    from agy_acp.logic.quota_tracker import format_local_reset_date, format_local_reset_time
+
+    pacific = ZoneInfo("America/Los_Angeles")
+    now = datetime(2026, 11, 4, 3, 21, 14, tzinfo=UTC)
+
+    # Arrange / Act / Assert for evening PST crossing UTC midnight (2026-11-04T06:21:14Z -> Nov 3)
+    formatted = format_local_reset_time(
+        "2026-11-04T06:21:14Z",
+        now=now,
+        local_tz=pacific,
+    )
+    assert formatted == "2026-11-03 10:21 PM PST (in 3h)"
+    assert format_local_reset_date("2026-11-04T06:21:14Z", local_tz=pacific) == "2026-11-03"
+    assert format_local_reset_time("", now=now, local_tz=pacific) == "unknown"
+    assert (
+        format_local_reset_time("not-a-timestamp", now=now, local_tz=pacific) == "not-a-timestamp"
+    )
+
+    # Arrange / Act / Assert for QuotaTracker.format_slash_command_response("/usage")
+    tracker = _make_tracker()
+    oct_now = datetime(2026, 10, 24, 5, 22, 4, tzinfo=UTC)
+    md = await tracker.format_slash_command_response(
+        "/usage",
+        now=oct_now,
+        local_tz=pacific,
+    )
+    assert "2026-10-24 12:52 AM PDT (in 2h 30m)" in md
+    assert "2026-10-24 5:34 AM PDT (in 7h 12m)" in md
+    assert "2026-10-24T07:52:04Z" not in md
+    assert "2026-10-24T12:34:28Z" not in md
