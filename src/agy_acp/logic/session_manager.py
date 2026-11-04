@@ -18,6 +18,7 @@ import anyio
 
 from agy_acp.providers.agy_cli_provider import (
     FALLBACK_MODELS,
+    PER_SESSION_MCP_ENV_KEYS,
     AgyCliProvider,
     ToolCallEvent,
 )
@@ -25,6 +26,82 @@ from agy_acp.providers.state_store import SqliteStateStoreProvider
 
 DEFAULT_MODEL_ID = "gemini-3.7-pro"
 DEFAULT_REASONING_EFFORT = "medium"
+
+_KIROCREW_SPAWN_ROUTING_DIRECTIVE = (
+    "[KIROCREW SUBAGENT ROUTING]\n"
+    "Subagent delegation in this KiroCrew session MUST use kirocrew-core's `spawn_run` tool "
+    'via `call_mcp_tool` (`ServerName="kirocrew-core"`, `ToolName="spawn_run"`, '
+    "`Arguments={...}`; read `<appDataDir>/mcp/kirocrew-core/spawn_run.json` first if needed). "
+    "NEVER call built-in `invoke_subagent`, `define_subagent`, or `manage_subagents`, "
+    "because native subagents bypass KiroCrew chat cards and completion events."
+)
+
+
+def _session_has_kirocrew_spawn_run(session: dict[str, Any]) -> bool:
+    """Return whether `session` exposes `kirocrew-core` `spawn_run`."""
+    raw_servers = session.get("mcp_servers")
+    if not isinstance(raw_servers, list):
+        return False
+    has_core = any(
+        isinstance(srv, dict) and str(srv.get("name") or "").strip() == "kirocrew-core"
+        for srv in raw_servers
+    )
+    if not has_core:
+        return False
+    agent_tools = session.get("agentTools")
+    if isinstance(agent_tools, list):
+        return any(
+            str(tool).strip() in {"@kirocrew-core", "@kirocrew-core/spawn_run"}
+            for tool in agent_tools
+        )
+    return True
+
+
+def _extract_session_mcp_env(session: dict[str, Any]) -> dict[str, str]:
+    """Build isolated per-session MCP identity environment variables for an `agy` subprocess."""
+    env: dict[str, str] = {
+        "KIROCREW_STUB_SESSION_TOKEN": "",
+        "KIROCREW_ROUTE_SPAWN_RUN": "1" if _session_has_kirocrew_spawn_run(session) else "",
+    }
+    sources = session.get("wire_mcp_servers") or session.get("mcp_servers") or []
+    if isinstance(sources, list):
+        for srv in sources:
+            if not isinstance(srv, dict):
+                continue
+            raw_env = srv.get("env")
+            if isinstance(raw_env, dict):
+                for key, val in raw_env.items():
+                    skey = str(key)
+                    if skey in PER_SESSION_MCP_ENV_KEYS and str(val):
+                        env[skey] = str(val)
+    return env
+
+
+def _apply_session_prompt_directives(
+    formatted_prompt: str,
+    session: dict[str, Any],
+    *,
+    is_new_conversation: bool,
+) -> str:
+    """Prepend Kiro agent mandate and KiroCrew `spawn_run` routing on new conversations."""
+    if not is_new_conversation:
+        return formatted_prompt
+    prefixes: list[str] = []
+    agent_prompt = session.get("agentPrompt")
+    if (
+        isinstance(agent_prompt, str)
+        and agent_prompt.strip()
+        and agent_prompt.strip() not in formatted_prompt
+    ):
+        prefixes.append(f"[AGENT MANDATE]\n{agent_prompt.strip()}")
+    if _session_has_kirocrew_spawn_run(session) and "[KIROCREW SUBAGENT ROUTING]" not in (
+        formatted_prompt
+    ):
+        prefixes.append(_KIROCREW_SPAWN_ROUTING_DIRECTIVE)
+    if not prefixes:
+        return formatted_prompt
+    return "\n\n".join([*prefixes, formatted_prompt]).strip()
+
 
 AVAILABLE_MODES: list[dict[str, str]] = [
     {"id": "auto", "name": "Auto"},
@@ -509,6 +586,9 @@ class SessionManager:
             session["mode"] = mode_id
             session["agent"] = None
             session["switchedModel"] = None
+            session["agentPrompt"] = None
+            session["agentTools"] = None
+            session["agentReadOnly"] = False
         elif self._is_valid_agent_mode(mode_id, cwd=cwd):
             session["agent"] = mode_id
             spec = load_kiro_agent_spec(
@@ -530,15 +610,28 @@ class SessionManager:
                 for s in session.get("mcp_servers", [])
                 if isinstance(s, dict) and s.get("name")
             ]
+            other_session_names = {
+                str(srv.get("name") or "")
+                for other in self._store.list_sessions()
+                if str(other.get("sessionId") or "") != session_id
+                for srv in (other.get("mcp_servers") or [])
+                if isinstance(srv, dict) and srv.get("name")
+            }
             combined_names = {str(s.get("name") or "") for s in combined}
             removable = [
                 name
                 for name in [*spec["disabled_mcp_servers"], *prev_names]
-                if name and name not in wire_names and name not in combined_names
+                if name
+                and name not in wire_names
+                and name not in combined_names
+                and name not in other_session_names
             ]
             if combined or removable:
                 self._cli.sync_mcp_servers(combined, remove_servers=removable)
             session["mcp_servers"] = combined
+            session["agentPrompt"] = spec.get("prompt")
+            session["agentTools"] = spec.get("tools")
+            session["agentReadOnly"] = bool(spec.get("read_only"))
             pinned_model = spec.get("model")
             if isinstance(pinned_model, str) and pinned_model:
                 session["model"] = pinned_model
@@ -605,6 +698,7 @@ class SessionManager:
                 model=model,
                 mode="read-only",
                 effort="low",
+                env=_extract_session_mcp_env(session),
             )
         except Exception as exc:
             return {
@@ -696,7 +790,9 @@ class SessionManager:
         cwd = str(session.get("cwd", ""))
         model = str(session.get("model", DEFAULT_MODEL_ID))
         mode = str(session.get("mode", "auto"))
-        if os.environ.get("GOOSE_MODE") == "approve":
+        if session.get("agentReadOnly"):
+            mode = "read-only"
+        elif os.environ.get("GOOSE_MODE") == "approve":
             mode = "approve"
         effort = str(session.get("reasoning_effort", DEFAULT_REASONING_EFFORT))
         agy_conv_id = session.get("agyConversationId")
@@ -714,6 +810,12 @@ class SessionManager:
                 f"[Compacted Session Summary]\n{compacted_summary.strip()}\n\n{formatted_prompt}"
             ).strip()
             consumed_compacted_summary = True
+        formatted_prompt = _apply_session_prompt_directives(
+            formatted_prompt,
+            session,
+            is_new_conversation=conversation_id is None,
+        )
+        session_env = _extract_session_mcp_env(session)
 
         outcome = None
         try:
@@ -726,6 +828,7 @@ class SessionManager:
                     model=model,
                     mode=mode,
                     effort=effort,
+                    env=session_env,
                     on_thought=on_thought,
                     on_text=on_text,
                     on_tool_call=on_tool_call,

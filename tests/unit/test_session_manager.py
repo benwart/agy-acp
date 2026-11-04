@@ -296,3 +296,93 @@ async def test_format_steer_message_and_markdown_local_images(tmp_path: Path) ->
     finally:
         for f in prompt_files:
             f.unlink(missing_ok=True)
+
+
+async def test_prompt_isolates_per_session_mcp_token_and_injects_spawn_run_routing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify SessionManager.prompt isolates KIROCREW_STUB_SESSION_TOKEN and steers to spawn_run."""
+    import json
+    import stat
+
+    monkeypatch.setenv("KIROCREW_STUB_SESSION_TOKEN", "leaked-parent-token")
+    monkeypatch.setenv("KIROCREW_ROUTE_SPAWN_RUN", "1")
+
+    fake_agy = tmp_path / "agy"
+    fake_agy.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "prompt = sys.argv[sys.argv.index('-p') + 1]\n"
+        "resp = json.dumps({\n"
+        "    'tok': os.environ.get('KIROCREW_STUB_SESSION_TOKEN'),\n"
+        "    'route': os.environ.get('KIROCREW_ROUTE_SPAWN_RUN'),\n"
+        "    'prompt': prompt,\n"
+        "    'args': sys.argv[1:],\n"
+        "})\n"
+        "print(json.dumps({'event': 'init', 'init': {'conversation_id': 'conv-kc-1'}}))\n"
+        "print(json.dumps({'event': 'result', 'result': {"
+        "'conversation_id': 'conv-kc-1', 'status': 'SUCCESS', 'response': resp}}))\n",
+        encoding="utf-8",
+    )
+    fake_agy.chmod(fake_agy.stat().st_mode | stat.S_IEXEC)
+
+    agents_dir = tmp_path / ".kiro" / "agents"
+    agents_dir.mkdir(parents=True)
+    (agents_dir / "egm--zoom-out.json").write_text(
+        json.dumps(
+            {
+                "name": "zoom-out",
+                "model": "auto",
+                "prompt": "Read zoom_out.md strictly.",
+                "tools": ["fs_read", "grep", "glob", "code"],
+                "mcpServers": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    from agy_acp.providers.agy_cli_provider import AgyCliProvider
+
+    cli = AgyCliProvider(bin_path=fake_agy, save_dir=tmp_path)
+    mgr = SessionManager(save_dir=tmp_path, cli_provider=cli, default_model="gemini-4-argon-medium")
+
+    parent = await mgr.create_session(
+        cwd=str(tmp_path),
+        mcp_servers=[
+            {
+                "name": "kirocrew-core",
+                "command": "kirocrew",
+                "args": ["mcp-core"],
+                "env": [{"name": "KIROCREW_STUB_SESSION_TOKEN", "value": "tok-parent-aaa"}],
+            }
+        ],
+    )
+    child = await mgr.create_session(cwd=str(tmp_path), mcp_servers=[])
+    await mgr.set_mode(session_id=child["sessionId"], mode_id="egm--zoom-out")
+
+    parent_res = await mgr.prompt(
+        session_id=parent["sessionId"],
+        prompt_blocks=[{"type": "text", "text": "Run drift review"}],
+    )
+    parent_payload = json.loads(parent_res["response"])
+    assert parent_payload["tok"] == "tok-parent-aaa"
+    assert parent_payload["route"] == "1"
+    assert "spawn_run" in parent_payload["prompt"]
+    assert "invoke_subagent" in parent_payload["prompt"]
+
+    child_res = await mgr.prompt(
+        session_id=child["sessionId"],
+        prompt_blocks=[{"type": "text", "text": "Audit architecture"}],
+    )
+    child_payload = json.loads(child_res["response"])
+    assert child_payload["tok"] == ""
+    assert child_payload["route"] == ""
+    assert "Read zoom_out.md strictly." in child_payload["prompt"]
+    assert "--mode" in child_payload["args"]
+    assert child_payload["args"][child_payload["args"].index("--mode") + 1] == "plan"
+    assert "auto" not in [
+        child_payload["args"][i + 1]
+        for i, flag in enumerate(child_payload["args"][:-1])
+        if flag == "--model"
+    ]

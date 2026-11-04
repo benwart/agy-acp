@@ -142,6 +142,9 @@ class SqliteStateStoreProvider:
             "cwd": str(row["cwd"]),
             "mode": str(row["mode"]),
             "agent": auth_cfg.get("_agent"),
+            "agentPrompt": auth_cfg.get("_agent_prompt"),
+            "agentTools": auth_cfg.get("_agent_tools"),
+            "agentReadOnly": bool(auth_cfg.get("_agent_read_only", False)),
             "switchedModel": auth_cfg.get("_switched_model"),
             "compactedSummary": auth_cfg.get("_compacted_summary"),
             "model": str(row["model"]),
@@ -181,6 +184,21 @@ class SqliteStateStoreProvider:
                 auth_config["_agent"] = str(state["agent"])
             else:
                 auth_config.pop("_agent", None)
+        if "agentPrompt" in state:
+            if state["agentPrompt"]:
+                auth_config["_agent_prompt"] = str(state["agentPrompt"])
+            else:
+                auth_config.pop("_agent_prompt", None)
+        if "agentTools" in state:
+            if isinstance(state["agentTools"], list):
+                auth_config["_agent_tools"] = list(state["agentTools"])
+            else:
+                auth_config.pop("_agent_tools", None)
+        if "agentReadOnly" in state:
+            if state["agentReadOnly"]:
+                auth_config["_agent_read_only"] = True
+            else:
+                auth_config.pop("_agent_read_only", None)
         if "wire_mcp_servers" in state and isinstance(state["wire_mcp_servers"], list):
             auth_config["_wire_mcp_servers"] = list(state["wire_mcp_servers"])
         if "switchedModel" in state:

@@ -1126,3 +1126,65 @@ async def test_stream_prompt_subagent_kill_all_no_active_and_cancelled_turn(
     assert snap_kill_all["sub-c"] == {"type": "cancelled", "message": ""}
     snap_final = {e["sessionId"]: e["status"] for e in roster_snapshots[5]}
     assert snap_final["sub-d"] == {"type": "cancelled", "message": ""}
+
+
+def test_sync_mcp_servers_strips_per_session_tokens_and_build_args_skips_auto_model(
+    tmp_path: Path,
+) -> None:
+    """Verify sync_mcp_servers omits per-session KiroCrew tokens from global mcp_config.json."""
+    mcp_cfg_path = tmp_path / "mcp_config.json"
+    provider = AgyCliProvider(save_dir=tmp_path, mcp_config_path=mcp_cfg_path)
+    provider.sync_mcp_servers(
+        [
+            {
+                "name": "kirocrew-core",
+                "command": "kirocrew",
+                "args": ["mcp-core"],
+                "env": {
+                    "KIROCREW_STUB_SESSION_TOKEN": "tok-parent-123",
+                    "KIROCREW_SESSION_KEY": "dashboard:chat-1",
+                },
+            },
+            {
+                "name": "rea",
+                "command": "npx",
+                "args": ["rea-agents"],
+                "env": {
+                    "JAVA_HOME": "/opt/jdk",
+                    "KIROCREW_STUB_SESSION_TOKEN": "tok-parent-123",
+                },
+            },
+        ]
+    )
+    written = json.loads(mcp_cfg_path.read_text(encoding="utf-8"))
+    assert "env" not in written["mcpServers"]["kirocrew-core"]
+    assert written["mcpServers"]["rea"]["env"] == {"JAVA_HOME": "/opt/jdk"}
+
+    args_auto_model = build_agy_args(cwd="/workspace", prompt_arg="Hi", model="auto")
+    assert "--model" not in args_auto_model
+
+
+def test_load_kiro_agent_spec_extracts_prompt_readonly_and_ignores_auto_model(
+    tmp_path: Path,
+) -> None:
+    """Verify load_kiro_agent_spec extracts prompt/read_only and ignores model='auto'."""
+    from agy_acp.providers.agy_cli_provider import load_kiro_agent_spec
+
+    agents_dir = tmp_path / ".kiro" / "agents"
+    agents_dir.mkdir(parents=True)
+    (agents_dir / "egm--zoom-out.json").write_text(
+        json.dumps(
+            {
+                "name": "zoom-out",
+                "model": "auto",
+                "prompt": "Follow zoom_out.md strictly.",
+                "tools": ["fs_read", "grep", "glob", "code"],
+                "mcpServers": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    spec = load_kiro_agent_spec("egm--zoom-out", cwd=str(tmp_path), include_home=False)
+    assert spec["model"] is None
+    assert spec["prompt"] == "Follow zoom_out.md strictly."
+    assert spec["read_only"] is True

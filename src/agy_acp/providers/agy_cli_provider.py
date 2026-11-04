@@ -56,6 +56,28 @@ _MODE_TO_AGY_CLI: dict[str, str] = {
     "plan": "plan",
 }
 
+PER_SESSION_MCP_ENV_KEYS: frozenset[str] = frozenset(
+    {
+        "KIROCREW_STUB_SESSION_TOKEN",
+        "KIROCREW_SESSION_KEY",
+        "KIROCREW_HOST_PID",
+        "KIROCREW_CHANNEL_ID",
+    }
+)
+
+_READ_ONLY_KIRO_TOOLS: frozenset[str] = frozenset(
+    {
+        "fs_read",
+        "grep",
+        "glob",
+        "code",
+        "web_search",
+        "web_fetch",
+        "tool_search",
+        "todo_list",
+    }
+)
+
 
 @dataclass(frozen=True)
 class ToolCallEvent:
@@ -197,7 +219,7 @@ def build_agy_args(
         args.extend(["--add-dir", cwd])
     if conversation_id:
         args.extend(["--conversation", conversation_id])
-    if model:
+    if model and model.strip().lower() != "auto":
         args.extend(["--model", model])
 
     cli_mode = _MODE_TO_AGY_CLI.get(mode, "auto")
@@ -253,6 +275,8 @@ def load_kiro_agent_spec(
             search_dirs.append(Path.home() / ".kiro" / "agents")
 
     pinned_model: str | None = None
+    agent_prompt: str | None = None
+    agent_tools: list[str] | None = None
     servers_by_name: dict[str, dict[str, Any]] = {}
     disabled_names: list[str] = []
 
@@ -268,8 +292,19 @@ def load_kiro_agent_spec(
                     continue
                 found_candidate = True
                 raw_model = raw_spec.get("model")
-                if pinned_model is None and isinstance(raw_model, str) and raw_model.strip():
+                if (
+                    pinned_model is None
+                    and isinstance(raw_model, str)
+                    and raw_model.strip()
+                    and raw_model.strip().lower() != "auto"
+                ):
                     pinned_model = raw_model.strip()
+                raw_prompt = raw_spec.get("prompt")
+                if agent_prompt is None and isinstance(raw_prompt, str) and raw_prompt.strip():
+                    agent_prompt = raw_prompt.strip()
+                raw_tools = raw_spec.get("tools")
+                if agent_tools is None and isinstance(raw_tools, list):
+                    agent_tools = [str(t).strip() for t in raw_tools if str(t).strip()]
                 raw_mcp = raw_spec.get("mcpServers")
                 if isinstance(raw_mcp, dict):
                     for srv_name, srv_cfg in raw_mcp.items():
@@ -294,8 +329,12 @@ def load_kiro_agent_spec(
         if found_candidate:
             break
 
+    is_read_only = bool(agent_tools) and all(tool in _READ_ONLY_KIRO_TOOLS for tool in agent_tools)
     return {
         "model": pinned_model,
+        "prompt": agent_prompt,
+        "tools": agent_tools,
+        "read_only": is_read_only,
         "mcp_servers": list(servers_by_name.values()),
         "disabled_mcp_servers": disabled_names,
     }
@@ -851,7 +890,13 @@ class AgyCliProvider:
                 entry["command"] = cmd
                 entry["args"] = [str(a) for a in translated.get("args", [])]
                 if isinstance(translated.get("env"), dict) and translated["env"]:
-                    entry["env"] = {str(k): str(v) for k, v in translated["env"].items()}
+                    static_env = {
+                        str(k): str(v)
+                        for k, v in translated["env"].items()
+                        if str(k) not in PER_SESSION_MCP_ENV_KEYS
+                    }
+                    if static_env:
+                        entry["env"] = static_env
             if servers_map.get(name) != entry:
                 servers_map[name] = entry
                 changed = True
@@ -998,8 +1043,17 @@ class AgyCliProvider:
         agent_translated = [translate_mcp_server(srv) for srv in spec["mcp_servers"]]
         combined_mcp = _dedupe_mcp_servers([*wire_translated, *agent_translated])
         wire_names = {str(s.get("name") or "") for s in wire_translated}
+        other_session_names = {
+            str(srv.get("name") or "")
+            for other in self._store.list_sessions()
+            if str(other.get("sessionId") or "") != sid
+            for srv in (other.get("mcp_servers") or [])
+            if isinstance(srv, dict) and srv.get("name")
+        }
         removable_disabled = [
-            name for name in spec["disabled_mcp_servers"] if name not in wire_names
+            name
+            for name in spec["disabled_mcp_servers"]
+            if name not in wire_names and name not in other_session_names
         ]
         if combined_mcp or removable_disabled:
             self.sync_mcp_servers(combined_mcp, remove_servers=removable_disabled)
@@ -1009,6 +1063,9 @@ class AgyCliProvider:
             "cwd": cwd,
             "mcp_servers": combined_mcp,
             "wire_mcp_servers": wire_translated,
+            "agentPrompt": spec.get("prompt"),
+            "agentTools": spec.get("tools"),
+            "agentReadOnly": bool(spec.get("read_only")),
             "model": model or str(existing.get("model", "gemini-3.7-pro")),
             "mode": mode,
             "reasoning_effort": reasoning_effort,
