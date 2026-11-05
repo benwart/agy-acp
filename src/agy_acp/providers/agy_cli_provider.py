@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import signal
+import sys
 import tempfile
 import time
 import uuid
@@ -62,6 +63,8 @@ PER_SESSION_MCP_ENV_KEYS: frozenset[str] = frozenset(
         "KIROCREW_SESSION_KEY",
         "KIROCREW_HOST_PID",
         "KIROCREW_CHANNEL_ID",
+        "KIROCREW_PORT",
+        "KIROCREW_HOME",
     }
 )
 
@@ -181,19 +184,24 @@ def translate_mcp_server(raw: dict[str, Any]) -> dict[str, Any]:
     """Translate an ACP MCP server definition into normalized stdio or HTTP config."""
     server_type = str(raw.get("type", "stdio")).lower()
     if server_type == "http" or "url" in raw:
-        return {
+        translated: dict[str, Any] = {
             "type": "http",
             "name": str(raw.get("name", "")),
             "url": str(raw.get("url", "")),
             "headers": _pairs_to_dict(raw.get("headers", [])),
         }
-    return {
-        "type": "stdio",
-        "name": str(raw.get("name", "")),
-        "command": str(raw.get("command", "")),
-        "args": [str(arg) for arg in raw.get("args", [])],
-        "env": _pairs_to_dict(raw.get("env", [])),
-    }
+    else:
+        translated = {
+            "type": "stdio",
+            "name": str(raw.get("name", "")),
+            "command": str(raw.get("command", "")),
+            "args": [str(arg) for arg in raw.get("args", [])],
+            "env": _pairs_to_dict(raw.get("env", [])),
+        }
+    for extra_key in ("disabled", "disabledTools", "displayName", "cwd", "_meta"):
+        if extra_key in raw:
+            translated[extra_key] = raw[extra_key]
+    return translated
 
 
 def resolve_agy_binary(explicit_bin: str | Path | None = None) -> str:
@@ -1010,11 +1018,70 @@ class AgyCliProvider:
         """Return whether this provider uses a non-default isolated state directory."""
         return self._is_custom_store
 
+    def _has_conflicting_stdio_server(
+        self,
+        server_name: str,
+        candidate_entry: dict[str, Any],
+        *,
+        exclude_session_id: str | None = None,
+    ) -> bool:
+        """Return True if another persisted session defines `server_name` with different args."""
+        for other in self._store.list_sessions():
+            other_sid = str(other.get("sessionId") or "")
+            if exclude_session_id and other_sid == exclude_session_id:
+                continue
+            for srv in other.get("mcp_servers") or []:
+                if not isinstance(srv, dict) or str(srv.get("name") or "").strip() != server_name:
+                    continue
+                translated = translate_mcp_server(srv)
+                if translated.get("type") == "http" or translated.get("url"):
+                    continue
+                other_entry: dict[str, Any] = {
+                    "command": str(translated.get("command") or ""),
+                    "args": [str(a) for a in translated.get("args", [])],
+                }
+                if isinstance(translated.get("env"), dict) and translated["env"]:
+                    static_env = {
+                        str(k): str(v)
+                        for k, v in translated["env"].items()
+                        if str(k) not in PER_SESSION_MCP_ENV_KEYS
+                    }
+                    if static_env:
+                        other_entry["env"] = static_env
+                if other_entry != candidate_entry:
+                    return True
+        return False
+
+    def _build_stdio_mux_entry(self, server_name: str) -> dict[str, Any]:
+        """Build a per-session stdio mux entry dispatching via `$AGY_ACP_SESSION_ID`."""
+        src_root = str(Path(__file__).resolve().parents[2])
+        mux_env: dict[str, str] = {}
+        existing_py = os.environ.get("PYTHONPATH", "")
+        if src_root not in existing_py.split(os.pathsep):
+            mux_env["PYTHONPATH"] = (
+                f"{src_root}{os.pathsep}{existing_py}" if existing_py else src_root
+            )
+        entry: dict[str, Any] = {
+            "command": sys.executable,
+            "args": [
+                "-m",
+                "agy_acp.providers.mcp_session_mux",
+                "--db",
+                str(self._store.db_path),
+                "--server",
+                server_name,
+            ],
+        }
+        if mux_env:
+            entry["env"] = mux_env
+        return entry
+
     def sync_mcp_servers(
         self,
         mcp_servers: list[dict[str, Any]],
         *,
         remove_servers: list[str] | None = None,
+        session_id: str | None = None,
     ) -> list[str]:
         """Synchronize MCP server configurations into `agy`'s `mcp_config.json`."""
         if not mcp_servers and not remove_servers:
@@ -1039,6 +1106,8 @@ class AgyCliProvider:
         synced: list[str] = []
         for srv in mcp_servers:
             translated = translate_mcp_server(srv)
+            if translated.get("disabled") is True:
+                continue
             name = str(translated.get("name") or "").strip()
             if not name:
                 continue
@@ -1061,6 +1130,12 @@ class AgyCliProvider:
                     }
                     if static_env:
                         entry["env"] = static_env
+                if self._has_conflicting_stdio_server(
+                    name,
+                    entry,
+                    exclude_session_id=session_id,
+                ):
+                    entry = self._build_stdio_mux_entry(name)
             if servers_map.get(name) != entry:
                 servers_map[name] = entry
                 changed = True
@@ -1198,11 +1273,22 @@ class AgyCliProvider:
             or os.environ.get("AGY_KIRO_AGENT")
             or "kirocrew"
         )
-        spec = load_kiro_agent_spec(
-            agent_name,
-            cwd=cwd,
-            include_home=not self._is_custom_store,
-        )
+        spec: dict[str, Any]
+        if (auth_config or {}).get("_engine_id") == "v3":
+            spec = {
+                "model": None,
+                "prompt": None,
+                "tools": None,
+                "read_only": False,
+                "mcp_servers": [],
+                "disabled_mcp_servers": [],
+            }
+        else:
+            spec = load_kiro_agent_spec(
+                agent_name,
+                cwd=cwd,
+                include_home=not self._is_custom_store,
+            )
         wire_translated = _dedupe_mcp_servers([translate_mcp_server(srv) for srv in raw_mcp])
         agent_translated = [translate_mcp_server(srv) for srv in spec["mcp_servers"]]
         combined_mcp = _dedupe_mcp_servers([*wire_translated, *agent_translated])
@@ -1220,7 +1306,11 @@ class AgyCliProvider:
             if name not in wire_names and name not in other_session_names
         ]
         if combined_mcp or removable_disabled:
-            self.sync_mcp_servers(combined_mcp, remove_servers=removable_disabled)
+            self.sync_mcp_servers(
+                combined_mcp,
+                remove_servers=removable_disabled,
+                session_id=sid,
+            )
         state: dict[str, Any] = {
             "sessionId": sid,
             "agyConversationId": existing.get("agyConversationId"),
@@ -1280,6 +1370,17 @@ class AgyCliProvider:
         if self._turn_conv_ids.get(session_id):
             self._interrupt_process_for_steer(session_id)
         return True
+
+    def abort_active_process(self, session_id: str) -> bool:
+        """Terminate an active `agy` subprocess for `session_id` without marking turn cancelled."""
+        proc = self._active_processes.get(session_id)
+        if proc is not None and proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError, OSError):
+                proc.send_signal(signal.SIGINT)
+            with contextlib.suppress(ProcessLookupError, OSError):
+                proc.terminate()
+            return True
+        return False
 
     async def cancel_session(self, session_id: str) -> bool:
         """Send SIGINT/terminate to an active `agy` subprocess for `session_id`."""
@@ -1447,6 +1548,8 @@ class AgyCliProvider:
                     )
 
                     if is_tool_step:
+                        if _rejected_tools and step_idx not in _active_tools:
+                            return
                         subagent_entries = _extract_subagent_entries(step)
                         raw_args: dict[str, Any] = {}
                         if isinstance(tool_info, dict):
@@ -1515,6 +1618,7 @@ class AgyCliProvider:
                                         self._interrupt_process_for_steer(sid)
                             if not allowed:
                                 _rejected_tools.add(step_idx)
+                                self.abort_active_process(sid)
                                 if on_tool_update is not None:
                                     await on_tool_update(
                                         replace(

@@ -386,3 +386,271 @@ async def test_prompt_isolates_per_session_mcp_token_and_injects_spawn_run_routi
         for i, flag in enumerate(child_payload["args"][:-1])
         if flag == "--model"
     ]
+
+
+async def test_kas_v3_custom_agents_modes_effort_and_spawn_run_routing(tmp_path: Path) -> None:
+    """Verify V3KasWireAdapter customAgents origin, MCP merge, effortLevel, and spawn_run."""
+    from agy_acp.logic.session_manager import (
+        _extract_session_mcp_env,
+        _session_has_kirocrew_spawn_run,
+    )
+    from agy_acp.logic.wire import V3KasWireAdapter
+    from agy_acp.providers.agy_cli_provider import PER_SESSION_MCP_ENV_KEYS
+
+    assert "KIROCREW_PORT" in PER_SESSION_MCP_ENV_KEYS
+    assert "KIROCREW_HOME" in PER_SESSION_MCP_ENV_KEYS
+
+    agents_dir = tmp_path / ".kiro" / "agents"
+    agents_dir.mkdir(parents=True)
+    (agents_dir / "md-helper.md").write_text(
+        "---\nname: MD Helper\ndescription: Markdown disk spec\ntools: read_file\n---\n"
+        "Follow markdown spec instructions.\n",
+        encoding="utf-8",
+    )
+
+    mgr = SessionManager(save_dir=tmp_path, wire_adapter=V3KasWireAdapter())
+    wire_meta = {
+        "kiro": {
+            "customAgents": [
+                {
+                    "id": "crew-kiro_default",
+                    "name": "kiro_default",
+                    "description": "Client projected default agent",
+                    "prompt": "You are Crew Default.",
+                    "model": "gemini-3.8-flash",
+                    "tools": ["*"],
+                    "excludedTools": [],
+                    "permissions": {
+                        "rules": [
+                            {
+                                "capability": "mcp",
+                                "match": ["kirocrew-core/*"],
+                                "effect": "allow",
+                            }
+                        ]
+                    },
+                    "mcpServers": {
+                        "kirocrew-core": {
+                            "command": "agent-overridden-cmd",
+                            "args": ["--wrong"],
+                        },
+                        "agent-stdio": {
+                            "command": "python3",
+                            "args": ["-m", "kas_env_shim", "--session", "s1"],
+                            "env": {"KIROCREW_HOME": "/crew/home/s1"},
+                        },
+                    },
+                }
+            ]
+        }
+    }
+    hoisted_mcp = [
+        {
+            "name": "kirocrew-core",
+            "command": "python3",
+            "args": ["-m", "kiro_crew.mcp_core"],
+            "env": [
+                {"name": "KIROCREW_PORT", "value": "9123"},
+                {"name": "KIROCREW_SESSION_KEY", "value": "skey-1"},
+                {"name": "KIROCREW_STUB_SESSION_TOKEN", "value": "tok-1"},
+            ],
+        }
+    ]
+
+    desc = await mgr.create_session(cwd=str(tmp_path), mcp_servers=hoisted_mcp, meta=wire_meta)
+    sid = desc["sessionId"]
+
+    modes_by_id = {m["id"]: m for m in desc["modes"]["availableModes"]}
+    assert (
+        modes_by_id["crew-kiro_default"]["_meta"]["kiro"]["resource"]["source"]["origin"]
+        == "client"
+    )
+    assert modes_by_id["md-helper"]["_meta"]["kiro"]["resource"]["source"]["origin"] == "project"
+
+    cfg_by_id = {o["id"]: o for o in desc["configOptions"]}
+    assert "effortLevel" in cfg_by_id
+    assert "reasoning_effort" not in cfg_by_id
+    assert [x["value"] for x in cfg_by_id["effortLevel"]["options"]] == [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+    ]
+
+    # Switch mode to client customAgent -> merges MCP (session overrides agent), sets model/prompt
+    await mgr.set_mode(session_id=sid, mode_id="crew-kiro_default")
+    state = mgr.get_session(sid)
+    assert state["agent"] == "crew-kiro_default"
+    assert state["agentPrompt"] == "You are Crew Default."
+    assert state["agentTools"] == ["*"]
+    assert state["agentPermissions"] == {
+        "rules": [{"capability": "mcp", "match": ["kirocrew-core/*"], "effect": "allow"}]
+    }
+    assert state["model"] == "gemini-3.8-flash"
+
+    mcp_by_name = {s["name"]: s for s in state["mcp_servers"]}
+    assert mcp_by_name["kirocrew-core"]["command"] == "python3"
+    assert mcp_by_name["kirocrew-core"]["args"] == ["-m", "kiro_crew.mcp_core"]
+    assert "agent-stdio" in mcp_by_name
+
+    # tools=["*"] with hoisted kirocrew-core must enable spawn_run routing!
+    assert _session_has_kirocrew_spawn_run(state) is True
+    extracted_env = _extract_session_mcp_env(state)
+    assert extracted_env["KIROCREW_PORT"] == "9123"
+    assert extracted_env["KIROCREW_SESSION_KEY"] == "skey-1"
+    assert extracted_env["KIROCREW_STUB_SESSION_TOKEN"] == "tok-1"
+    assert extracted_env["KIROCREW_HOME"] == "/crew/home/s1"
+    assert extracted_env["KIROCREW_ROUTE_SPAWN_RUN"] == "1"
+
+    # Excluding spawn_run disables spawn_run routing
+    excluded_state = {**state, "agentExcludedTools": ["@kirocrew-core/spawn_run"]}
+    assert _session_has_kirocrew_spawn_run(excluded_state) is False
+
+    # Pinning model explicitly prevents subsequent set_mode from clobbering user's choice
+    cfg_res = await mgr.set_config_option(
+        session_id=sid,
+        config_id="model",
+        value="claude-sonnet-4-6",
+    )
+    assert {o["id"]: o["currentValue"] for o in cfg_res["configOptions"]}["model"] == (
+        "claude-sonnet-4-6"
+    )
+    effort_res = await mgr.set_config_option(
+        session_id=sid,
+        config_id="effortLevel",
+        value="xhigh",
+    )
+    assert {o["id"]: o["currentValue"] for o in effort_res["configOptions"]}["effortLevel"] == (
+        "xhigh"
+    )
+    with pytest.raises(ValueError, match="effort"):
+        await mgr.set_config_option(session_id=sid, config_id="effortLevel", value="turbo")
+
+    await mgr.set_mode(session_id=sid, mode_id="md-helper")
+    await mgr.set_mode(session_id=sid, mode_id="crew-kiro_default")
+    assert mgr.get_session(sid)["model"] == "claude-sonnet-4-6"
+
+
+async def test_evict_vs_delete_session_and_load_with_updated_mcp_and_turns(tmp_path: Path) -> None:
+    """Verify evict_session preserves turns & state for session/load, while delete removes both."""
+    from agy_acp.logic.wire import V3KasWireAdapter
+
+    mgr = SessionManager(save_dir=tmp_path, wire_adapter=V3KasWireAdapter())
+    created = await mgr.create_session(
+        cwd=str(tmp_path),
+        mcp_servers=[{"name": "srv-initial", "command": "echo", "args": ["1"]}],
+    )
+    sid = created["sessionId"]
+    mgr.state_store.append_session_turn(
+        session_id=sid,
+        user_message_id="msg_001",
+        prompt_blocks=[{"type": "text", "text": "Hello"}],
+        assistant_text="World",
+    )
+
+    await mgr.evict_session(session_id=sid)
+    assert len(mgr.state_store.get_session_turns(sid)) == 1
+
+    updated_meta = {
+        "kiro": {
+            "customAgents": [
+                {
+                    "id": "kirocrew",
+                    "name": "KiroCrew",
+                    "prompt": "Updated prompt",
+                    "tools": ["*"],
+                }
+            ]
+        }
+    }
+    reloaded = await mgr.load_session(
+        session_id=sid,
+        cwd=str(tmp_path / "new-cwd"),
+        mcp_servers=[{"name": "srv-reinjected", "command": "echo", "args": ["2"]}],
+        meta=updated_meta,
+    )
+    assert reloaded["sessionId"] == sid
+    reloaded_state = mgr.get_session(sid)
+    assert reloaded_state["cwd"] == str(tmp_path / "new-cwd")
+    assert [s["name"] for s in reloaded_state["mcp_servers"]] == ["srv-reinjected"]
+    reloaded_modes = {m["id"]: m for m in reloaded["modes"]["availableModes"]}
+    assert reloaded_modes["kirocrew"]["_meta"]["kiro"]["resource"]["source"]["origin"] == "client"
+    assert len(mgr.state_store.get_session_turns(sid)) == 1
+
+    await mgr.terminate_session(session_id=sid, delete_persisted=True)
+    assert mgr.state_store.get_session(sid) is None
+    assert mgr.state_store.get_session_turns(sid) == []
+
+
+async def test_concurrent_sessions_mcp_shim_isolation_and_prober(tmp_path: Path) -> None:
+    """Verify concurrent sessions isolate conflicting MCP server args and probe session MCPs."""
+    import json
+    import sys
+
+    from agy_acp.logic.wire import V3KasWireAdapter
+
+    mcp_stub = tmp_path / "mcp_echo_stub.py"
+    mcp_stub.write_text(
+        "import json, os, sys\n"
+        "session_arg = sys.argv[sys.argv.index('--session') + 1]\n"
+        "port = os.environ.get('KIROCREW_PORT', '')\n"
+        "home = os.environ.get('KIROCREW_HOME', '')\n"
+        "for raw in sys.stdin:\n"
+        "    msg = json.loads(raw)\n"
+        "    mid = msg.get('id')\n"
+        "    method = msg.get('method')\n"
+        "    if method == 'initialize':\n"
+        "        print(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': {"
+        "'protocolVersion': '2025-03-26', 'capabilities': {'tools': {}}, "
+        "'serverInfo': {'name': 'stub', 'version': '1.0'}}}), flush=True)\n"
+        "    elif method == 'tools/list':\n"
+        "        print(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': {'tools': ["
+        "{'name': f'tool_{session_arg}_{port}', 'description': home}]}}), flush=True)\n",
+        encoding="utf-8",
+    )
+
+    mgr = SessionManager(save_dir=tmp_path, wire_adapter=V3KasWireAdapter())
+    s_a = await mgr.create_session(
+        cwd=str(tmp_path),
+        mcp_servers=[
+            {
+                "name": "shared-shim",
+                "command": sys.executable,
+                "args": [str(mcp_stub), "--session", "sessA"],
+                "env": [
+                    {"name": "KIROCREW_PORT", "value": "7001"},
+                    {"name": "KIROCREW_HOME", "value": "/home/a"},
+                ],
+            }
+        ],
+    )
+    s_b = await mgr.create_session(
+        cwd=str(tmp_path),
+        mcp_servers=[
+            {
+                "name": "shared-shim",
+                "command": sys.executable,
+                "args": [str(mcp_stub), "--session", "sessB"],
+                "env": [
+                    {"name": "KIROCREW_PORT", "value": "7002"},
+                    {"name": "KIROCREW_HOME", "value": "/home/b"},
+                ],
+            }
+        ],
+    )
+
+    statuses_a = await mgr.probe_session_mcp_servers(s_a["sessionId"])
+    statuses_b = await mgr.probe_session_mcp_servers(s_b["sessionId"])
+    assert len(statuses_a) == 1 and statuses_a[0].status == "connected"
+    assert [t.name for t in statuses_a[0].tools] == ["tool_sessA_7001"]
+    assert statuses_a[0].tools[0].description == "/home/a"
+
+    assert len(statuses_b) == 1 and statuses_b[0].status == "connected"
+    assert [t.name for t in statuses_b[0].tools] == ["tool_sessB_7002"]
+    assert statuses_b[0].tools[0].description == "/home/b"
+
+    # Also verify mcp_config.json uses mux wrapper when conflicting args exist across sessions
+    mcp_cfg = json.loads((tmp_path / "mcp_config.json").read_text(encoding="utf-8"))
+    mux_entry = mcp_cfg["mcpServers"]["shared-shim"]
+    assert "mcp_session_mux" in " ".join(mux_entry["args"])

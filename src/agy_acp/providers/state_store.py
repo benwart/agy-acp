@@ -168,9 +168,14 @@ class SqliteStateStoreProvider:
             "agent": auth_cfg.get("_agent"),
             "agentPrompt": auth_cfg.get("_agent_prompt"),
             "agentTools": auth_cfg.get("_agent_tools"),
+            "agentExcludedTools": auth_cfg.get("_agent_excluded_tools", []),
+            "agentAllowedTools": auth_cfg.get("_agent_allowed_tools", []),
+            "agentPermissions": auth_cfg.get("_agent_permissions"),
             "agentReadOnly": bool(auth_cfg.get("_agent_read_only", False)),
             "switchedModel": auth_cfg.get("_switched_model"),
+            "modelPinnedByUser": bool(auth_cfg.get("_model_pinned_by_user", False)),
             "compactedSummary": auth_cfg.get("_compacted_summary"),
+            "reinjectAgentPrompt": bool(auth_cfg.get("_reinject_agent_prompt", False)),
             "model": str(row["model"]),
             "reasoning_effort": str(row["reasoning_effort"]),
             "cancelled": bool(row["cancelled"]),
@@ -225,6 +230,21 @@ class SqliteStateStoreProvider:
                 auth_config["_agent_tools"] = list(state["agentTools"])
             else:
                 auth_config.pop("_agent_tools", None)
+        if "agentExcludedTools" in state:
+            if isinstance(state["agentExcludedTools"], list) and state["agentExcludedTools"]:
+                auth_config["_agent_excluded_tools"] = list(state["agentExcludedTools"])
+            else:
+                auth_config.pop("_agent_excluded_tools", None)
+        if "agentAllowedTools" in state:
+            if isinstance(state["agentAllowedTools"], list) and state["agentAllowedTools"]:
+                auth_config["_agent_allowed_tools"] = list(state["agentAllowedTools"])
+            else:
+                auth_config.pop("_agent_allowed_tools", None)
+        if "agentPermissions" in state:
+            if isinstance(state["agentPermissions"], (dict, list)):
+                auth_config["_agent_permissions"] = state["agentPermissions"]
+            else:
+                auth_config.pop("_agent_permissions", None)
         if "agentReadOnly" in state:
             if state["agentReadOnly"]:
                 auth_config["_agent_read_only"] = True
@@ -237,11 +257,21 @@ class SqliteStateStoreProvider:
                 auth_config["_switched_model"] = str(state["switchedModel"])
             else:
                 auth_config.pop("_switched_model", None)
+        if "modelPinnedByUser" in state:
+            if state["modelPinnedByUser"]:
+                auth_config["_model_pinned_by_user"] = True
+            else:
+                auth_config.pop("_model_pinned_by_user", None)
         if "compactedSummary" in state:
             if state["compactedSummary"]:
                 auth_config["_compacted_summary"] = str(state["compactedSummary"])
             else:
                 auth_config.pop("_compacted_summary", None)
+        if "reinjectAgentPrompt" in state:
+            if state["reinjectAgentPrompt"]:
+                auth_config["_reinject_agent_prompt"] = True
+            else:
+                auth_config.pop("_reinject_agent_prompt", None)
         created_at = str(existing.get("createdAt") or now)
 
         with self._connect() as conn:

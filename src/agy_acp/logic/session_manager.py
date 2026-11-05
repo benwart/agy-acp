@@ -10,17 +10,23 @@ import re
 import shutil
 import tempfile
 import uuid
-from collections.abc import Awaitable, Callable, Generator
+from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import anyio
 
+from agy_acp.logic.custom_agents import CustomAgentRegistry, CustomAgentSpec
+from agy_acp.logic.mcp_catalog_prober import McpCatalogProber
+from agy_acp.logic.wire import EngineWireAdapter, McpServerStatus, V2KiroWireAdapter
 from agy_acp.providers.agy_cli_provider import (
     FALLBACK_MODELS,
     PER_SESSION_MCP_ENV_KEYS,
     AgyCliProvider,
     ToolCallEvent,
+    _dedupe_mcp_servers,
+    load_kiro_agent_spec,
+    translate_mcp_server,
 )
 from agy_acp.providers.state_store import SqliteStateStoreProvider
 
@@ -36,44 +42,115 @@ _KIROCREW_SPAWN_ROUTING_DIRECTIVE = (
     "because native subagents bypass KiroCrew chat cards and completion events."
 )
 
+_READ_ONLY_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "fs_read",
+        "read",
+        "read_file",
+        "list_directory",
+        "grep",
+        "grep_search",
+        "glob",
+        "file_search",
+        "code",
+        "web_search",
+        "remote_web_search",
+        "web_fetch",
+        "tool_search",
+        "todo_list",
+    }
+)
+
+_SPAWN_RUN_ALLOW_PATTERNS: frozenset[str] = frozenset(
+    {
+        "*",
+        "@kirocrew-core",
+        "@kirocrew-core/*",
+        "@kirocrew-core/spawn_run",
+        "mcp_kirocrew-core_spawn_run",
+    }
+)
+
+_SPAWN_RUN_DENY_PATTERNS: frozenset[str] = _SPAWN_RUN_ALLOW_PATTERNS | {"spawn_run"}
+
+
+def _normalize_env_mapping(raw_env: Any) -> dict[str, str]:
+    """Normalize MCP `env` (`dict` or `[{name, value}]`) into `dict[str, str]`."""
+    if isinstance(raw_env, Mapping):
+        return {str(k): str(v) for k, v in raw_env.items() if v is not None}
+    if isinstance(raw_env, Sequence) and not isinstance(raw_env, (str, bytes)):
+        out: dict[str, str] = {}
+        for item in raw_env:
+            if isinstance(item, Mapping) and item.get("name") and item.get("value") is not None:
+                out[str(item["name"])] = str(item["value"])
+        return out
+    return {}
+
 
 def _session_has_kirocrew_spawn_run(session: dict[str, Any]) -> bool:
-    """Return whether `session` exposes `kirocrew-core` `spawn_run`."""
+    """Return whether `session` exposes enabled `kirocrew-core` `spawn_run`."""
     raw_servers = session.get("mcp_servers")
+    if not isinstance(raw_servers, list) or not raw_servers:
+        raw_servers = session.get("wire_mcp_servers")
     if not isinstance(raw_servers, list):
         return False
-    has_core = any(
-        isinstance(srv, dict) and str(srv.get("name") or "").strip() == "kirocrew-core"
-        for srv in raw_servers
+
+    core_srv = next(
+        (
+            srv
+            for srv in raw_servers
+            if isinstance(srv, dict)
+            and str(srv.get("name") or "").strip() == "kirocrew-core"
+            and srv.get("disabled") is not True
+        ),
+        None,
     )
-    if not has_core:
+    if core_srv is None:
         return False
+
+    disabled_tools = core_srv.get("disabledTools") or core_srv.get("disabled_tools")
+    if isinstance(disabled_tools, list) and any(
+        str(t).strip() == "spawn_run" for t in disabled_tools
+    ):
+        return False
+
+    excluded_tools = session.get("agentExcludedTools")
+    if isinstance(excluded_tools, list) and any(
+        str(t).strip() in _SPAWN_RUN_DENY_PATTERNS for t in excluded_tools
+    ):
+        return False
+
     agent_tools = session.get("agentTools")
     if isinstance(agent_tools, list):
-        return any(
-            str(tool).strip() in {"@kirocrew-core", "@kirocrew-core/spawn_run"}
-            for tool in agent_tools
-        )
+        return any(str(tool).strip() in _SPAWN_RUN_ALLOW_PATTERNS for tool in agent_tools)
     return True
 
 
-def _extract_session_mcp_env(session: dict[str, Any]) -> dict[str, str]:
+def _extract_session_mcp_env(
+    session: dict[str, Any],
+    *,
+    state_db_path: Path | None = None,
+) -> dict[str, str]:
     """Build isolated per-session MCP identity environment variables for an `agy` subprocess."""
-    env: dict[str, str] = {
-        "KIROCREW_STUB_SESSION_TOKEN": "",
-        "KIROCREW_ROUTE_SPAWN_RUN": "1" if _session_has_kirocrew_spawn_run(session) else "",
-    }
-    sources = session.get("wire_mcp_servers") or session.get("mcp_servers") or []
-    if isinstance(sources, list):
+    env: dict[str, str] = dict.fromkeys(PER_SESSION_MCP_ENV_KEYS, "")
+    env["KIROCREW_ROUTE_SPAWN_RUN"] = "1" if _session_has_kirocrew_spawn_run(session) else ""
+
+    sid = str(session.get("sessionId") or "")
+    if sid:
+        env["AGY_ACP_SESSION_ID"] = sid
+    if state_db_path is not None:
+        env["AGY_ACP_STATE_DB"] = str(state_db_path)
+
+    for source_key in ("mcp_servers", "wire_mcp_servers"):
+        sources = session.get(source_key)
+        if not isinstance(sources, list):
+            continue
         for srv in sources:
-            if not isinstance(srv, dict):
+            if not isinstance(srv, dict) or srv.get("disabled") is True:
                 continue
-            raw_env = srv.get("env")
-            if isinstance(raw_env, dict):
-                for key, val in raw_env.items():
-                    skey = str(key)
-                    if skey in PER_SESSION_MCP_ENV_KEYS and str(val):
-                        env[skey] = str(val)
+            for key, val in _normalize_env_mapping(srv.get("env")).items():
+                if key in PER_SESSION_MCP_ENV_KEYS and val:
+                    env[key] = val
     return env
 
 
@@ -83,9 +160,11 @@ def _apply_session_prompt_directives(
     *,
     is_new_conversation: bool,
 ) -> str:
-    """Prepend Kiro agent mandate and KiroCrew `spawn_run` routing on new conversations."""
-    if not is_new_conversation:
+    """Prepend Kiro mandate, system prompt, and `spawn_run` routing when starting/reinjecting."""
+    should_inject = is_new_conversation or bool(session.get("reinjectAgentPrompt"))
+    if not should_inject:
         return formatted_prompt
+
     prefixes: list[str] = []
     agent_prompt = session.get("agentPrompt")
     if (
@@ -93,7 +172,16 @@ def _apply_session_prompt_directives(
         and agent_prompt.strip()
         and agent_prompt.strip() not in formatted_prompt
     ):
-        prefixes.append(f"[AGENT MANDATE]\n{agent_prompt.strip()}")
+        clean_prompt = agent_prompt.strip()
+        if "[AGENT SYSTEM PROMPT]" in clean_prompt:
+            prefixes.append(f"[AGENT MANDATE]\n{clean_prompt}")
+        else:
+            prefixes.append(
+                "[AGENT MANDATE]\n"
+                "Treat the [AGENT SYSTEM PROMPT] ... [END AGENT SYSTEM PROMPT] block below "
+                "as your authoritative operating contract.\n\n"
+                f"[AGENT SYSTEM PROMPT]\n{clean_prompt}\n[END AGENT SYSTEM PROMPT]"
+            )
     if _session_has_kirocrew_spawn_run(session) and "[KIROCREW SUBAGENT ROUTING]" not in (
         formatted_prompt
     ):
@@ -103,6 +191,19 @@ def _apply_session_prompt_directives(
     return "\n\n".join([*prefixes, formatted_prompt]).strip()
 
 
+def _extract_wire_custom_agents(meta: dict[str, Any] | None) -> list[dict[str, Any]] | None:
+    """Extract `params._meta.kiro.customAgents` when explicitly provided on the wire."""
+    if not isinstance(meta, dict):
+        return None
+    kiro_meta = meta.get("kiro")
+    if not isinstance(kiro_meta, dict) or "customAgents" not in kiro_meta:
+        return None
+    raw_agents = kiro_meta.get("customAgents")
+    if not isinstance(raw_agents, list):
+        return []
+    return [copy.deepcopy(entry) for entry in raw_agents if isinstance(entry, dict)]
+
+
 AVAILABLE_MODES: list[dict[str, str]] = [
     {"id": "auto", "name": "Auto"},
     {"id": "approve", "name": "Approve"},
@@ -110,7 +211,7 @@ AVAILABLE_MODES: list[dict[str, str]] = [
 ]
 VALID_MODE_IDS: frozenset[str] = frozenset(m["id"] for m in AVAILABLE_MODES)
 REASONING_EFFORT_CONFIG_IDS: frozenset[str] = frozenset(
-    {"reasoning_effort", "thought_level", "thinkingLevel"}
+    {"effortLevel", "reasoning_effort", "thought_level", "thinkingLevel"}
 )
 
 AVAILABLE_MODELS: list[dict[str, str]] = list(FALLBACK_MODELS)
@@ -259,119 +360,42 @@ def _build_config_options(
     mode: str,
     reasoning_effort: str,
     available_models: list[dict[str, str]] | None = None,
+    wire_adapter: EngineWireAdapter | None = None,
 ) -> list[dict[str, Any]]:
     """Build ACP configOptions array for the given session state."""
-    models = available_models or AVAILABLE_MODELS
-    return [
-        {
-            "id": "model",
-            "name": "Model",
-            "category": "model",
-            "type": "select",
-            "currentValue": model,
-            "options": [{"value": m["modelId"], "name": m["name"]} for m in models],
-        },
-        {
-            "id": "mode",
-            "name": "Approval Mode",
-            "category": "mode",
-            "type": "select",
-            "currentValue": mode,
-            "options": [
-                {"value": "read-only", "name": "Read Only"},
-                {"value": "approve", "name": "Approve"},
-                {"value": "auto", "name": "Default"},
-            ],
-        },
-        {
-            "id": "reasoning_effort",
-            "name": "Reasoning Effort",
-            "category": "thought_level",
-            "type": "select",
-            "currentValue": reasoning_effort,
-            "options": [
-                {"value": "low", "name": "Low"},
-                {"value": "medium", "name": "Medium"},
-                {"value": "high", "name": "High"},
-            ],
-        },
-    ]
-
-
-def _discover_agent_mode_ids(
-    *,
-    cwd: str | None = None,
-    default_agent: str | None = None,
-    active_agent: str | None = None,
-) -> list[str]:
-    """Discover KiroCrew agent mode IDs from spawn flags and `.kiro/agents/*.json`."""
-    found: list[str] = []
-    seen: set[str] = set(VALID_MODE_IDS)
-
-    def _add(agent_id: str | None) -> None:
-        if agent_id and agent_id not in seen:
-            seen.add(agent_id)
-            found.append(agent_id)
-
-    _add(default_agent)
-    _add(active_agent)
-    _add("kirocrew")
-    _add("kirocrew-lite")
-
-    search_dirs: list[Path] = []
-    if cwd:
-        search_dirs.append(Path(cwd) / ".kiro" / "agents")
-    with contextlib.suppress(RuntimeError, OSError):
-        search_dirs.append(Path.home() / ".kiro" / "agents")
-
-    for agents_dir in search_dirs:
-        if not agents_dir.is_dir():
-            continue
-        with contextlib.suppress(OSError):
-            for spec_file in sorted(agents_dir.glob("*.json")):
-                _add(spec_file.stem)
-    return found
-
-
-def _build_session_descriptor(
-    state: dict[str, Any],
-    *,
-    available_models: list[dict[str, str]] | None = None,
-    default_agent: str | None = None,
-) -> dict[str, Any]:
-    """Build an ACP session response payload from persisted session state."""
-    model = str(state.get("model", DEFAULT_MODEL_ID))
-    mode = str(state.get("mode", "auto"))
-    active_agent = state.get("agent") or default_agent
-    current_mode_id = str(active_agent) if active_agent else mode
-    reasoning_effort = str(state.get("reasoning_effort", DEFAULT_REASONING_EFFORT))
+    adapter = wire_adapter or V2KiroWireAdapter()
     models = list(available_models or AVAILABLE_MODELS)
-    if model and all(m.get("modelId") != model for m in models):
+    if model and model != "auto" and all(m.get("modelId") != model for m in models):
         models.insert(0, {"modelId": model, "name": model, "description": model})
-
-    extra_modes = _discover_agent_mode_ids(
-        cwd=str(state.get("cwd", "")),
-        default_agent=default_agent,
-        active_agent=str(active_agent) if active_agent else None,
+    return adapter.build_config_options(
+        models=models,
+        current_model=model,
+        current_mode=mode,
+        current_effort=reasoning_effort,
     )
-    modes_list = list(AVAILABLE_MODES) + [{"id": mid, "name": mid} for mid in extra_modes]
-    return {
-        "sessionId": str(state["sessionId"]),
-        "modes": {
-            "currentModeId": current_mode_id,
-            "availableModes": modes_list,
-        },
-        "models": {
-            "currentModelId": model,
-            "availableModels": models,
-        },
-        "configOptions": _build_config_options(
-            model=model,
-            mode=mode,
-            reasoning_effort=reasoning_effort,
-            available_models=models,
-        ),
-    }
+
+
+def _agent_mcp_mapping_to_list(
+    raw_mcp: Mapping[str, Any],
+    *,
+    origin: str,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Split `CustomAgentSpec.mcp_servers` into enabled server dicts and disabled names."""
+    enabled: list[dict[str, Any]] = []
+    disabled: list[str] = []
+    for srv_name, srv_cfg in raw_mcp.items():
+        if not isinstance(srv_name, str) or not srv_name or not isinstance(srv_cfg, Mapping):
+            continue
+        if srv_cfg.get("disabled") is True:
+            disabled.append(srv_name)
+            continue
+        entry = {"name": srv_name, **dict(srv_cfg)}
+        entry.setdefault(
+            "_meta",
+            {"kiro": {"resource": {"resourceType": "mcpServer", "source": {"origin": origin}}}},
+        )
+        enabled.append(entry)
+    return enabled, disabled
 
 
 class SessionManager:
@@ -385,6 +409,8 @@ class SessionManager:
         cli_provider: AgyCliProvider | None = None,
         default_agent: str | None = None,
         default_model: str | None = None,
+        wire_adapter: EngineWireAdapter | None = None,
+        mcp_prober: McpCatalogProber | None = None,
     ) -> None:
         self._store = state_store or (
             cli_provider.state_store
@@ -394,6 +420,8 @@ class SessionManager:
         self._cli = cli_provider or AgyCliProvider(state_store=self._store)
         self._default_agent = default_agent
         self._default_model = default_model
+        self._wire_adapter: EngineWireAdapter = wire_adapter or V2KiroWireAdapter()
+        self._mcp_prober: McpCatalogProber = mcp_prober or McpCatalogProber()
         self._cancel_scopes: dict[str, anyio.CancelScope] = {}
         self._active_cancel_scopes: dict[str, anyio.CancelScope] = self._cancel_scopes
 
@@ -406,6 +434,33 @@ class SessionManager:
     def cli_provider(self) -> AgyCliProvider:
         """Return the underlying `AgyCliProvider` instance."""
         return self._cli
+
+    @property
+    def wire_adapter(self) -> EngineWireAdapter:
+        """Return the active `EngineWireAdapter` strategy."""
+        return self._wire_adapter
+
+    @property
+    def mcp_prober(self) -> McpCatalogProber:
+        """Return the active `McpCatalogProber` instance."""
+        return self._mcp_prober
+
+    def _build_config_options_for_state(
+        self,
+        *,
+        model: str,
+        mode: str,
+        reasoning_effort: str,
+        available_models: list[dict[str, str]] | None = None,
+    ) -> list[dict[str, Any]]:
+        models = available_models or self._store.load_models() or AVAILABLE_MODELS
+        return _build_config_options(
+            model=model,
+            mode=mode,
+            reasoning_effort=reasoning_effort,
+            available_models=models,
+            wire_adapter=self._wire_adapter,
+        )
 
     @staticmethod
     def _build_config_options(
@@ -420,6 +475,216 @@ class SessionManager:
             mode=mode,
             reasoning_effort=reasoning_effort,
         )
+
+    def _user_agents_dir(self) -> Path | None:
+        if self._cli.is_custom_store:
+            return self._store.db_path.parent / ".kiro_user_agents"
+        return None
+
+    def get_custom_agent_registry(
+        self,
+        *,
+        cwd: str | None,
+        custom_agents: Sequence[Mapping[str, Any]] | None = None,
+    ) -> CustomAgentRegistry:
+        """Load `CustomAgentRegistry` across project, user, and client wire scopes."""
+        return CustomAgentRegistry.load(
+            cwd=cwd or None,
+            wire_custom_agents=custom_agents,
+            user_agents_dir=self._user_agents_dir(),
+        )
+
+    def get_active_custom_agent(self, session_id: str) -> CustomAgentSpec | None:
+        """Return the active `CustomAgentSpec` for `session_id`, if any."""
+        session = self._store.get_session(session_id)
+        if session is None:
+            return None
+        agent_id = session.get("agent")
+        if not isinstance(agent_id, str) or not agent_id:
+            return None
+        registry = self.get_custom_agent_registry(
+            cwd=str(session.get("cwd") or ""),
+            custom_agents=session.get("custom_agents") or [],
+        )
+        spec = registry.get(agent_id)
+        if spec is not None:
+            return spec
+        if session.get("agentPermissions") is not None or session.get("agentPrompt"):
+            raw_tools = session.get("agentTools")
+            return CustomAgentSpec(
+                agent_id=agent_id,
+                name=agent_id,
+                prompt=str(session.get("agentPrompt") or ""),
+                tools=tuple(raw_tools) if isinstance(raw_tools, list) else None,
+                excluded_tools=tuple(session.get("agentExcludedTools") or ()),
+                allowed_tools=tuple(session.get("agentAllowedTools") or ()),
+                permissions=session.get("agentPermissions"),
+            )
+        return None
+
+    def _build_descriptor(
+        self,
+        state: dict[str, Any],
+        *,
+        available_models: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        """Build an ACP `session/new` or `session/load` descriptor via `self._wire_adapter`."""
+        raw_model = str(state.get("model", DEFAULT_MODEL_ID))
+        mode = str(state.get("mode", "auto"))
+        active_agent = state.get("agent") or self._default_agent
+        current_mode_id = str(active_agent) if active_agent else mode
+        reasoning_effort = str(state.get("reasoning_effort", DEFAULT_REASONING_EFFORT))
+        models = list(available_models or AVAILABLE_MODELS)
+        if raw_model and raw_model != "auto" and all(m.get("modelId") != raw_model for m in models):
+            models.insert(0, {"modelId": raw_model, "name": raw_model, "description": raw_model})
+        concrete_model = self._wire_adapter.resolve_concrete_model(models, raw_model)
+
+        registry = self.get_custom_agent_registry(
+            cwd=str(state.get("cwd") or ""),
+            custom_agents=state.get("custom_agents") or [],
+        )
+        custom_specs = registry.list_agents()
+        if self._wire_adapter.engine_id == "v2":
+            existing_ids = {s.agent_id for s in custom_specs} | set(VALID_MODE_IDS)
+            for virtual_id in (
+                self._default_agent,
+                str(active_agent) if active_agent else None,
+                "kirocrew",
+                "kirocrew-lite",
+            ):
+                if virtual_id and virtual_id not in existing_ids:
+                    existing_ids.add(virtual_id)
+                    custom_specs.append(
+                        CustomAgentSpec(
+                            agent_id=virtual_id,
+                            name=virtual_id,
+                            origin="bundled",
+                        )
+                    )
+        elif active_agent and str(active_agent) not in (
+            {s.agent_id for s in custom_specs} | set(VALID_MODE_IDS)
+        ):
+            custom_specs.append(
+                CustomAgentSpec(
+                    agent_id=str(active_agent),
+                    name=str(active_agent),
+                    origin="bundled",
+                )
+            )
+
+        modes_list = self._wire_adapter.build_available_modes(custom_agents=custom_specs)
+        return {
+            "sessionId": str(state["sessionId"]),
+            "modes": {
+                "currentModeId": current_mode_id,
+                "availableModes": modes_list,
+            },
+            "models": {
+                "currentModelId": concrete_model,
+                "availableModels": models,
+            },
+            "configOptions": self._wire_adapter.build_config_options(
+                models=models,
+                current_model=concrete_model,
+                current_mode=mode,
+                current_effort=reasoning_effort,
+            ),
+        }
+
+    def _merge_and_sync_session_mcp(
+        self,
+        *,
+        session_id: str,
+        cwd: str,
+        raw_wire_mcp: list[dict[str, Any]],
+        active_agent: str | None,
+        registry: CustomAgentRegistry,
+        prev_mcp_servers: list[dict[str, Any]] | None = None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+        """Merge session wire MCP servers with active customAgent MCP servers (session wins)."""
+        wire_translated = _dedupe_mcp_servers(
+            [translate_mcp_server(s) for s in raw_wire_mcp if isinstance(s, dict)]
+        )
+        spec = registry.get(active_agent) if active_agent else None
+        agent_raw_servers: list[dict[str, Any]] = []
+        disabled_names: list[str] = []
+
+        if spec is not None and spec.mcp_servers:
+            agent_raw_servers, disabled_names = _agent_mcp_mapping_to_list(
+                spec.mcp_servers,
+                origin=spec.origin,
+            )
+        elif self._wire_adapter.engine_id == "v2":
+            legacy_spec = load_kiro_agent_spec(
+                active_agent,
+                cwd=cwd,
+                include_home=not self._cli.is_custom_store,
+            )
+            agent_raw_servers = list(legacy_spec["mcp_servers"])
+            disabled_names = list(legacy_spec["disabled_mcp_servers"])
+
+        agent_translated = [translate_mcp_server(s) for s in agent_raw_servers]
+        combined = _dedupe_mcp_servers(
+            [
+                *[s for s in wire_translated if s.get("disabled") is not True],
+                *[
+                    s
+                    for s in agent_translated
+                    if s.get("disabled") is not True
+                    and str(s.get("name") or "") not in disabled_names
+                ],
+            ]
+        )
+        wire_names = {str(s.get("name") or "") for s in wire_translated if s.get("name")}
+        prev_names = [
+            str(s.get("name") or "")
+            for s in (prev_mcp_servers or [])
+            if isinstance(s, dict) and s.get("name")
+        ]
+        other_session_names = {
+            str(srv.get("name") or "")
+            for other in self._store.list_sessions()
+            if str(other.get("sessionId") or "") != session_id
+            for srv in (other.get("mcp_servers") or [])
+            if isinstance(srv, dict) and srv.get("name")
+        }
+        combined_names = {str(s.get("name") or "") for s in combined}
+        removable = [
+            name
+            for name in [*disabled_names, *prev_names]
+            if name
+            and name not in wire_names
+            and name not in combined_names
+            and name not in other_session_names
+        ]
+        return combined, wire_translated, removable
+
+    @staticmethod
+    def _apply_custom_agent_fields(
+        target_state: dict[str, Any],
+        spec: CustomAgentSpec | None,
+        *,
+        allow_model_override: bool,
+    ) -> None:
+        """Populate session agent prompt/tools/permissions/model fields from `spec`."""
+        if spec is None:
+            return
+        target_state["agentPrompt"] = spec.prompt or None
+        target_state["agentTools"] = list(spec.tools) if spec.tools is not None else None
+        target_state["agentExcludedTools"] = list(spec.excluded_tools)
+        target_state["agentAllowedTools"] = list(spec.allowed_tools)
+        target_state["agentPermissions"] = copy.deepcopy(spec.permissions)
+        target_state["agentReadOnly"] = bool(spec.tools) and all(
+            t in _READ_ONLY_TOOL_NAMES for t in spec.tools
+        )
+        candidate_model = (
+            spec.model if spec.model and spec.model.strip().lower() != "auto" else None
+        )
+        if candidate_model and allow_model_override:
+            target_state["model"] = candidate_model
+            target_state["switchedModel"] = candidate_model
+        else:
+            target_state["switchedModel"] = None
 
     def _require_session(self, session_id: str) -> dict[str, Any]:
         """Fetch session state for `session_id` directly from SQLite or raise KeyError."""
@@ -446,11 +711,80 @@ class SessionManager:
             return []
         names: list[str] = []
         for entry in raw_servers:
-            if isinstance(entry, dict):
+            if isinstance(entry, dict) and entry.get("disabled") is not True:
                 name = str(entry.get("name") or "").strip()
                 if name and name not in names:
                     names.append(name)
         return names
+
+    async def probe_session_mcp_servers(
+        self,
+        session_id: str,
+        server_filter: str | None = None,
+    ) -> list[McpServerStatus]:
+        """Probe the effective MCP server roster for `session_id` via `McpCatalogProber`."""
+        session = self._store.get_session(session_id)
+        if session is None:
+            return []
+
+        cwd = str(session.get("cwd") or "")
+        registry = self.get_custom_agent_registry(
+            cwd=cwd,
+            custom_agents=session.get("custom_agents") or [],
+        )
+        active_agent = session.get("agent")
+        spec = registry.get(str(active_agent)) if active_agent else None
+
+        raw_wire = session.get("wire_mcp_servers")
+        wire_entries = (
+            [dict(s) for s in raw_wire if isinstance(s, dict) and s.get("name")]
+            if isinstance(raw_wire, list)
+            else []
+        )
+        agent_entries: list[dict[str, Any]] = []
+        disabled_by_agent: set[str] = set()
+        if spec is not None and spec.mcp_servers:
+            for srv_name, srv_cfg in spec.mcp_servers.items():
+                if not isinstance(srv_name, str) or not isinstance(srv_cfg, Mapping):
+                    continue
+                if srv_cfg.get("disabled") is True:
+                    disabled_by_agent.add(srv_name)
+                entry = {"name": srv_name, **dict(srv_cfg)}
+                entry.setdefault(
+                    "_meta",
+                    {
+                        "kiro": {
+                            "resource": {
+                                "resourceType": "mcpServer",
+                                "source": {"origin": spec.origin},
+                            }
+                        }
+                    },
+                )
+                agent_entries.append(entry)
+
+        merged_declarations = _dedupe_mcp_servers([*wire_entries, *agent_entries])
+        if not merged_declarations:
+            fallback = session.get("mcp_servers")
+            if isinstance(fallback, list):
+                merged_declarations = [
+                    dict(s) for s in fallback if isinstance(s, dict) and s.get("name")
+                ]
+        _ = disabled_by_agent
+
+        if server_filter:
+            merged_declarations = [
+                s for s in merged_declarations if str(s.get("name") or "") == server_filter
+            ]
+        if not merged_declarations:
+            return []
+
+        session_env = _extract_session_mcp_env(session, state_db_path=self._store.db_path)
+        return await self._mcp_prober.probe_servers(
+            merged_declarations,
+            session_env=session_env,
+            cwd=cwd or None,
+        )
 
     async def create_session(
         self,
@@ -468,9 +802,17 @@ class SessionManager:
             initial_model = str(cached_models[0].get("modelId") or DEFAULT_MODEL_ID)
         else:
             initial_model = DEFAULT_MODEL_ID
+
         isolated_mcp = copy.deepcopy(mcp_servers) if mcp_servers is not None else []
         isolated_meta = copy.deepcopy(meta) if meta is not None else {}
-        auth_cfg = {"kiro_agent": self._default_agent} if self._default_agent else None
+        wire_custom_agents = _extract_wire_custom_agents(isolated_meta) or []
+
+        auth_cfg: dict[str, Any] = {}
+        if self._default_agent:
+            auth_cfg["kiro_agent"] = self._default_agent
+        if self._wire_adapter.engine_id == "v3":
+            auth_cfg["_engine_id"] = "v3"
+
         sid = await self._cli.start_or_resume_agent(
             session_id=None,
             cwd=cwd,
@@ -478,31 +820,46 @@ class SessionManager:
             model=initial_model,
             mode=initial_mode,
             reasoning_effort=DEFAULT_REASONING_EFFORT,
-            auth_config=auth_cfg,
+            auth_config=auth_cfg or None,
         )
         synced_state = self._store.get_session(sid) or {}
-        state = self._store.upsert_session(
-            {
-                **synced_state,
-                "sessionId": sid,
-                "agyConversationId": None,
-                "cwd": cwd,
-                "mcp_servers": synced_state.get("mcp_servers", isolated_mcp),
-                "wire_mcp_servers": synced_state.get("wire_mcp_servers", isolated_mcp),
-                "meta": isolated_meta,
-                "mode": initial_mode,
-                "agent": self._default_agent,
-                "model": initial_model,
-                "reasoning_effort": DEFAULT_REASONING_EFFORT,
-                "cancelled": False,
-            }
+        registry = self.get_custom_agent_registry(cwd=cwd, custom_agents=wire_custom_agents)
+        combined_mcp, _, removable = self._merge_and_sync_session_mcp(
+            session_id=sid,
+            cwd=cwd,
+            raw_wire_mcp=isolated_mcp,
+            active_agent=self._default_agent,
+            registry=registry,
         )
+
+        draft_state: dict[str, Any] = {
+            **synced_state,
+            "sessionId": sid,
+            "agyConversationId": None,
+            "cwd": cwd,
+            "mcp_servers": combined_mcp,
+            "wire_mcp_servers": isolated_mcp,
+            "custom_agents": wire_custom_agents,
+            "meta": isolated_meta,
+            "mode": initial_mode,
+            "agent": self._default_agent,
+            "model": initial_model,
+            "modelPinnedByUser": bool(self._default_model),
+            "reasoning_effort": DEFAULT_REASONING_EFFORT,
+            "cancelled": False,
+        }
+        if self._default_agent:
+            self._apply_custom_agent_fields(
+                draft_state,
+                registry.get(self._default_agent),
+                allow_model_override=not bool(self._default_model),
+            )
+
+        state = self._store.upsert_session(draft_state)
+        if combined_mcp or removable:
+            self._cli.sync_mcp_servers(combined_mcp, remove_servers=removable, session_id=sid)
         _write_dsh_gate_marker_if_configured()
-        return _build_session_descriptor(
-            state,
-            available_models=cached_models,
-            default_agent=self._default_agent,
-        )
+        return self._build_descriptor(state, available_models=cached_models)
 
     async def load_session(
         self,
@@ -510,6 +867,7 @@ class SessionManager:
         session_id: str,
         cwd: str,
         mcp_servers: list[dict[str, Any]] | None = None,
+        meta: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Resume an existing ACP session (`session/load`) from SQLite storage."""
         await anyio.sleep(0)
@@ -520,11 +878,25 @@ class SessionManager:
             if mcp_servers is not None
             else copy.deepcopy(state.get("wire_mcp_servers", state.get("mcp_servers", [])))
         )
+        wire_custom_agents = _extract_wire_custom_agents(meta)
+        effective_custom_agents = (
+            wire_custom_agents
+            if wire_custom_agents is not None
+            else copy.deepcopy(state.get("custom_agents", []))
+        )
+        effective_meta = (
+            copy.deepcopy(meta) if meta is not None else copy.deepcopy(state.get("meta", {}))
+        )
+
         model = str(state.get("model", self._default_model or DEFAULT_MODEL_ID))
         mode = str(state.get("mode", "auto"))
         agent = state.get("agent") or self._default_agent
         reasoning_effort = str(state.get("reasoning_effort", DEFAULT_REASONING_EFFORT))
-        auth_cfg = {"kiro_agent": str(agent)} if agent else None
+        auth_cfg: dict[str, Any] = dict(state.get("auth_config") or {})
+        if agent:
+            auth_cfg["kiro_agent"] = str(agent)
+        if self._wire_adapter.engine_id == "v3":
+            auth_cfg["_engine_id"] = "v3"
 
         await self._cli.start_or_resume_agent(
             session_id=session_id,
@@ -533,114 +905,149 @@ class SessionManager:
             model=model,
             mode=mode,
             reasoning_effort=reasoning_effort,
-            auth_config=auth_cfg,
+            auth_config=auth_cfg or None,
         )
-        synced_state = self._store.get_session(session_id) or {}
+        registry = self.get_custom_agent_registry(cwd=cwd, custom_agents=effective_custom_agents)
+        combined_mcp, _, removable = self._merge_and_sync_session_mcp(
+            session_id=session_id,
+            cwd=cwd,
+            raw_wire_mcp=effective_wire_mcp,
+            active_agent=str(agent) if agent else None,
+            registry=registry,
+            prev_mcp_servers=state.get("mcp_servers", []),
+        )
 
-        restored_state = self._store.upsert_session(
-            {
-                **copy.deepcopy(state),
-                "sessionId": session_id,
-                "cwd": cwd,
-                "mcp_servers": synced_state.get("mcp_servers", effective_wire_mcp),
-                "wire_mcp_servers": synced_state.get("wire_mcp_servers", effective_wire_mcp),
-                "mode": mode,
-                "agent": agent,
-                "model": model,
-                "reasoning_effort": reasoning_effort,
-                "cancelled": bool(state.get("cancelled", False)),
-            }
-        )
+        draft_state: dict[str, Any] = {
+            **copy.deepcopy(state),
+            "sessionId": session_id,
+            "cwd": cwd,
+            "mcp_servers": combined_mcp,
+            "wire_mcp_servers": effective_wire_mcp,
+            "custom_agents": effective_custom_agents,
+            "meta": effective_meta,
+            "mode": mode,
+            "agent": agent,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "cancelled": bool(state.get("cancelled", False)),
+        }
+        if agent and wire_custom_agents is not None:
+            self._apply_custom_agent_fields(
+                draft_state,
+                registry.get(str(agent)),
+                allow_model_override=not bool(state.get("modelPinnedByUser", False)),
+            )
+
+        restored_state = self._store.upsert_session(draft_state)
+        if combined_mcp or removable:
+            self._cli.sync_mcp_servers(
+                combined_mcp,
+                remove_servers=removable,
+                session_id=session_id,
+            )
         _write_dsh_gate_marker_if_configured()
         cached_models = self._store.load_models() or None
-        return _build_session_descriptor(
-            restored_state,
-            available_models=cached_models,
-            default_agent=self._default_agent,
-        )
+        return self._build_descriptor(restored_state, available_models=cached_models)
 
-    def _is_valid_agent_mode(self, mode_id: str, *, cwd: str | None = None) -> bool:
-        """Return whether `mode_id` is a valid KiroCrew agent mode ID."""
+    def _is_valid_agent_mode(
+        self,
+        mode_id: str,
+        *,
+        registry: CustomAgentRegistry,
+    ) -> bool:
+        """Return whether `mode_id` resolves to a registered or virtual custom agent."""
         if not mode_id:
             return False
-        if mode_id.startswith("kirocrew"):
+        if registry.get(mode_id) is not None:
             return True
-        known = _discover_agent_mode_ids(
-            cwd=cwd,
-            default_agent=self._default_agent,
-        )
-        return mode_id in known
+        if mode_id == self._default_agent:
+            return True
+        return self._wire_adapter.engine_id == "v2" and mode_id.startswith("kirocrew")
 
     async def set_mode(self, *, session_id: str, mode_id: str) -> dict[str, Any]:
         """Update session approval mode or agent profile (`session/set_mode`) in SQLite."""
-        from agy_acp.providers.agy_cli_provider import (
-            _dedupe_mcp_servers,
-            load_kiro_agent_spec,
-            translate_mcp_server,
-        )
-
         await anyio.sleep(0)
         session = self._require_session(session_id)
         cwd = str(session.get("cwd", ""))
+        registry = self.get_custom_agent_registry(
+            cwd=cwd,
+            custom_agents=session.get("custom_agents") or [],
+        )
+
         if mode_id in VALID_MODE_IDS:
             session["mode"] = mode_id
             session["agent"] = None
             session["switchedModel"] = None
             session["agentPrompt"] = None
             session["agentTools"] = None
+            session["agentExcludedTools"] = []
+            session["agentAllowedTools"] = []
+            session["agentPermissions"] = None
             session["agentReadOnly"] = False
-        elif self._is_valid_agent_mode(mode_id, cwd=cwd):
-            session["agent"] = mode_id
-            spec = load_kiro_agent_spec(
+            raw_wire = session.get("wire_mcp_servers", [])
+            combined, _, removable = self._merge_and_sync_session_mcp(
+                session_id=session_id,
+                cwd=cwd,
+                raw_wire_mcp=raw_wire if isinstance(raw_wire, list) else [],
+                active_agent=None,
+                registry=registry,
+                prev_mcp_servers=session.get("mcp_servers", []),
+            )
+            session["mcp_servers"] = combined
+            self._store.upsert_session(session)
+            if combined or removable:
+                self._cli.sync_mcp_servers(
+                    combined, remove_servers=removable, session_id=session_id
+                )
+            return {}
+
+        if not self._is_valid_agent_mode(mode_id, registry=registry):
+            raise ValueError(f"Mode '{mode_id}' not found")
+
+        session["agent"] = mode_id
+        spec = registry.get(mode_id)
+        raw_wire = session.get("wire_mcp_servers", [])
+        combined, _, removable = self._merge_and_sync_session_mcp(
+            session_id=session_id,
+            cwd=cwd,
+            raw_wire_mcp=raw_wire if isinstance(raw_wire, list) else [],
+            active_agent=mode_id,
+            registry=registry,
+            prev_mcp_servers=session.get("mcp_servers", []),
+        )
+        session["mcp_servers"] = combined
+
+        model_pinned = bool(session.get("modelPinnedByUser", False))
+        if spec is not None and (self._wire_adapter.engine_id == "v3" or spec.origin != "project"):
+            self._apply_custom_agent_fields(
+                session,
+                spec,
+                allow_model_override=not model_pinned,
+            )
+        elif self._wire_adapter.engine_id == "v2":
+            legacy_spec = load_kiro_agent_spec(
                 mode_id,
                 cwd=cwd,
                 include_home=not self._cli.is_custom_store,
             )
-            raw_wire = session.get("wire_mcp_servers", [])
-            wire_list = (
-                [translate_mcp_server(s) for s in raw_wire if isinstance(s, dict)]
-                if isinstance(raw_wire, list)
-                else []
-            )
-            agent_list = [translate_mcp_server(s) for s in spec["mcp_servers"]]
-            combined = _dedupe_mcp_servers([*wire_list, *agent_list])
-            wire_names = {str(s.get("name") or "") for s in wire_list}
-            prev_names = [
-                str(s.get("name") or "")
-                for s in session.get("mcp_servers", [])
-                if isinstance(s, dict) and s.get("name")
-            ]
-            other_session_names = {
-                str(srv.get("name") or "")
-                for other in self._store.list_sessions()
-                if str(other.get("sessionId") or "") != session_id
-                for srv in (other.get("mcp_servers") or [])
-                if isinstance(srv, dict) and srv.get("name")
-            }
-            combined_names = {str(s.get("name") or "") for s in combined}
-            removable = [
-                name
-                for name in [*spec["disabled_mcp_servers"], *prev_names]
-                if name
-                and name not in wire_names
-                and name not in combined_names
-                and name not in other_session_names
-            ]
-            if combined or removable:
-                self._cli.sync_mcp_servers(combined, remove_servers=removable)
-            session["mcp_servers"] = combined
-            session["agentPrompt"] = spec.get("prompt")
-            session["agentTools"] = spec.get("tools")
-            session["agentReadOnly"] = bool(spec.get("read_only"))
-            pinned_model = spec.get("model")
-            if isinstance(pinned_model, str) and pinned_model:
+            session["agentPrompt"] = legacy_spec.get("prompt")
+            session["agentTools"] = legacy_spec.get("tools")
+            session["agentExcludedTools"] = list(spec.excluded_tools) if spec else []
+            session["agentAllowedTools"] = list(spec.allowed_tools) if spec else []
+            session["agentPermissions"] = copy.deepcopy(spec.permissions) if spec else None
+            session["agentReadOnly"] = bool(legacy_spec.get("read_only"))
+            pinned_model = legacy_spec.get("model")
+            if isinstance(pinned_model, str) and pinned_model and not model_pinned:
                 session["model"] = pinned_model
                 session["switchedModel"] = pinned_model
             else:
                 session["switchedModel"] = None
         else:
-            raise ValueError(f"Mode '{mode_id}' not found")
+            session["switchedModel"] = None
+
         self._store.upsert_session(session)
+        if combined or removable:
+            self._cli.sync_mcp_servers(combined, remove_servers=removable, session_id=session_id)
         return {}
 
     async def compact_session(
@@ -649,7 +1056,7 @@ class SessionManager:
         session_id: str,
         instructions: str = "",
     ) -> dict[str, Any]:
-        """Summarize and reset `session_id` conversation history for `/compact`."""
+        """Summarize and reset `session_id` conversation history for compaction."""
         session = self._store.get_session(session_id)
         if session is None:
             return {
@@ -671,6 +1078,7 @@ class SessionManager:
                 summary = "Context is already empty."
                 compacted_tokens = 0
             session["contextTokens"] = compacted_tokens
+            session["reinjectAgentPrompt"] = True
             self._store.upsert_session(session)
             return {
                 "status": "completed",
@@ -698,7 +1106,7 @@ class SessionManager:
                 model=model,
                 mode="read-only",
                 effort="low",
-                env=_extract_session_mcp_env(session),
+                env=_extract_session_mcp_env(session, state_db_path=self._store.db_path),
             )
         except Exception as exc:
             return {
@@ -723,6 +1131,7 @@ class SessionManager:
         session["agyConversationId"] = None
         session["compactedSummary"] = summary
         session["contextTokens"] = compacted_tokens
+        session["reinjectAgentPrompt"] = True
         self._store.upsert_session(session)
         return {
             "status": "completed",
@@ -733,10 +1142,11 @@ class SessionManager:
         }
 
     async def set_model(self, *, session_id: str, model_id: str) -> dict[str, Any]:
-        """Update active model (`session/set_model`) in SQLite."""
+        """Update active model (`session/set_model`) in SQLite and pin user override."""
         await anyio.sleep(0)
         session = self._require_session(session_id)
         session["model"] = model_id
+        session["modelPinnedByUser"] = True
         self._store.upsert_session(session)
         return {}
 
@@ -752,17 +1162,23 @@ class SessionManager:
         session = self._require_session(session_id)
         if config_id == "model":
             session["model"] = value
+            session["modelPinnedByUser"] = True
         elif config_id == "mode":
             if value not in VALID_MODE_IDS:
                 raise ValueError(f"Mode '{value}' not found")
             session["mode"] = value
         elif config_id in REASONING_EFFORT_CONFIG_IDS:
+            if value not in self._wire_adapter.supported_effort_levels:
+                supported = ", ".join(self._wire_adapter.supported_effort_levels)
+                raise ValueError(
+                    f"Unsupported effort level '{value}' (expected one of: {supported})"
+                )
             session["reasoning_effort"] = value
         else:
             raise ValueError(f"Config option '{config_id}' not found")
         updated = self._store.upsert_session(session)
         return {
-            "configOptions": self._build_config_options(
+            "configOptions": self._build_config_options_for_state(
                 model=str(updated.get("model", DEFAULT_MODEL_ID)),
                 mode=str(updated.get("mode", "auto")),
                 reasoning_effort=str(updated.get("reasoning_effort", DEFAULT_REASONING_EFFORT)),
@@ -798,6 +1214,7 @@ class SessionManager:
         agy_conv_id = session.get("agyConversationId")
         conversation_id = str(agy_conv_id) if agy_conv_id else None
         compacted_summary = session.get("compactedSummary")
+        reinjected_prompt = bool(session.get("reinjectAgentPrompt"))
 
         formatted_prompt, temp_images = _format_prompt_blocks(prompt_blocks)
         consumed_compacted_summary = False
@@ -815,7 +1232,7 @@ class SessionManager:
             session,
             is_new_conversation=conversation_id is None,
         )
-        session_env = _extract_session_mcp_env(session)
+        session_env = _extract_session_mcp_env(session, state_db_path=self._store.db_path)
 
         outcome = None
         try:
@@ -856,12 +1273,19 @@ class SessionManager:
             or outcome.resolved_model
             or ctx_tokens > 0
             or consumed_compacted_summary
+            or reinjected_prompt
         ):
             if outcome.conversation_id:
                 session["agyConversationId"] = outcome.conversation_id
             if consumed_compacted_summary:
                 session["compactedSummary"] = None
-            if outcome.resolved_model and session.get("model") in {DEFAULT_MODEL_ID, "auto", ""}:
+            if reinjected_prompt:
+                session["reinjectAgentPrompt"] = False
+            if (
+                outcome.resolved_model
+                and not session.get("modelPinnedByUser")
+                and session.get("model") in {DEFAULT_MODEL_ID, "auto", ""}
+            ):
                 session["model"] = outcome.resolved_model
             if ctx_tokens > 0:
                 session["contextTokens"] = ctx_tokens
@@ -960,6 +1384,22 @@ class SessionManager:
         if scope is not None:
             scope.cancel()
         return True
+
+    async def evict_session(self, *, session_id: str) -> dict[str, Any]:
+        """Evict resident runtime handles for `session_id` while preserving SQLite state & turns."""
+        return await self.close_session(session_id=session_id, delete_persisted=False)
+
+    async def terminate_session(
+        self,
+        *,
+        session_id: str,
+        delete_persisted: bool = False,
+    ) -> dict[str, Any]:
+        """Terminate `session_id` and optionally delete persisted SQLite session + turns."""
+        return await self.close_session(
+            session_id=session_id,
+            delete_persisted=delete_persisted,
+        )
 
     async def close_session(
         self,

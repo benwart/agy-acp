@@ -439,7 +439,7 @@ def _spec_from_mapping(
     fallback_id: str = "",
 ) -> CustomAgentSpec | None:
     cleaned = {k: v for k, v in raw.items() if k not in CREW_ONLY_ENTRY_KEYS}
-    raw_id = cleaned.get("id") or cleaned.get("name") or fallback_id
+    raw_id = cleaned.get("id") or fallback_id or cleaned.get("name")
     if not isinstance(raw_id, str) or not raw_id.strip():
         return None
     agent_id = raw_id.strip()
