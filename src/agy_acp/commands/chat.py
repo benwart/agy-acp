@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+import sys
+from typing import Annotated, Any
 
 import anyio
+from cyclopts import Parameter
 
+from agy_acp.commands.serve import AGENT_ENGINE_HELP, normalize_agent_engine
 from agy_acp.logic.quota_tracker import QuotaTracker, format_local_reset_date
 from agy_acp.providers.agy_cli_provider import AgyCliProvider
 
@@ -18,12 +21,18 @@ async def default(
     list_models: bool = False,
     format: str = "text",
     no_interactive: bool = False,
-    agent_engine: str | None = None,
+    agent_engine: Annotated[str | None, Parameter(help=AGENT_ENGINE_HELP)] = None,
     agent: str | None = None,
     model: str | None = None,
     **extra_kwargs: Any,
 ) -> int:
     """Execute KiroCrew `--list-models` catalog query or non-interactive `/usage` scrape."""
+    try:
+        normalize_agent_engine(agent_engine)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(2)
+
     await anyio.sleep(0)
     _ = (format, no_interactive, agent_engine, agent, model, extra_kwargs)
 

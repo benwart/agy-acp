@@ -14,9 +14,10 @@ from agy_acp.commands.docs import build as docs_build_cmd
 
 def test_cli_scaffold_help_and_version(capsys: pytest.CaptureFixture[str]) -> None:
     """Verify Cyclopts scaffold registers subcommands, group docstrings, and version."""
+    assert __version__ == "1.3.0"
     app(["--version"], result_action="return_value")
     version_out = capsys.readouterr().out.strip()
-    assert __version__ in version_out
+    assert "1.3.0 kiro-cli 2.28.0" in version_out
     last_token = version_out.split()[-1]
     major, minor, patch = (int(part) for part in last_token.split(".")[:3])
     assert (major, minor, patch) >= (2, 28, 0)
@@ -31,6 +32,62 @@ def test_cli_scaffold_help_and_version(capsys: pytest.CaptureFixture[str]) -> No
     assert "Inspect token, credit, 5-hour, and 7-day rolling quota usage." in quota_help
     assert "five-hour" in quota_help
     assert "seven-day" in quota_help
+
+
+def test_agent_engine_help_satisfies_kirocrew_kas_floor_probe(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify `--help` output advertises `--agent-engine` and `v3` across entrypoints."""
+    for help_tokens in (
+        ["--help"],
+        ["serve", "--help"],
+        ["acp", "--help"],
+        ["acp", "serve", "--help"],
+        ["chat", "--help"],
+    ):
+        app(help_tokens, result_action="return_value")
+        help_text = capsys.readouterr().out
+        assert "--agent-engine" in help_text, f"Missing --agent-engine in {help_tokens}"
+        assert "v3" in help_text, f"Missing v3 in {help_tokens}"
+
+
+async def test_normalize_agent_engine_and_cli_validation(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify normalize_agent_engine maps v2/v3 aliases and CLI exits 2 on invalid engine."""
+    from agy_acp.commands.serve import default as serve_default
+    from agy_acp.commands.serve import normalize_agent_engine
+
+    for raw_v2 in (None, "", "  ", "default", "v2", "V2", "kiro", "KIRO"):
+        assert normalize_agent_engine(raw_v2) == "v2"
+    for raw_v3 in ("v3", "V3", "kas", "KAS", " v3 "):
+        assert normalize_agent_engine(raw_v3) == "v3"
+
+    with pytest.raises(ValueError, match="v99"):
+        normalize_agent_engine("v99")
+
+    assert await serve_default(agent_engine="v2", save_dir=tmp_path) == 0
+    assert await serve_default(agent_engine="v3", save_dir=tmp_path) == 0
+    assert await acp_serve_cmd.default(agent_engine="kas", save_dir=tmp_path) == 0
+
+    with pytest.raises(SystemExit) as serve_exc:
+        await serve_default(agent_engine="v99", save_dir=tmp_path)
+    assert serve_exc.value.code == 2
+    assert "v99" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit) as acp_exc:
+        await acp_serve_cmd.default(agent_engine="v99", save_dir=tmp_path)
+    assert acp_exc.value.code == 2
+    assert "v99" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit) as cli_exc:
+        app(
+            ["acp", "--agent-engine", "v99", "--save-dir", str(tmp_path)],
+            result_action="return_int_as_exit_code_else_zero",
+        )
+    assert cli_exc.value.code == 2
+    assert "v99" in capsys.readouterr().err
 
 
 async def test_acp_serve_accepts_kirocrew_flags(tmp_path: Path) -> None:
