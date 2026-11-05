@@ -379,3 +379,225 @@ def test_kas_permissions_evaluator_rules_precedence_meta_and_list_shapes() -> No
         )
         == "allow"
     )
+
+
+def test_permissions_path_traversal_cwd_relativization_shell_chaining_and_unmapped_deny() -> None:
+    """Verify HIGH-01 path normalization, cwd relativization, shell chaining, & unmapped deny."""
+    fs_policy = {
+        "rules": [
+            {"capability": "filesystem", "match": ["src/**"], "effect": "allow"},
+            {"capability": "filesystem", "match": ["secrets/**"], "effect": "deny"},
+        ]
+    }
+    # 1. Traversal `src/../secrets/key.pem` must NOT match `src/**` allow; MUST hit `secrets/**`
+    assert (
+        evaluate_tool_call_permission(
+            fs_policy,
+            tool_id="read_file",
+            path="src/../secrets/key.pem",
+        )
+        == "deny"
+    )
+    assert (
+        evaluate_tool_call_permission(
+            fs_policy,
+            tool_id="fs_write",
+            path="src/../secrets/key.pem",
+            cwd="/repo",
+        )
+        == "deny"
+    )
+
+    # 2. Absolute `/repo/secrets/key.pem` with `cwd="/repo"` relativizes to `secrets/key.pem`
+    broad_allow_with_rel_deny = {
+        "rules": [
+            {"capability": "filesystem", "match": ["/repo/**"], "effect": "allow"},
+            {"capability": "filesystem", "match": ["secrets/**"], "effect": "deny"},
+        ]
+    }
+    assert (
+        evaluate_tool_call_permission(
+            broad_allow_with_rel_deny,
+            tool_id="read_file",
+            path="/repo/secrets/key.pem",
+            cwd="/repo",
+        )
+        == "deny"
+    )
+    assert (
+        evaluate_tool_call_permission(
+            broad_allow_with_rel_deny,
+            tool_id="read_file",
+            path="/repo/src/main.py",
+            cwd="/repo",
+        )
+        == "allow"
+    )
+
+    # Exclude pattern on relative path still excludes absolute target inside cwd
+    exclude_rel_policy = {
+        "rules": [
+            {
+                "capability": "fs_read",
+                "match": ["**"],
+                "exclude": ["secrets/**"],
+                "effect": "allow",
+            }
+        ]
+    }
+    assert (
+        evaluate_tool_call_permission(
+            exclude_rel_policy,
+            tool_id="read_file",
+            path="/repo/secrets/key.pem",
+            cwd="/repo",
+        )
+        == "ask"
+    )
+
+    # 3. Shell wildcard allow rule MUST NOT match compound shell operators / control chars
+    shell_policy = {
+        "rules": [
+            {"capability": "shell", "match": ["git status*"], "effect": "allow"},
+            {"capability": "shell", "match": ["echo safe | cat"], "effect": "allow"},
+            {"capability": "shell", "match": ["*rm -rf /"], "effect": "deny"},
+        ]
+    }
+    for chained in (
+        "git status; whoami",
+        "git status | cat",
+        "git status && id",
+        "git status `id`",
+        "git status $(id)",
+        "git status\nid",
+        "git status\rid",
+        "git status > /tmp/out",
+        "git status < /etc/passwd",
+    ):
+        assert (
+            evaluate_tool_call_permission(
+                shell_policy,
+                tool_id="run_command",
+                command=chained,
+            )
+            == "ask"
+        ), f"Expected ask for compound command: {chained!r}"
+
+    # Deny rule with wildcard STILL matches compound command
+    assert (
+        evaluate_tool_call_permission(
+            shell_policy,
+            tool_id="run_command",
+            command="git status; rm -rf /",
+        )
+        == "deny"
+    )
+    # Exact literal pattern without `*` or `?` still matches literally
+    assert (
+        evaluate_tool_call_permission(
+            shell_policy,
+            tool_id="run_command",
+            command="echo safe | cat",
+        )
+        == "allow"
+    )
+
+    # 4. Unmapped built-in tools (`manage_task`, `todo_list`) obey `all` / `builtin` deny
+    deny_all = {"rules": [{"capability": "all", "effect": "deny"}]}
+    deny_builtin = {"rules": [{"capability": "builtin", "effect": "deny"}]}
+    unrelated_allow = {"rules": [{"capability": "fs_read", "effect": "allow"}]}
+
+    assert evaluate_tool_call_permission(deny_all, tool_id="manage_task") == "deny"
+    assert evaluate_tool_call_permission(deny_builtin, tool_id="manage_task") == "deny"
+    assert evaluate_tool_call_permission(deny_builtin, tool_id="todo_list") == "deny"
+    assert evaluate_tool_call_permission(unrelated_allow, tool_id="manage_task") == "ask"
+
+
+async def test_symlink_escape_nan_json_and_semantic_agent_validate(tmp_path: Path) -> None:
+    """Verify MEDIUM-05 .kiro symlink escape, LOW-01 NaN/Infinity, and LOW-03 agent validate."""
+    user_dir = tmp_path / "empty_user_agents"
+    user_dir.mkdir()
+
+    # 1. Symlinked `.kiro/agents` pointing outside repo is ignored
+    outside_agents = tmp_path / "outside_agents"
+    outside_agents.mkdir()
+    (outside_agents / "sneaky.json").write_text(
+        json.dumps({"name": "sneaky", "prompt": "Injected prompt"}),
+        encoding="utf-8",
+    )
+
+    repo_a = tmp_path / "repo_a"
+    (repo_a / ".kiro").mkdir(parents=True)
+    (repo_a / ".kiro" / "agents").symlink_to(outside_agents)
+    reg_a = CustomAgentRegistry.load(cwd=repo_a, user_agents_dir=user_dir)
+    assert reg_a.get("sneaky") is None
+
+    # Symlinked `.kiro` directory itself is also ignored
+    outside_kiro = tmp_path / "outside_kiro"
+    (outside_kiro / "agents").mkdir(parents=True)
+    (outside_kiro / "agents" / "sneaky2.json").write_text(
+        json.dumps({"name": "sneaky2", "prompt": "Injected prompt 2"}),
+        encoding="utf-8",
+    )
+    repo_b = tmp_path / "repo_b"
+    repo_b.mkdir()
+    (repo_b / ".kiro").symlink_to(outside_kiro)
+    reg_b = CustomAgentRegistry.load(cwd=repo_b, user_agents_dir=user_dir)
+    assert reg_b.get("sneaky2") is None
+
+    # 2. JSON NaN / Infinity / -Infinity rejected in parse_agent_spec_file
+    for bad_const in ("NaN", "Infinity", "-Infinity"):
+        nan_file = tmp_path / f"bad_{bad_const}.json"
+        nan_file.write_text(
+            f'{{"name": "nan-agent", "temperature": {bad_const}}}',
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError):
+            parse_agent_spec_file(nan_file)
+        assert await agent_validate.default(path=nan_file) == 1
+
+    # 3. `agy-acp agent validate` rejects escaping file:// prompt and malformed permissions
+    secret = tmp_path / "secret_outside.txt"
+    secret.write_text("SECRET", encoding="utf-8")
+    spec_dir = tmp_path / "specs"
+    spec_dir.mkdir()
+
+    escaping_spec = spec_dir / "escape.json"
+    escaping_spec.write_text(
+        json.dumps({"name": "escape", "prompt": "file://../secret_outside.txt"}),
+        encoding="utf-8",
+    )
+    assert await agent_validate.default(path=escaping_spec) == 1
+
+    bad_perms_type = spec_dir / "bad_perms_type.json"
+    bad_perms_type.write_text(
+        json.dumps({"name": "bad1", "permissions": "allow"}),
+        encoding="utf-8",
+    )
+    assert await agent_validate.default(path=bad_perms_type) == 1
+
+    bad_perms_effect = spec_dir / "bad_perms_effect.json"
+    bad_perms_effect.write_text(
+        json.dumps(
+            {
+                "name": "bad2",
+                "permissions": {"rules": [{"capability": "all", "effect": "invalid_effect"}]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert await agent_validate.default(path=bad_perms_effect) == 1
+
+    valid_with_perms_and_file = spec_dir / "good.json"
+    (spec_dir / "prompt.txt").write_text("Contained prompt", encoding="utf-8")
+    valid_with_perms_and_file.write_text(
+        json.dumps(
+            {
+                "name": "good",
+                "prompt": "file://prompt.txt",
+                "permissions": {"rules": [{"capability": "fs_read", "effect": "allow"}]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert await agent_validate.default(path=valid_with_perms_and_file) == 0

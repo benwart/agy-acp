@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import posixpath
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -93,12 +94,13 @@ KAS_CAPABILITIES: frozenset[str] = frozenset(
 )
 
 META_CAPABILITY_EXPANSION: dict[str, tuple[str, ...]] = {
-    "all": _BUILTIN_CAPABILITIES + ("mcp",),
-    "builtin": _BUILTIN_CAPABILITIES,
+    "all": (*_BUILTIN_CAPABILITIES, "builtin", "mcp"),
+    "builtin": (*_BUILTIN_CAPABILITIES, "builtin"),
     "filesystem": ("fs_read", "fs_write"),
 }
 
 _PATH_SCOPED_CAPABILITIES: frozenset[str] = frozenset({"fs_read", "fs_write", "mcp"})
+_COMPOUND_SHELL_TOKENS: tuple[str, ...] = (";", "|", "&", "`", "$(", "\n", "\r", ">", "<")
 
 _CAPABILITY_BY_TOOL_NAME: dict[str, str] = {
     # KAS v3 built-in tool IDs
@@ -260,6 +262,10 @@ def parse_markdown_agent_spec(text: str) -> dict[str, Any]:
     return spec
 
 
+def _reject_nonfinite_json_constant(token: str) -> Any:
+    raise ValueError(f"invalid non-finite JSON constant: {token}")
+
+
 def parse_agent_spec_file(path: Path) -> dict[str, Any]:
     """Parse either a `.json` or `.md` agent specification file from disk."""
     suffix = path.suffix.lower()
@@ -268,7 +274,7 @@ def parse_agent_spec_file(path: Path) -> dict[str, Any]:
         return parse_markdown_agent_spec(raw_text)
     if suffix == JSON_SUFFIX:
         try:
-            loaded = json.loads(raw_text)
+            loaded = json.loads(raw_text, parse_constant=_reject_nonfinite_json_constant)
         except json.JSONDecodeError as exc:
             raise ValueError(f"invalid JSON agent spec: {exc}") from exc
         if not isinstance(loaded, dict):
@@ -397,6 +403,7 @@ class CustomAgentSpec:
         url: str = "",
         query: str = "",
         subagent_target: str = "",
+        cwd: str = "",
     ) -> PermissionDecision:
         """Evaluate KAS inline permissions for a concrete tool invocation."""
         return evaluate_tool_call_permission(
@@ -410,6 +417,7 @@ class CustomAgentSpec:
             url=url,
             query=query,
             subagent_target=subagent_target,
+            cwd=cwd,
         )
 
     def to_available_mode(self, *, v3_meta: bool = True) -> dict[str, Any]:
@@ -524,22 +532,33 @@ class CustomAgentRegistry:
 
         # 1. Lowest precedence: Project scope `<cwd>/.kiro/agents/*.{json,md}` (UNTRUSTED)
         if cwd is not None:
-            project_dir = Path(cwd) / ".kiro" / "agents"
-            for spec_path in _iter_live_spec_files(project_dir):
-                loaded = cls._read_disk_spec(spec_path)
-                if loaded is None:
-                    continue
-                try:
-                    sanitized = sanitize_project_agent_spec(loaded, agents_dir=project_dir)
-                except CustomAgentSecurityError:
-                    continue
-                agent = _spec_from_mapping(
-                    sanitized,
-                    origin="project",
-                    fallback_id=spec_path.stem,
-                )
-                if agent is not None:
-                    merged[agent.agent_id] = agent
+            cwd_path = Path(cwd)
+            kiro_dir = cwd_path / ".kiro"
+            project_dir = kiro_dir / "agents"
+            if cls._is_safe_project_agents_dir(cwd_path, kiro_dir, project_dir):
+                resolved_project_dir = project_dir.resolve()
+                for spec_path in _iter_live_spec_files(project_dir):
+                    if spec_path.is_symlink():
+                        continue
+                    try:
+                        if not spec_path.resolve().is_relative_to(resolved_project_dir):
+                            continue
+                    except OSError:
+                        continue
+                    loaded = cls._read_disk_spec(spec_path)
+                    if loaded is None:
+                        continue
+                    try:
+                        sanitized = sanitize_project_agent_spec(loaded, agents_dir=project_dir)
+                    except CustomAgentSecurityError:
+                        continue
+                    agent = _spec_from_mapping(
+                        sanitized,
+                        origin="project",
+                        fallback_id=spec_path.stem,
+                    )
+                    if agent is not None:
+                        merged[agent.agent_id] = agent
 
         # 2. Middle precedence: User scope `~/.kiro/agents/*.{json,md}`
         resolved_user_dir = (
@@ -579,6 +598,17 @@ class CustomAgentRegistry:
         return cls(list(merged.values()))
 
     @staticmethod
+    def _is_safe_project_agents_dir(cwd_path: Path, kiro_dir: Path, project_dir: Path) -> bool:
+        if kiro_dir.is_symlink() or project_dir.is_symlink():
+            return False
+        if not project_dir.is_dir():
+            return False
+        try:
+            return project_dir.resolve().is_relative_to(cwd_path.resolve())
+        except OSError:
+            return False
+
+    @staticmethod
     def _read_disk_spec(path: Path) -> dict[str, Any] | None:
         try:
             raw_text = path.read_text(encoding="utf-8")
@@ -589,7 +619,7 @@ class CustomAgentRegistry:
         try:
             if path.suffix.lower() == MARKDOWN_SUFFIX:
                 return parse_markdown_agent_spec(raw_text)
-            parsed = json.loads(raw_text)
+            parsed = json.loads(raw_text, parse_constant=_reject_nonfinite_json_constant)
             return parsed if isinstance(parsed, dict) else None
         except ValueError, json.JSONDecodeError:
             return None
@@ -751,16 +781,133 @@ def _normalize_permission_rules(raw_permissions: Any) -> list[dict[str, Any]]:
     return normalized
 
 
-def evaluate_kas_permissions(
+def _has_compound_shell_syntax(command: str) -> bool:
+    return any(tok in command for tok in _COMPOUND_SHELL_TOKENS)
+
+
+def _normalize_fs_path_candidates(path: str, *, cwd: str = "") -> tuple[str, ...]:
+    """Compute canonical normalized POSIX path candidates (absolute and `cwd`-relative)."""
+    if not path:
+        return ("",)
+    raw_posix = path.replace("\\", "/")
+    cwd_clean = cwd.strip()
+    if cwd_clean:
+        cwd_path = Path(cwd_clean).resolve(strict=False)
+        raw_p = Path(raw_posix)
+        target_path = (
+            raw_p.resolve(strict=False)
+            if raw_p.is_absolute()
+            else (cwd_path / raw_p).resolve(strict=False)
+        )
+        candidates: list[str] = [target_path.as_posix()]
+        if target_path == cwd_path:
+            candidates.append(".")
+        elif target_path.is_relative_to(cwd_path):
+            rel_posix = target_path.relative_to(cwd_path).as_posix()
+            if rel_posix not in candidates:
+                candidates.append(rel_posix)
+        return tuple(candidates)
+
+    norm = posixpath.normpath(raw_posix)
+    if norm.startswith("//"):
+        norm = "/" + norm.lstrip("/")
+    return (norm,)
+
+
+def _validate_str_list_field(value: Any, field_name: str) -> None:
+    if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
+        raise ValueError(f"{field_name!r} must be a list of strings")
+
+
+def _validate_permission_rule_entry(entry: Any, index: int) -> None:
+    if not isinstance(entry, Mapping):
+        raise ValueError(f"permission rule at index {index} must be an object")
+    effect = entry.get("effect") if "effect" in entry else entry.get("permission")
+    if not isinstance(effect, str) or effect not in ("allow", "ask", "deny"):
+        raise ValueError(
+            f"permission rule at index {index} has invalid effect {effect!r}; "
+            "expected 'allow', 'ask', or 'deny'"
+        )
+    has_cap = "capability" in entry and entry["capability"] is not None
+    has_tool = "tool" in entry and entry["tool"] is not None
+    if not has_cap and not has_tool:
+        raise ValueError(f"permission rule at index {index} must specify 'capability' or 'tool'")
+    if has_cap:
+        cap = entry["capability"]
+        if not isinstance(cap, str) or cap not in KAS_CAPABILITIES:
+            raise ValueError(f"permission rule at index {index} has unknown capability {cap!r}")
+    if has_tool:
+        tool = entry["tool"]
+        if not isinstance(tool, str) or not tool.strip():
+            raise ValueError(f"permission rule at index {index} must have a non-empty 'tool'")
+    for list_key in ("match", "exclude", "commands"):
+        if list_key in entry and entry[list_key] is not None:
+            _validate_str_list_field(entry[list_key], f"permissions[{index}].{list_key}")
+
+
+def _validate_permissions_structure(raw_permissions: Any) -> None:
+    if raw_permissions is None:
+        return
+    if isinstance(raw_permissions, dict):
+        if not raw_permissions:
+            return
+        if "rules" not in raw_permissions:
+            raise ValueError("'permissions' object must contain a 'rules' list")
+        unknown_keys = set(raw_permissions.keys()) - {"rules"}
+        if unknown_keys:
+            raise ValueError(f"unsupported keys in 'permissions': {sorted(unknown_keys)!r}")
+        rules = raw_permissions["rules"]
+        if not isinstance(rules, list):
+            raise ValueError("'permissions.rules' must be a list")
+        for idx, entry in enumerate(rules):
+            _validate_permission_rule_entry(entry, idx)
+        return
+    if isinstance(raw_permissions, list):
+        for idx, entry in enumerate(raw_permissions):
+            _validate_permission_rule_entry(entry, idx)
+        return
+    raise ValueError("'permissions' must be an object or list")
+
+
+def validate_agent_spec_file(path: Path) -> CustomAgentSpec:
+    """Validate syntax, `file://` prompt containment, and semantic schema of an agent spec file."""
+    loaded = parse_agent_spec_file(path)
+    base_dir = path.parent
+
+    for prompt_key in ("prompt", "systemPrompt"):
+        if prompt_key in loaded and loaded[prompt_key] is not None:
+            val = loaded[prompt_key]
+            if not isinstance(val, str):
+                raise ValueError(f"{prompt_key!r} must be a string")
+            if val.startswith("file://"):
+                resolve_contained_prompt_file(val, base_dir=base_dir)
+
+    _validate_permissions_structure(loaded.get("permissions"))
+
+    if "mcpServers" in loaded and loaded["mcpServers"] is not None:
+        if not isinstance(loaded["mcpServers"], dict):
+            raise ValueError("'mcpServers' must be an object")
+
+    for tool_list_key in ("tools", "excludedTools", "allowedTools"):
+        if tool_list_key in loaded and loaded[tool_list_key] is not None:
+            raw_tools = loaded[tool_list_key]
+            if not isinstance(raw_tools, str) and (
+                not isinstance(raw_tools, list) or not all(isinstance(x, str) for x in raw_tools)
+            ):
+                raise ValueError(f"{tool_list_key!r} must be a string or list of strings")
+
+    spec = _spec_from_mapping(loaded, origin="user", fallback_id=path.stem)
+    if spec is None:
+        raise ValueError("agent spec must define a non-empty 'id' or 'name'")
+    return spec
+
+
+def _evaluate_kas_permissions_for_candidates(
     permissions: Any,
     *,
     capability: str,
-    resource: str = "",
+    candidates: Sequence[str],
 ) -> PermissionDecision:
-    """Evaluate KAS permissions with Cedar most-restrictive-match (`deny > ask > allow`).
-
-    Unmatched requests resolve to `"ask"`.
-    """
     rules = _normalize_permission_rules(permissions)
     if not rules:
         return "ask"
@@ -774,15 +921,30 @@ def evaluate_kas_permissions(
         if capability not in expanded:
             continue
 
+        effect = rule["effect"]
         match_list: list[str] = rule["match"]
-        if match_list and not _matches_any_pattern(match_list, resource, path_mode=path_mode):
-            continue
+        if match_list:
+            effective_matches = match_list
+            if (
+                capability == "shell"
+                and effect == "allow"
+                and any(_has_compound_shell_syntax(c) for c in candidates)
+            ):
+                effective_matches = [p for p in match_list if "*" not in p and "?" not in p]
+                if not effective_matches:
+                    continue
+            if not any(
+                _matches_any_pattern(effective_matches, cand, path_mode=path_mode)
+                for cand in candidates
+            ):
+                continue
 
         exclude_list: list[str] = rule["exclude"]
-        if exclude_list and _matches_any_pattern(exclude_list, resource, path_mode=path_mode):
+        if exclude_list and any(
+            _matches_any_pattern(exclude_list, cand, path_mode=path_mode) for cand in candidates
+        ):
             continue
 
-        effect = rule["effect"]
         if effect == "deny":
             return "deny"
         if effect == "ask":
@@ -797,6 +959,27 @@ def evaluate_kas_permissions(
     return "ask"
 
 
+def evaluate_kas_permissions(
+    permissions: Any,
+    *,
+    capability: str,
+    resource: str = "",
+) -> PermissionDecision:
+    """Evaluate KAS permissions with Cedar most-restrictive-match (`deny > ask > allow`).
+
+    Unmatched requests resolve to `"ask"`.
+    """
+    if capability in ("fs_read", "fs_write"):
+        candidates = _normalize_fs_path_candidates(resource, cwd="")
+    else:
+        candidates = (resource,)
+    return _evaluate_kas_permissions_for_candidates(
+        permissions,
+        capability=capability,
+        candidates=candidates,
+    )
+
+
 def evaluate_tool_call_permission(
     permissions: Any,
     *,
@@ -809,6 +992,7 @@ def evaluate_tool_call_permission(
     url: str = "",
     query: str = "",
     subagent_target: str = "",
+    cwd: str = "",
 ) -> PermissionDecision:
     """Map a tool invocation to `(capability, resource)` and evaluate KAS permissions."""
     if is_mcp or (server_name and tool_name):
@@ -820,12 +1004,22 @@ def evaluate_tool_call_permission(
 
     capability = _CAPABILITY_BY_TOOL_NAME.get(tool_id)
     if capability is None:
-        return "ask"
+        return evaluate_kas_permissions(
+            permissions,
+            capability="builtin",
+            resource=tool_id,
+        )
+
+    if capability in ("fs_read", "fs_write"):
+        candidates = _normalize_fs_path_candidates(path, cwd=cwd)
+        return _evaluate_kas_permissions_for_candidates(
+            permissions,
+            capability=capability,
+            candidates=candidates,
+        )
 
     if capability == "shell":
         resource = command
-    elif capability in ("fs_read", "fs_write"):
-        resource = path
     elif capability == "web_fetch":
         resource = url
     elif capability == "web_search":
