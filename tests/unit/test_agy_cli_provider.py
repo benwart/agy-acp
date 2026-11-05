@@ -463,6 +463,11 @@ async def test_resolve_kiro_tool_identity_and_sync_mcp_servers(tmp_path: Path) -
     assert _resolve_kiro_tool_identity("tool", "edit_file", {"Path": "/tmp/a"}) == (
         "fs_write",
         "",
+        "str_replace",
+    )
+    assert _resolve_kiro_tool_identity("tool", "write_file", {"Path": "/tmp/a"}) == (
+        "fs_write",
+        "",
         "fs_write",
     )
     assert _resolve_kiro_tool_identity("tool", "search_web", {"query": "test"}) == (
@@ -1188,3 +1193,216 @@ def test_load_kiro_agent_spec_extracts_prompt_readonly_and_ignores_auto_model(
     assert spec["model"] is None
     assert spec["prompt"] == "Follow zoom_out.md strictly."
     assert spec["read_only"] is True
+
+
+def test_kas_tool_classification_diff_extraction_and_effort_levels() -> None:
+    """Verify KAS built-in IDs, ACP kinds, MCP metadata, diffs, and 5-level effort mapping."""
+    from agy_acp.providers.agy_cli_provider import (
+        build_command_args,
+        classify_tool_call_step,
+    )
+
+    cases: list[tuple[str, dict[str, Any], str, str, str]] = [
+        ("run_command", {"CommandLine": "pytest -q"}, "run_command", "execute_bash", "execute"),
+        ("execute_command", {"command": "echo ok"}, "run_command", "execute_bash", "execute"),
+        ("read_file", {"Path": "/a.py"}, "read_file", "fs_read", "read"),
+        ("view_file", {"AbsolutePath": "/b.py"}, "read_file", "fs_read", "read"),
+        ("view_file_outline", {"AbsolutePath": "/c.py"}, "read_file", "fs_read", "read"),
+        ("view_code_item", {"File": "/d.py"}, "read_file", "fs_read", "read"),
+        ("list_dir", {"DirectoryPath": "/src"}, "list_directory", "fs_read", "read"),
+        ("list_directory", {"path": "/src"}, "list_directory", "fs_read", "read"),
+        ("write_file", {"Path": "/w.py", "Content": "x = 1\n"}, "fs_write", "fs_write", "edit"),
+        ("write_to_file", {"TargetFile": "/w2.py"}, "fs_write", "fs_write", "edit"),
+        ("create_file", {"path": "/w3.py"}, "fs_write", "fs_write", "edit"),
+        (
+            "edit_file",
+            {"Path": "/e.py", "Target": "a = 1", "Replacement": "a = 2"},
+            "str_replace",
+            "fs_write",
+            "edit",
+        ),
+        ("replace_file_content", {"TargetFile": "/e2.py"}, "str_replace", "fs_write", "edit"),
+        ("multi_replace_file_content", {"TargetFile": "/e3.py"}, "str_replace", "fs_write", "edit"),
+        ("delete_file", {"Path": "/gone.py"}, "delete_file", "fs_write", "delete"),
+        ("remove_file", {"path": "/gone2.py"}, "delete_file", "fs_write", "delete"),
+        ("grep_search", {"Query": "TODO"}, "grep_search", "grep", "search"),
+        ("grep", {"Pattern": "FIXME"}, "grep_search", "grep", "search"),
+        ("find_by_name", {"Pattern": "*.py"}, "file_search", "glob", "search"),
+        ("glob", {"pattern": "**/*.ts"}, "file_search", "glob", "search"),
+        ("file_search", {"query": "main"}, "file_search", "glob", "search"),
+        ("search_web", {"query": "acp spec"}, "remote_web_search", "web_search", "fetch"),
+        ("read_url_content", {"Url": "https://example.com"}, "web_fetch", "web_fetch", "fetch"),
+        ("web_fetch", {"url": "https://example.com"}, "web_fetch", "web_fetch", "fetch"),
+        (
+            "invoke_subagent",
+            {"TypeName": "research", "Role": "Auditor"},
+            "invoke_sub_agent",
+            "use_subagent",
+            "other",
+        ),
+        ("todo_list", {"todos": []}, "todo_list", "todo_list", "other"),
+        ("task_boundary", {"TaskName": "Build"}, "todo_list", "todo_list", "other"),
+    ]
+    for tool_name, raw_args, expected_kas, expected_v2, expected_kind in cases:
+        cls = classify_tool_call_step("tool", tool_name, raw_args)
+        assert cls.kas_builtin_id == expected_kas, f"{tool_name} kas_builtin_id"
+        assert cls.v2_tool_name == expected_v2, f"{tool_name} v2_tool_name"
+        assert cls.acp_kind == expected_kind, f"{tool_name} acp_kind"
+        assert cls.mcp_server == ""
+        assert cls.mcp_tool == ""
+
+    shell_cls = classify_tool_call_step("tool", "run_command", {"CommandLine": "pytest -q"})
+    assert shell_cls.command == "pytest -q"
+
+    sub_by_type = classify_tool_call_step(
+        "tool", "invoke_subagent", {"TypeName": "research", "Role": "Codebase Researcher"}
+    )
+    assert sub_by_type.subagent_target == "research"
+    sub_by_agent = classify_tool_call_step(
+        "tool", "invoke_subagent", {"AgentName": "reviewer", "Role": "Reviewer"}
+    )
+    assert sub_by_agent.subagent_target == "reviewer"
+    sub_by_role = classify_tool_call_step("tool", "invoke_subagent", {"Role": "Debugger"})
+    assert sub_by_role.subagent_target == "Debugger"
+
+    edit_cls = classify_tool_call_step(
+        "tool",
+        "edit_file",
+        {"Path": "/repo/app.py", "Target": "old()", "Replacement": "new()"},
+    )
+    assert edit_cls.diff_content == [
+        {"type": "diff", "path": "/repo/app.py", "oldText": "old()", "newText": "new()"}
+    ]
+
+    write_cls = classify_tool_call_step(
+        "tool",
+        "write_file",
+        {"Path": "/repo/new.py", "Content": "print('hi')\n"},
+    )
+    assert write_cls.diff_content == [
+        {"type": "diff", "path": "/repo/new.py", "oldText": "", "newText": "print('hi')\n"}
+    ]
+
+    mcp_native = classify_tool_call_step("tool", "mcp_kirocrew-core_spawn_run", {"tasks": []})
+    assert mcp_native.mcp_server == "kirocrew-core"
+    assert mcp_native.mcp_tool == "spawn_run"
+    assert mcp_native.kas_builtin_id == ""
+    assert mcp_native.acp_kind == "other"
+
+    mcp_lazy = classify_tool_call_step(
+        "tool",
+        "call_mcp_tool",
+        {"ServerName": "kirocrew-cron", "ToolName": "cron_list", "Arguments": {}},
+    )
+    assert mcp_lazy.mcp_server == "kirocrew-cron"
+    assert mcp_lazy.mcp_tool == "cron_list"
+    assert mcp_lazy.kas_builtin_id == ""
+    assert mcp_lazy.acp_kind == "other"
+
+    for level in ("low", "medium", "high", "xhigh", "max"):
+        built = build_command_args(cwd="/workspace", prompt_arg="Run", effort=level.upper())
+        idx = built.index("--effort")
+        assert built[idx + 1] == level
+
+
+async def test_stream_prompt_yields_enriched_kas_metadata_on_tool_events(tmp_path: Path) -> None:
+    """Verify stream_prompt populates KAS metadata, diffs, subagent target, and MCP fields."""
+    events = [
+        {"event": "init", "init": {"conversation_id": "conv-kas-meta"}},
+        {
+            "event": "step_update",
+            "step_update": {
+                "step_index": 1,
+                "state": "DONE",
+                "step_type": "tool",
+                "tool_name": "edit_file",
+                "tool_info": {
+                    "name": "edit_file",
+                    "parameters": {
+                        "Path": "/workspace/src/main.py",
+                        "Target": "x = 1",
+                        "Replacement": "x = 2",
+                    },
+                    "output": "Replaced 1 occurrence.",
+                },
+            },
+        },
+        {
+            "event": "step_update",
+            "step_update": {
+                "step_index": 2,
+                "state": "DONE",
+                "step_type": "tool",
+                "tool_name": "call_mcp_tool",
+                "tool_info": {
+                    "name": "call_mcp_tool",
+                    "parameters": {
+                        "ServerName": "kirocrew-core",
+                        "ToolName": "memory_recall",
+                        "Arguments": {"query": "architecture"},
+                    },
+                    "output": "Found 1 note.",
+                },
+            },
+        },
+        {
+            "event": "result",
+            "result": {
+                "conversation_id": "conv-kas-meta",
+                "status": "SUCCESS",
+                "response": "Done.",
+            },
+        },
+    ]
+    script_lines = ["#!/usr/bin/env python3", "import json"]
+    for ev in events:
+        script_lines.append(f"print(json.dumps({ev!r}), flush=True)")
+    fake_agy = _write_executable(tmp_path / "agy", "\n".join(script_lines) + "\n")
+
+    starts: list[ToolCallEvent] = []
+    updates: list[ToolCallEvent] = []
+
+    async def _on_call(ev: ToolCallEvent) -> bool:
+        starts.append(ev)
+        return True
+
+    async def _on_update(ev: ToolCallEvent) -> None:
+        updates.append(ev)
+
+    provider = AgyCliProvider(bin_path=fake_agy, save_dir=tmp_path)
+    outcome = await provider.stream_prompt(
+        cwd=str(tmp_path),
+        prompt="edit and recall",
+        session_id="sess-kas-meta",
+        on_tool_call=_on_call,
+        on_tool_update=_on_update,
+    )
+    assert outcome.stop_reason == "end_turn"
+    assert len(starts) == 2
+    assert len(updates) == 2
+
+    edit_start = starts[0]
+    assert edit_start.kas_builtin_id == "str_replace"
+    assert edit_start.v2_tool_name == "fs_write"
+    assert edit_start.kiro_tool_name == "fs_write"
+    assert edit_start.acp_kind == "edit"
+    assert edit_start.kind == "edit"
+    assert edit_start.diff_content == [
+        {
+            "type": "diff",
+            "path": "/workspace/src/main.py",
+            "oldText": "x = 1",
+            "newText": "x = 2",
+        }
+    ]
+    assert updates[0].kas_builtin_id == "str_replace"
+    assert updates[0].diff_content == edit_start.diff_content
+
+    mcp_start = starts[1]
+    assert mcp_start.mcp_server == "kirocrew-core"
+    assert mcp_start.mcp_server_name == "kirocrew-core"
+    assert mcp_start.mcp_tool == "memory_recall"
+    assert mcp_start.acp_kind == "other"
+    assert mcp_start.raw_input == {"query": "architecture"}
+    assert updates[1].mcp_server == "kirocrew-core"
+    assert updates[1].mcp_tool == "memory_recall"
