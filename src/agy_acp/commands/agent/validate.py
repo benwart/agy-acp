@@ -1,12 +1,13 @@
-"""Validate a KiroCrew JSON agent specification file (`agy-acp agent validate --path <path>`)."""
+"""Validate a KiroCrew JSON or Markdown agent specification (`agy-acp agent validate --path`)."""
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
 import anyio
+
+from agy_acp.logic.custom_agents import parse_agent_spec_file
 
 
 async def default(
@@ -14,15 +15,15 @@ async def default(
     *extra_args: str,
     **extra_kwargs: Any,
 ) -> int:
-    """Validate that a KiroCrew agent specification file exists and contains a JSON object."""
+    """Validate that a KiroCrew `.json` or `.md` agent specification file parses cleanly."""
     await anyio.sleep(0)
     _ = (extra_args, extra_kwargs)
     if path is None or not path.is_file():
         print("Agent configuration is invalid: file not found")
         return 1
     try:
-        loaded = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        loaded = parse_agent_spec_file(path)
+    except (OSError, ValueError) as exc:
         print(f"Agent configuration is invalid: {exc}")
         return 1
     if not isinstance(loaded, dict):
