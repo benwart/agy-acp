@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -16,17 +17,35 @@ def _find_server_config(
     server_name: str,
     session_id: str,
 ) -> dict[str, Any] | None:
-    if session_id:
-        session = store.get_session(session_id)
-        if session is not None:
-            for srv in session.get("mcp_servers") or []:
-                if isinstance(srv, dict) and str(srv.get("name") or "") == server_name:
-                    return srv
-    for session in store.list_sessions():
-        for srv in session.get("mcp_servers") or []:
-            if isinstance(srv, dict) and str(srv.get("name") or "") == server_name:
-                return srv
+    normalized_sid = session_id.strip()
+    if not normalized_sid:
+        return None
+    session = store.get_session(normalized_sid)
+    if session is None:
+        return None
+    for srv in session.get("mcp_servers") or []:
+        if isinstance(srv, dict) and str(srv.get("name") or "") == server_name:
+            if bool(srv.get("disabled")) is True:
+                return None
+            return srv
     return None
+
+
+def _merge_server_env(base_env: Mapping[str, str], raw_env: Any) -> dict[str, str]:
+    child_env = dict(base_env)
+    if isinstance(raw_env, Mapping):
+        for k, v in raw_env.items():
+            if v is not None:
+                child_env[str(k)] = str(v)
+    elif isinstance(raw_env, Sequence) and not isinstance(raw_env, (str, bytes)):
+        for item in raw_env:
+            if not isinstance(item, Mapping):
+                continue
+            name = item.get("name")
+            value = item.get("value")
+            if isinstance(name, str) and name and value is not None:
+                child_env[name] = str(value)
+    return child_env
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -37,30 +56,43 @@ def main(argv: list[str] | None = None) -> int:
     parsed = parser.parse_args(argv)
 
     session_id = os.environ.get("AGY_ACP_SESSION_ID", "").strip()
+    if not session_id:
+        print("MCP router error: missing active session identifier", file=sys.stderr)
+        return 1
+
     store = SqliteStateStoreProvider(Path(parsed.db))
     cfg = _find_server_config(store, parsed.server, session_id)
     if cfg is None:
         print(
-            f"MCP server {parsed.server!r} not configured for session {session_id!r}",
+            f"MCP router error: server {parsed.server!r} is not configured or enabled for session",
             file=sys.stderr,
         )
         return 1
 
     command = str(cfg.get("command") or "").strip()
     if not command:
-        print(f"MCP server {parsed.server!r} has no stdio command", file=sys.stderr)
+        print(f"MCP router error: server {parsed.server!r} has no stdio command", file=sys.stderr)
         return 1
 
-    raw_args = cfg.get("args")
-    args = [str(a) for a in raw_args] if isinstance(raw_args, list) else []
-    merged_env = dict(os.environ)
-    raw_env = cfg.get("env")
-    if isinstance(raw_env, dict):
-        for k, v in raw_env.items():
-            if v is not None:
-                merged_env[str(k)] = str(v)
+    raw_cwd = cfg.get("cwd")
+    if isinstance(raw_cwd, str) and raw_cwd.strip():
+        cwd_path = Path(raw_cwd.strip())
+        if not cwd_path.is_dir():
+            print(
+                "MCP router error: configured server working directory is invalid", file=sys.stderr
+            )
+            return 1
+        os.chdir(cwd_path)
 
-    os.execvpe(command, [command, *args], merged_env)
+    raw_args = cfg.get("args")
+    cmd_args = (
+        [str(a) for a in raw_args]
+        if isinstance(raw_args, Sequence) and not isinstance(raw_args, (str, bytes))
+        else []
+    )
+    child_env = _merge_server_env(os.environ, cfg.get("env"))
+
+    os.execvpe(command, [command, *cmd_args], child_env)
     return 0
 
 
