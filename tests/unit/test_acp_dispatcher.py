@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -1151,3 +1152,510 @@ async def test_session_prompt_emits_kiro_subagent_list_update_notifications() ->
             ],
         },
     ]
+
+
+async def test_kas_v3_initialize_session_new_set_mode_load_replay_and_reset_server(
+    tmp_path: Path,
+) -> None:
+    """Verify KAS v3 initialize, session/new, set_mode, load replay, and resetServer."""
+    import sys
+
+    from agy_acp.logic.wire import V3KasWireAdapter
+
+    mcp_stub = tmp_path / "mcp_v3_stub.py"
+    mcp_stub.write_text(
+        "import json, sys\n"
+        "tag = sys.argv[1] if len(sys.argv) > 1 else 'v1'\n"
+        "for raw in sys.stdin:\n"
+        "    msg = json.loads(raw)\n"
+        "    mid = msg.get('id')\n"
+        "    method = msg.get('method')\n"
+        "    if method == 'initialize':\n"
+        "        print(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': {"
+        "'protocolVersion': '2025-03-26', 'capabilities': {'tools': {}}, "
+        "'serverInfo': {'name': 'stub', 'version': '1.0'}}}), flush=True)\n"
+        "    elif method == 'tools/list':\n"
+        "        print(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': {'tools': ["
+        "{'name': f'spawn_run_{tag}', 'description': 'Spawn'}]}}), flush=True)\n",
+        encoding="utf-8",
+    )
+
+    emitted: list[dict[str, Any]] = []
+
+    async def _sink(msg: dict[str, Any]) -> None:
+        emitted.append(msg)
+
+    adapter = V3KasWireAdapter()
+    cli = _StubAgyCliProvider(save_dir=tmp_path)
+    mgr = SessionManager(save_dir=tmp_path, cli_provider=cli, wire_adapter=adapter)
+    dispatcher = AcpDispatcher(
+        notification_sink=_sink,
+        session_manager=mgr,
+        quota_tracker=QuotaTracker(
+            provider=QuotaProvider(cli_provider=cli),
+            state_store=cli.state_store,
+        ),
+        wire_adapter=adapter,
+    )
+
+    init_resp = await dispatcher.handle_message(
+        json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+    )
+    assert init_resp is not None
+    assert init_resp["result"]["protocolVersion"] == 1
+    kiro_caps = init_resp["result"]["agentCapabilities"]["_meta"]["kiro"]
+    assert kiro_caps["extensionMethods"] == [
+        "_kiro/session/compact",
+        "_kiro/session/delete",
+        "_kiro/mcp/resetServer",
+    ]
+    assert kiro_caps["checkpoints"] is False
+
+    new_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/new",
+                "params": {
+                    "cwd": str(tmp_path),
+                    "mcpServers": [
+                        {
+                            "name": "kirocrew-core",
+                            "command": sys.executable,
+                            "args": [str(mcp_stub), "initial"],
+                        }
+                    ],
+                    "_meta": {
+                        "kiro": {
+                            "customAgents": [
+                                {
+                                    "id": "kirocrew",
+                                    "name": "KiroCrew",
+                                    "prompt": "Crew prompt",
+                                    "tools": ["*"],
+                                }
+                            ]
+                        }
+                    },
+                },
+            }
+        )
+    )
+    assert new_resp is not None
+    sid = new_resp["result"]["sessionId"]
+    post_new = dispatcher.pop_post_response_notifications()
+    assert [n["method"] for n in post_new] == ["_kiro/mcp/status", "_kiro/tools/didChange"]
+    assert post_new[0]["params"]["servers"][0]["tools"][0]["name"] == "spawn_run_initial"
+
+    emitted.clear()
+    mode_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "session/set_mode",
+                "params": {"sessionId": sid, "modeId": "kirocrew"},
+            }
+        )
+    )
+    assert mode_resp is not None and mode_resp["result"] == {}
+    assert all(n["method"] != "_kiro.dev/agent/switched" for n in emitted)
+    assert any(
+        n.get("params", {}).get("update", {}).get("sessionUpdate") == "current_mode_update"
+        for n in emitted
+    )
+    post_mode = dispatcher.pop_post_response_notifications()
+    assert [n["method"] for n in post_mode] == ["_kiro/mcp/status", "_kiro/tools/didChange"]
+
+    emitted.clear()
+    cfg_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "session/set_config_option",
+                "params": {"sessionId": sid, "configId": "effortLevel", "value": "xhigh"},
+            }
+        )
+    )
+    assert cfg_resp is not None
+    assert "configOptions" in cfg_resp["result"]
+    assert any(
+        n.get("params", {}).get("update", {}).get("sessionUpdate") == "config_option_update"
+        for n in emitted
+    )
+
+    emitted.clear()
+    prompt_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": sid,
+                    "prompt": [{"type": "text", "text": "Hello v3"}],
+                    "_meta": {"kiro": {"reportTtft": True}},
+                },
+            }
+        )
+    )
+    assert prompt_resp is not None
+    assert prompt_resp["result"]["stopReason"] == "end_turn"
+    updates = [n["params"]["update"] for n in emitted if n.get("method") == "session/update"]
+    assert updates[0]["sessionUpdate"] == "session_info_update"
+    assert updates[0]["_meta"]["kiro"]["kind"] == "user_message_id_assigned"
+    msg_chunks = [u for u in updates if u.get("sessionUpdate") == "agent_message_chunk"]
+    assert "ttftMs" in msg_chunks[0]["_meta"]["kiro"]
+    info_kinds = [
+        u["_meta"]["kiro"]["kind"]
+        for u in updates
+        if u.get("sessionUpdate") == "session_info_update"
+    ]
+    assert "context_usage" in info_kinds
+    assert "turn_completion" in info_kinds
+    assert len(mgr.state_store.get_session_turns(sid)) == 1
+
+    # session/close preserves state & turns; session/load replays BEFORE response
+    close_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "session/close",
+                "params": {"sessionId": sid},
+            }
+        )
+    )
+    assert close_resp is not None and close_resp["result"] == {}
+    emitted.clear()
+
+    load_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "session/load",
+                "params": {
+                    "sessionId": sid,
+                    "cwd": str(tmp_path),
+                    "mcpServers": [
+                        {
+                            "name": "kirocrew-core",
+                            "command": sys.executable,
+                            "args": [str(mcp_stub), "reloaded"],
+                        }
+                    ],
+                },
+            }
+        )
+    )
+    assert load_resp is not None and load_resp["result"]["sessionId"] == sid
+    replay_updates = [
+        n["params"]["update"]
+        for n in emitted
+        if n.get("method") == "session/update"
+        and n.get("params", {}).get("update", {}).get("_meta", {}).get("kiro", {}).get("replay")
+        is True
+    ]
+    assert [u["sessionUpdate"] for u in replay_updates] == [
+        "user_message_chunk",
+        "agent_message_chunk",
+    ]
+    post_load = dispatcher.pop_post_response_notifications()
+    assert [n["method"] for n in post_load] == ["_kiro/mcp/status", "_kiro/tools/didChange"]
+    assert post_load[0]["params"]["servers"][0]["tools"][0]["name"] == "spawn_run_reloaded"
+
+    # _kiro/mcp/resetServer re-probes server
+    emitted.clear()
+    reset_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "_kiro/mcp/resetServer",
+                "params": {"sessionId": sid, "serverName": "kirocrew-core"},
+            }
+        )
+    )
+    assert reset_resp is not None and reset_resp["result"] == {}
+    reset_frames = [*emitted, *dispatcher.pop_post_response_notifications()]
+    assert any(n.get("method") == "_kiro/mcp/status" for n in reset_frames)
+
+    # _kiro.dev/commands/execute is refused with -32603 on v3
+    cmd_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "_kiro.dev/commands/execute",
+                "params": {"sessionId": sid, "command": "/quota"},
+            }
+        )
+    )
+    assert cmd_resp is not None and cmd_resp["error"]["code"] == -32603
+
+    # _kiro/session/delete removes session & turns
+    del_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "_kiro/session/delete",
+                "params": {"sessionId": sid},
+            }
+        )
+    )
+    assert del_resp is not None and del_resp["result"] == {}
+    assert mgr.state_store.get_session(sid) is None
+    assert mgr.state_store.get_session_turns(sid) == []
+
+
+async def test_kas_v3_tool_permissions_allow_deny_ask_subagents_steer_and_compact(
+    tmp_path: Path,
+) -> None:
+    """Verify KAS v3 permission evaluator, diff tool calls, subagents, steer, and compact RPC."""
+    from agy_acp.logic.wire import V3KasWireAdapter
+    from agy_acp.providers.agy_cli_provider import ToolCallEvent
+
+    perm_calls: list[dict[str, Any]] = []
+    emitted: list[dict[str, Any]] = []
+    aborted_sessions: list[str] = []
+
+    class _V3TurnStubCli(_StubAgyCliProvider):
+        def abort_active_process(self, session_id: str) -> bool:
+            aborted_sessions.append(session_id)
+            return True
+
+        async def stream_prompt(self, **kwargs: Any) -> PromptOutcome:
+            prompt_str = str(kwargs.get("prompt", ""))
+            if "Summarize our conversation" in prompt_str:
+                return PromptOutcome(
+                    conversation_id="conv-compact",
+                    stop_reason="end_turn",
+                    response="Compacted v3 summary.",
+                    usage={"input_tokens": 20, "output_tokens": 10, "total_tokens": 30},
+                )
+            on_tool_call = kwargs.get("on_tool_call")
+            on_tool_update = kwargs.get("on_tool_update")
+            on_steer_consumed = kwargs.get("on_steer_consumed")
+            on_subagent_list = kwargs.get("on_subagent_list")
+            assert on_tool_call is not None and on_tool_update is not None
+
+            # 1. Auto-allowed MCP tool
+            allowed_mcp = await on_tool_call(
+                ToolCallEvent(
+                    tool_call_id="tc_mcp_allow",
+                    title="@kirocrew-core/spawn_run",
+                    kind="other",
+                    status="in_progress",
+                    raw_input={"tasks": []},
+                    mcp_server="kirocrew-core",
+                    mcp_tool="spawn_run",
+                    kiro_tool_id="mcp_kirocrew-core_spawn_run",
+                )
+            )
+            assert allowed_mcp is True
+
+            # 2. Auto-denied shell tool
+            allowed_deny = await on_tool_call(
+                ToolCallEvent(
+                    tool_call_id="tc_shell_deny",
+                    title="rm -rf /tmp/nope",
+                    kind="execute",
+                    status="in_progress",
+                    raw_input={"CommandLine": "rm -rf /tmp/nope"},
+                    kas_builtin_id="run_command",
+                    command="rm -rf /tmp/nope",
+                )
+            )
+            assert allowed_deny is False
+
+            # 3. Ask edit_file tool with diff content
+            allowed_edit = await on_tool_call(
+                ToolCallEvent(
+                    tool_call_id="tc_edit_ask",
+                    title="Edit app.py",
+                    kind="edit",
+                    status="in_progress",
+                    raw_input={"Path": "app.py"},
+                    kas_builtin_id="str_replace",
+                    locations=[{"path": "app.py"}],
+                    diff_content=[
+                        {"type": "diff", "path": "app.py", "oldText": "a", "newText": "b"}
+                    ],
+                )
+            )
+            assert allowed_edit is True
+            await on_tool_update(
+                ToolCallEvent(
+                    tool_call_id="tc_edit_ask",
+                    title="Edit app.py",
+                    kind="edit",
+                    status="completed",
+                    output="Updated app.py",
+                    kas_builtin_id="str_replace",
+                )
+            )
+
+            if on_steer_consumed is not None:
+                await on_steer_consumed("Focus on tests")
+            if on_subagent_list is not None:
+                await on_subagent_list(
+                    [
+                        {
+                            "sessionId": "sub-99",
+                            "role": "Verifier",
+                            "status": {"type": "running", "message": "working"},
+                        },
+                        {
+                            "sessionId": "sub-99",
+                            "role": "Verifier",
+                            "status": {"type": "completed", "message": ""},
+                        },
+                    ]
+                )
+
+            return PromptOutcome(
+                conversation_id="conv-v3-active",
+                stop_reason="end_turn",
+                response="Completed turn.",
+                usage={"input_tokens": 30, "output_tokens": 15, "total_tokens": 45},
+            )
+
+    async def _sink(msg: dict[str, Any]) -> None:
+        emitted.append(msg)
+
+    async def _rpc_caller(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        assert method == "session/request_permission"
+        perm_calls.append(params)
+        return {"outcome": {"outcome": "selected", "optionId": "allow_once"}}
+
+    adapter = V3KasWireAdapter()
+    cli = _V3TurnStubCli(save_dir=tmp_path)
+    mgr = SessionManager(save_dir=tmp_path, cli_provider=cli, wire_adapter=adapter)
+    dispatcher = AcpDispatcher(
+        notification_sink=_sink,
+        client_rpc_caller=_rpc_caller,
+        session_manager=mgr,
+        quota_tracker=QuotaTracker(
+            provider=QuotaProvider(cli_provider=cli),
+            state_store=cli.state_store,
+        ),
+        wire_adapter=adapter,
+    )
+
+    new_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "session/new",
+                "params": {
+                    "cwd": str(tmp_path),
+                    "mcpServers": [],
+                    "_meta": {
+                        "kiro": {
+                            "customAgents": [
+                                {
+                                    "id": "kirocrew",
+                                    "name": "KiroCrew",
+                                    "prompt": "Mandate body",
+                                    "permissions": {
+                                        "rules": [
+                                            {
+                                                "capability": "mcp",
+                                                "match": ["kirocrew-core/*"],
+                                                "effect": "allow",
+                                            },
+                                            {
+                                                "capability": "shell",
+                                                "match": ["rm -rf *"],
+                                                "effect": "deny",
+                                            },
+                                        ]
+                                    },
+                                }
+                            ]
+                        }
+                    },
+                },
+            }
+        )
+    )
+    assert new_resp is not None
+    sid = new_resp["result"]["sessionId"]
+    dispatcher.pop_post_response_notifications()
+
+    await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/set_mode",
+                "params": {"sessionId": sid, "modeId": "kirocrew"},
+            }
+        )
+    )
+    dispatcher.pop_post_response_notifications()
+    emitted.clear()
+
+    prompt_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "session/prompt",
+                "params": {"sessionId": sid, "prompt": [{"type": "text", "text": "Go"}]},
+            }
+        )
+    )
+    assert prompt_resp is not None
+    assert prompt_resp["result"]["stopReason"] == "end_turn"
+
+    # Only tc_edit_ask prompted client; allow & deny were handled inline!
+    assert len(perm_calls) == 1
+    assert perm_calls[0]["_meta"]["kiro"]["toolId"] == "str_replace"
+    assert "kind" not in perm_calls[0]["toolCall"]
+    assert perm_calls[0]["toolCall"]["content"][0]["type"] == "diff"
+    assert aborted_sessions == [sid]
+
+    updates = [n["params"]["update"] for n in emitted if n.get("method") == "session/update"]
+    subtask_updates = [
+        u
+        for u in updates
+        if u.get("sessionUpdate") == "tool_call_update"
+        and u.get("_meta", {}).get("kiro", {}).get("kind") == "agent-subtask"
+    ]
+    assert [u["status"] for u in subtask_updates] == ["in_progress", "completed"]
+    assert any(
+        u.get("sessionUpdate") == "session_info_update"
+        and u.get("_meta", {}).get("kiro", {}).get("kind") == "steering_injected"
+        for u in updates
+    )
+
+    # _kiro/session/compact RPC
+    emitted.clear()
+    compact_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "_kiro/session/compact",
+                "params": {"sessionId": sid},
+            }
+        )
+    )
+    assert compact_resp is not None
+    assert compact_resp["result"] == {"success": True}
+    compact_kinds = [
+        n["params"]["update"]["_meta"]["kiro"]["kind"]
+        for n in emitted
+        if n.get("method") == "session/update"
+        and n["params"]["update"].get("sessionUpdate") == "session_info_update"
+    ]
+    assert "summarization_started" in compact_kinds
+    assert "summarization_completed" in compact_kinds
+    assert "context_usage" in compact_kinds
+    assert mgr.get_session(sid)["reinjectAgentPrompt"] is True

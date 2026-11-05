@@ -581,7 +581,11 @@ class V3KasWireAdapter(EngineWireAdapter):
             label = str(
                 entry.get("role") or entry.get("sessionName") or entry.get("name") or sub_id
             )
-            raw_status = str(entry.get("status") or "in_progress").lower()
+            status_val = entry.get("status")
+            if isinstance(status_val, Mapping):
+                raw_status = str(status_val.get("type") or "in_progress").lower()
+            else:
+                raw_status = str(status_val or "in_progress").lower()
             mapped_status = status_map.get(raw_status, "in_progress")
             frames.append(
                 {

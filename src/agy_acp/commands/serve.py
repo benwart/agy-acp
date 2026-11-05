@@ -15,6 +15,7 @@ from cyclopts import Parameter
 from agy_acp.logic.acp_dispatcher import AcpDispatcher
 from agy_acp.logic.auth_manager import AuthManager, ensure_kiro_identity_store
 from agy_acp.logic.session_manager import SessionManager
+from agy_acp.logic.wire import create_wire_adapter
 from agy_acp.providers.acp_logger import log_acp_event, snapshot_relevant_env
 
 AGENT_ENGINE_HELP = "Agent engine wire protocol (v2, v3)."
@@ -90,10 +91,12 @@ async def default(
     pending_results: dict[Any, dict[str, Any]] = {}
     next_rpc_seq = 0
 
+    wire_adapter = create_wire_adapter(normalized_engine)
     session_manager = SessionManager(
         save_dir=save_dir,
         default_agent=agent,
         default_model=model,
+        wire_adapter=wire_adapter,
     )
     auth_manager = AuthManager(auth_file=auth_file) if auth_file is not None else None
     dispatcher: AcpDispatcher
@@ -145,6 +148,7 @@ async def default(
         client_rpc_caller=_client_rpc_caller,
         session_manager=session_manager,
         auth_manager=auth_manager,
+        wire_adapter=wire_adapter,
     )
 
     async def _dispatch_line(raw_line: str) -> None:
