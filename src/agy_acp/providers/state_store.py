@@ -115,7 +115,9 @@ class SqliteStateStoreProvider:
         return self._db_path
 
     def _ensure_initialized(self) -> None:
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with contextlib.suppress(OSError):
+            self._db_path.parent.chmod(0o700)
         if not self._db_path.exists():
             fd = os.open(self._db_path, os.O_WRONLY | os.O_CREAT, 0o600)
             os.close(fd)
