@@ -6,8 +6,10 @@ import contextlib
 import json
 import os
 import re
+import signal
 import subprocess
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -21,12 +23,74 @@ from agy_acp.logic.wire.base import McpServerStatus, McpToolDef
 MCP_PROTOCOL_LATEST = "2025-03-26"
 MCP_PROTOCOL_LEGACY = "2024-11-05"
 _MAX_PAGINATION_PAGES = 20
+MAX_HTTP_BYTES = 4 * 1024 * 1024
+MAX_STDIO_CONTENT_LENGTH = 4 * 1024 * 1024
+MAX_STDIO_FRAMES = 256
+MAX_TOOLS_PER_SERVER = 512
+MAX_CONCURRENT_PROBES = 8
+_MAX_HEADER_LINES = 32
+_MAX_ERROR_CHARS = 500
 
 _AUTH_URI_PARAM_RE = re.compile(
     r'(?:authorization_uri|auth_url|oauth_url|resource_metadata)\s*=\s*"([^"]+)"',
     re.IGNORECASE,
 )
 _URL_FALLBACK_RE = re.compile(r"(https?://[^\s\",;>]+)")
+_URL_USERINFO_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)[^\s/@\"']+@")
+_URL_QUERY_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://[^\s?#\"']+)[?#][^\s\"')>\]]*")
+_BEARER_RE = re.compile(r"(?i)(bearer\s+)\S+")
+_SECRET_KV_RE = re.compile(
+    r"(?i)(\b[a-z0-9_-]*(?:token|key|secret|password|passwd|auth)[a-z0-9_-]*\s*=\s*)[^\s&\"',;]+"
+)
+
+
+def _is_safe_http_url(url: str) -> bool:
+    """Return True iff `url` uses `http` or `https` and has a non-empty hostname."""
+    try:
+        parsed = urllib.parse.urlparse(url.strip())
+    except ValueError:
+        return False
+    return parsed.scheme.lower() in {"http", "https"} and bool(parsed.hostname)
+
+
+def sanitize_mcp_error(raw_error: str) -> str:
+    """Scrub URL userinfo, URL query strings, Bearer tokens, and secret assignments from errors."""
+    scrubbed = _URL_USERINFO_RE.sub(r"\1", raw_error)
+    scrubbed = _URL_QUERY_RE.sub(r"\1", scrubbed)
+    scrubbed = _BEARER_RE.sub(r"\1[REDACTED]", scrubbed)
+    scrubbed = _SECRET_KV_RE.sub(r"\1[REDACTED]", scrubbed)
+    if len(scrubbed) > _MAX_ERROR_CHARS:
+        scrubbed = scrubbed[:_MAX_ERROR_CHARS]
+    return scrubbed
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Redirect handler restricting targets strictly to `http://` and `https://` with hostnames."""
+
+    def redirect_request(  # type: ignore[override]
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        resolved = urllib.parse.urljoin(req.full_url, newurl)
+        if not _is_safe_http_url(resolved):
+            raise urllib.error.URLError("Unsafe HTTP redirect target")
+        return super().redirect_request(req, fp, code, msg, headers, resolved)
+
+
+def _build_safe_http_opener() -> urllib.request.OpenerDirector:
+    """Build an HTTP/HTTPS-only opener excluding `FileHandler`, `FTPHandler`, and `DataHandler`."""
+    opener = urllib.request.OpenerDirector()
+    opener.add_handler(urllib.request.HTTPHandler())
+    opener.add_handler(urllib.request.HTTPSHandler())
+    opener.add_handler(urllib.request.HTTPDefaultErrorHandler())
+    opener.add_handler(urllib.request.HTTPErrorProcessor())
+    opener.add_handler(_SafeRedirectHandler())
+    return opener
 
 
 def _extract_version_negotiation(server_cfg: Mapping[str, Any]) -> str:
@@ -78,8 +142,8 @@ def _extract_origin(server_cfg: Mapping[str, Any]) -> AgentOrigin:
 def _extract_auth_url(www_authenticate: str, body_text: str) -> str | None:
     if www_authenticate:
         match = _AUTH_URI_PARAM_RE.search(www_authenticate)
-        if match:
-            return match.group(1)
+        if match and _is_safe_http_url(match.group(1)):
+            return match.group(1).strip()
     if body_text:
         with contextlib.suppress(json.JSONDecodeError):
             parsed = json.loads(body_text)
@@ -92,12 +156,12 @@ def _extract_auth_url(www_authenticate: str, body_text: str) -> str | None:
                     "url",
                 ):
                     val = parsed.get(key)
-                    if isinstance(val, str) and val.startswith(("http://", "https://")):
-                        return val
+                    if isinstance(val, str) and _is_safe_http_url(val):
+                        return val.strip()
     if www_authenticate:
         fallback = _URL_FALLBACK_RE.search(www_authenticate)
-        if fallback:
-            return fallback.group(1)
+        if fallback and _is_safe_http_url(fallback.group(1)):
+            return fallback.group(1).strip()
     return None
 
 
@@ -148,6 +212,9 @@ def _post_mcp_http_sync(
     headers: Mapping[str, str],
     timeout_secs: float,
 ) -> tuple[int, dict[str, str], dict[str, Any] | None]:
+    if not _is_safe_http_url(url):
+        raise ValueError("Unsupported or invalid MCP HTTP URL: expected http:// or https:// host")
+
     req_headers = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
@@ -155,20 +222,30 @@ def _post_mcp_http_sync(
     }
     encoded = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(url, data=encoded, headers=req_headers, method="POST")
+    opener = _build_safe_http_opener()
     try:
-        with urllib.request.urlopen(request, timeout=timeout_secs) as resp:
+        with opener.open(request, timeout=timeout_secs) as resp:
             status_code = int(resp.status)
             resp_headers = {k.lower(): v for k, v in resp.headers.items()}
-            raw_body = resp.read()
+            raw_body = resp.read(MAX_HTTP_BYTES + 1)
+            if len(raw_body) > MAX_HTTP_BYTES:
+                raise ValueError("MCP HTTP response body exceeds maximum allowed size")
             ctype = resp_headers.get("content-type", "application/json")
             parsed = _parse_http_rpc_body(ctype, raw_body)
             return status_code, resp_headers, parsed
     except urllib.error.HTTPError as exc:
         body_bytes = b""
-        with contextlib.suppress(Exception):
-            body_bytes = exc.read()
-        body_text = body_bytes.decode("utf-8", errors="replace")
+        try:
+            body_bytes = exc.read(MAX_HTTP_BYTES + 1)
+        except OSError:
+            body_bytes = b""
+        finally:
+            with contextlib.suppress(Exception):
+                exc.close()
+        if len(body_bytes) > MAX_HTTP_BYTES:
+            raise ValueError("MCP HTTP error response body exceeds maximum allowed size") from exc
         if exc.code in (401, 403):
+            body_text = body_bytes.decode("utf-8", errors="replace")
             www_auth = exc.headers.get("WWW-Authenticate", "") if exc.headers else ""
             auth_url = _extract_auth_url(www_auth, body_text)
             raise _HttpAuthRequiredError(
@@ -176,26 +253,33 @@ def _post_mcp_http_sync(
                 auth_url,
                 f"HTTP {exc.code} {exc.reason}".strip(),
             ) from exc
-        raise RuntimeError(f"HTTP {exc.code} {exc.reason}: {body_text[:200]}".strip()) from exc
+        raise RuntimeError(f"HTTP {exc.code} {exc.reason}".strip()) from exc
 
 
 async def _read_stdio_jsonrpc_response(
     stream: BufferedByteReceiveStream,
     expected_id: int,
 ) -> dict[str, Any]:
-    """Read JSON-RPC frames from stdio until the response matching `expected_id` arrives."""
-    while True:
+    """Read bounded JSON-RPC frames from stdio until the response matching `expected_id` arrives."""
+    for _ in range(MAX_STDIO_FRAMES):
         raw_line = await stream.receive_until(b"\n", 1_048_576)
         line = raw_line.decode("utf-8", errors="replace").strip()
         if not line:
             continue
         if line.lower().startswith("content-length:"):
-            length = int(line.split(":", 1)[1].strip())
+            try:
+                length = int(line.split(":", 1)[1].strip())
+            except ValueError as exc:
+                raise ValueError("Invalid or oversized Content-Length") from exc
+            if length <= 0 or length > MAX_STDIO_CONTENT_LENGTH:
+                raise ValueError("Invalid or oversized Content-Length")
             # Consume blank header separator line (`\r\n` or `\n`)
-            while True:
+            for _ in range(_MAX_HEADER_LINES):
                 sep = await stream.receive_until(b"\n", 4096)
                 if not sep.strip():
                     break
+            else:
+                raise ValueError("Too many header lines in stdio MCP frame")
             body = await stream.receive_exactly(length)
             msg = json.loads(body.decode("utf-8", errors="replace"))
         else:
@@ -205,6 +289,7 @@ async def _read_stdio_jsonrpc_response(
                 continue
         if isinstance(msg, dict) and msg.get("id") == expected_id:
             return msg
+    raise RuntimeError(f"Exceeded {MAX_STDIO_FRAMES} stdio frames waiting for JSON-RPC response")
 
 
 class McpCatalogProber:
@@ -220,19 +305,21 @@ class McpCatalogProber:
         session_env: Mapping[str, str] | None = None,
         cwd: str | None = None,
     ) -> list[McpServerStatus]:
-        """Probe all declared MCP servers concurrently and return ordered `McpServerStatus`."""
+        """Probe all declared MCP servers concurrently (capped) and return ordered statuses."""
         normalized_list = self._normalize_server_declarations(servers)
         if not normalized_list:
             return []
 
         results: list[McpServerStatus | None] = [None] * len(normalized_list)
+        limiter = anyio.CapacityLimiter(MAX_CONCURRENT_PROBES)
 
         async def _run_one(idx: int, cfg: dict[str, Any]) -> None:
-            results[idx] = await self.probe_server(
-                cfg,
-                session_env=session_env,
-                cwd=cwd,
-            )
+            async with limiter:
+                results[idx] = await self.probe_server(
+                    cfg,
+                    session_env=session_env,
+                    cwd=cwd,
+                )
 
         async with anyio.create_task_group() as tg:
             for index, server_cfg in enumerate(normalized_list):
@@ -322,7 +409,7 @@ class McpCatalogProber:
                 status="authRequired",
                 auth_url=auth_err.auth_url,
                 failed_authorization=True,
-                error=auth_err.detail,
+                error=sanitize_mcp_error(auth_err.detail),
                 origin=origin,
             )
         except Exception as exc:  # noqa: BLE001 - prober must contain all transport errors
@@ -330,7 +417,7 @@ class McpCatalogProber:
                 name=name,
                 display_name=display_name,
                 status="failed",
-                error=str(exc) or type(exc).__name__,
+                error=sanitize_mcp_error(str(exc) or type(exc).__name__),
                 origin=origin,
             )
 
@@ -368,9 +455,10 @@ class McpCatalogProber:
                     [command, *args],
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
                     env=merged_env,
                     cwd=effective_cwd,
+                    start_new_session=True,
                 )
                 assert proc.stdin is not None
                 assert proc.stdout is not None
@@ -418,6 +506,9 @@ class McpCatalogProber:
                     if not isinstance(result, Mapping):
                         break
                     discovered.extend(self._parse_tool_items(result.get("tools"), disabled_tools))
+                    if len(discovered) >= MAX_TOOLS_PER_SERVER:
+                        discovered = discovered[:MAX_TOOLS_PER_SERVER]
+                        break
                     next_cursor = result.get("nextCursor")
                     if not isinstance(next_cursor, str) or not next_cursor:
                         break
@@ -433,7 +524,10 @@ class McpCatalogProber:
         finally:
             if proc is not None:
                 with anyio.CancelScope(shield=True):
-                    with contextlib.suppress(ProcessLookupError, OSError):
+                    if hasattr(os, "killpg") and proc.pid:
+                        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                            os.killpg(proc.pid, signal.SIGKILL)
+                    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
                         proc.kill()
                     with contextlib.suppress(Exception):
                         await proc.wait()
@@ -447,6 +541,9 @@ class McpCatalogProber:
         server_cfg: Mapping[str, Any],
         origin: AgentOrigin,
     ) -> McpServerStatus:
+        if not _is_safe_http_url(url):
+            raise ValueError("Unsupported or invalid MCP HTTP URL: expected http:// or https://")
+
         headers = _normalize_kv_pairs(server_cfg.get("headers"))
         proto_version = _extract_version_negotiation(server_cfg)
         disabled_tools = _extract_disabled_tools(server_cfg)
@@ -517,6 +614,9 @@ class McpCatalogProber:
                 if not isinstance(result, Mapping):
                     break
                 discovered.extend(self._parse_tool_items(result.get("tools"), disabled_tools))
+                if len(discovered) >= MAX_TOOLS_PER_SERVER:
+                    discovered = discovered[:MAX_TOOLS_PER_SERVER]
+                    break
                 next_cursor = result.get("nextCursor")
                 if not isinstance(next_cursor, str) or not next_cursor:
                     break

@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 from agy_acp.logic.mcp_catalog_prober import McpCatalogProber
 
@@ -246,3 +251,175 @@ async def test_http_sse_and_oauth_401_probing() -> None:
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+async def test_http_scheme_validation_redirect_ssrf_auth_url_and_error_scrubbing(
+    tmp_path: Path,
+) -> None:
+    """Verify HIGH-02 scheme/redirect/authUrl defenses and MEDIUM-01 error secret scrubbing."""
+    secret_file = tmp_path / "secret.json"
+    secret_file.write_text('{"secret": "DO_NOT_READ"}', encoding="utf-8")
+
+    class _EvilHttpHandler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+            _ = (format, args)
+
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length > 0:
+                _ = self.rfile.read(length)
+            if self.path.startswith("/redirect-file"):
+                self.send_response(302)
+                self.send_header("Location", secret_file.as_uri())
+                self.end_headers()
+                return
+            if self.path.startswith("/bad-oauth-js"):
+                self.send_response(401)
+                self.send_header(
+                    "WWW-Authenticate",
+                    'Bearer authorization_uri="javascript:alert(document.cookie)"',
+                )
+                self.end_headers()
+                self.wfile.write(b'{"authorization_url": "file:///etc/passwd"}')
+                return
+            if self.path.startswith("/error-500"):
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"Internal leak: Bearer SUPER_SECRET_BEARER_999 token=RAW_TOK_1")
+                return
+
+    httpd = HTTPServer(("127.0.0.1", 0), _EvilHttpHandler)
+    port = httpd.server_port
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        prober = McpCatalogProber(timeout_secs=5.0)
+        statuses = await prober.probe_servers(
+            [
+                {"name": "file-srv", "url": secret_file.as_uri()},
+                {"name": "ftp-srv", "url": "ftp://example.com/mcp"},
+                {"name": "redirect-srv", "url": f"http://127.0.0.1:{port}/redirect-file"},
+                {"name": "bad-oauth", "url": f"http://127.0.0.1:{port}/bad-oauth-js"},
+                {
+                    "name": "err-500",
+                    "url": f"http://user:TOP_PASS@127.0.0.1:{port}/error-500?api_key=Q_SECRET_77",
+                },
+            ]
+        )
+        by_name = {s.name: s for s in statuses}
+
+        assert by_name["file-srv"].status == "failed"
+        assert "DO_NOT_READ" not in (by_name["file-srv"].error or "")
+
+        assert by_name["ftp-srv"].status == "failed"
+
+        assert by_name["redirect-srv"].status == "failed"
+        assert "DO_NOT_READ" not in (by_name["redirect-srv"].error or "")
+
+        assert by_name["bad-oauth"].status == "authRequired"
+        assert by_name["bad-oauth"].auth_url is None
+
+        err_srv = by_name["err-500"]
+        assert err_srv.status == "failed"
+        assert err_srv.error is not None
+        assert "SUPER_SECRET_BEARER_999" not in err_srv.error
+        assert "RAW_TOK_1" not in err_srv.error
+        assert "TOP_PASS" not in err_srv.error
+        assert "Q_SECRET_77" not in err_srv.error
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+async def test_stdio_oversized_content_length_process_group_cleanup_and_error_scrubbing(
+    tmp_path: Path,
+) -> None:
+    """Verify HIGH-03 oversized Content-Length rejection, pgid kill, and query secret scrubbing."""
+    oversized_script = tmp_path / "oversized_mcp.py"
+    oversized_script.write_text(
+        "import sys\n"
+        "_ = sys.stdin.readline()\n"
+        "sys.stdout.write('Content-Length: 999999999\\r\\n\\r\\n')\n"
+        "sys.stdout.flush()\n",
+        encoding="utf-8",
+    )
+
+    grandchild_pid_file = tmp_path / "grandchild.pid"
+    wrapper_script = tmp_path / "wrapper_mcp.py"
+    wrapper_script.write_text(
+        "import subprocess, sys, time\n"
+        "from pathlib import Path\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        f"Path({str(grandchild_pid_file)!r}).write_text(str(child.pid), encoding='utf-8')\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+
+    noisy_err_script = tmp_path / "noisy_err.py"
+    noisy_err_script.write_text(
+        "import json, sys\n"
+        "msg = json.loads(sys.stdin.readline())\n"
+        "err = {\n"
+        "    'jsonrpc': '2.0',\n"
+        "    'id': msg['id'],\n"
+        "    'error': {\n"
+        "        'code': -32000,\n"
+        "        'message': 'Upstream https://admin:PW123@api.internal/v1?token=TOK999 '\n"
+        "                   'Bearer SECRET_JWT_ABC secret=MY_SEC_42',\n"
+        "    },\n"
+        "}\n"
+        "sys.stdout.write(json.dumps(err) + '\\n')\n"
+        "sys.stdout.flush()\n",
+        encoding="utf-8",
+    )
+
+    prober = McpCatalogProber(timeout_secs=0.4)
+    statuses = await prober.probe_servers(
+        [
+            {
+                "name": "oversized-srv",
+                "command": sys.executable,
+                "args": ["-u", str(oversized_script)],
+            },
+            {
+                "name": "wrapper-srv",
+                "command": sys.executable,
+                "args": ["-u", str(wrapper_script)],
+            },
+            {
+                "name": "noisy-err-srv",
+                "command": sys.executable,
+                "args": ["-u", str(noisy_err_script)],
+            },
+        ]
+    )
+    by_name = {s.name: s for s in statuses}
+
+    assert by_name["oversized-srv"].status == "failed"
+    assert "content-length" in (by_name["oversized-srv"].error or "").lower()
+
+    assert by_name["wrapper-srv"].status == "failed"
+    assert grandchild_pid_file.is_file()
+    grandchild_pid = int(grandchild_pid_file.read_text(encoding="utf-8").strip())
+    # Give OS process table brief moment to reap/clear killed grandchild
+    deadline = time.monotonic() + 2.0
+    alive = True
+    while time.monotonic() < deadline:
+        try:
+            os.kill(grandchild_pid, 0)
+        except ProcessLookupError:
+            alive = False
+            break
+        time.sleep(0.05)
+    if alive:
+        with pytest.raises(ProcessLookupError):
+            os.kill(grandchild_pid, signal.SIGKILL)
+        pytest.fail(f"Orphan grandchild process {grandchild_pid} was not killed with process group")
+
+    noisy_err = by_name["noisy-err-srv"].error or ""
+    assert by_name["noisy-err-srv"].status == "failed"
+    assert "PW123" not in noisy_err
+    assert "TOK999" not in noisy_err
+    assert "SECRET_JWT_ABC" not in noisy_err
+    assert "MY_SEC_42" not in noisy_err
