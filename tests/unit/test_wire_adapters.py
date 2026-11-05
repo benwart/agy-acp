@@ -379,7 +379,7 @@ def test_turn_start_ttft_telemetry_steering_compaction_and_subagents() -> None:
         }
     ]
 
-    # First-chunk TTFT & replay stamping
+    # First-chunk TTFT & replay stamping (no non-standard ttftMs sibling key)
     v3_chunk = v3.build_agent_message_chunk(
         "sess-1",
         "Hello",
@@ -387,11 +387,35 @@ def test_turn_start_ttft_telemetry_steering_compaction_and_subagents() -> None:
         first_chunk_emitted_at_ms=1_700_000_000_250,
     )
     chunk_kiro = v3_chunk["params"]["update"]["_meta"]["kiro"]
-    assert chunk_kiro["ttft"] == {
-        "promptReceivedAt": 1_700_000_000_000,
-        "firstChunkEmittedAt": 1_700_000_000_250,
+    assert chunk_kiro == {
+        "ttft": {
+            "promptReceivedAt": 1_700_000_000_000,
+            "firstChunkEmittedAt": 1_700_000_000_250,
+        }
     }
-    assert chunk_kiro["ttftMs"] == 250
+    assert "ttftMs" not in chunk_kiro
+
+    v3_thought = v3.build_agent_thought_chunk(
+        "sess-1",
+        "Thinking...",
+        prompt_received_at_ms=1_700_000_000_000,
+        first_chunk_emitted_at_ms=1_700_000_000_120,
+    )
+    assert v3_thought["params"]["update"]["_meta"]["kiro"] == {
+        "ttft": {
+            "promptReceivedAt": 1_700_000_000_000,
+            "firstChunkEmittedAt": 1_700_000_000_120,
+        }
+    }
+
+    # Negative delta (clock skew / invalid order) omits ttft
+    skew_chunk = v3.build_agent_message_chunk(
+        "sess-1",
+        "Skew",
+        prompt_received_at_ms=1_700_000_000_500,
+        first_chunk_emitted_at_ms=1_700_000_000_250,
+    )
+    assert "_meta" not in skew_chunk["params"]["update"]
 
     replay_chunk = v3.build_agent_message_chunk("sess-1", "Old turn", replay=True)
     assert replay_chunk["params"]["update"]["_meta"]["kiro"]["replay"] is True
@@ -417,13 +441,23 @@ def test_turn_start_ttft_telemetry_steering_compaction_and_subagents() -> None:
         "session/update",
         "session/update",
         "session/update",
-        "_kiro.dev/metadata",
-        "_kiro.dev/error/rate_limit",
     ]
-    assert v3_tel[1]["params"]["update"]["_meta"]["kiro"] == {
-        "kind": "context_usage",
-        "usagePercentage": 20.0,
+    assert all(not f["method"].startswith("_kiro.dev/") for f in v3_tel)
+    assert v3_tel[0]["params"]["update"] == {
+        "sessionUpdate": "session_info_update",
+        "_meta": {
+            "kiro": {
+                "kind": "context_usage",
+                "usagePercentage": 20.0,
+            }
+        },
     }
+    assert v3_tel[1]["params"]["update"] == {
+        "sessionUpdate": "usage_update",
+        "used": 40_000,
+        "size": 200_000,
+    }
+    assert "cost" not in v3_tel[1]["params"]["update"]
     assert v3_tel[2]["params"]["update"]["_meta"]["kiro"] == {
         "kind": "turn_completion",
         "promptTurnSummaries": [{"unit": "credit", "usage": 1.25}],
@@ -518,3 +552,39 @@ def test_normalize_agy_tool_event_mappings() -> None:
     assert mcp_ev.mcp_server == "kirocrew-core"
     assert mcp_ev.mcp_tool == "memory_recall"
     assert mcp_ev.raw_input == {"query": "kas"}
+
+    # Longest-prefix known_mcp_servers disambiguation for underscore server names
+    underscored_ev = normalize_agy_tool_event(
+        tool_call_id="tc-3",
+        step_name="mcp_my_sql_db_run_query",
+        title="",
+        raw_input={"sql": "SELECT 1"},
+        known_mcp_servers=("my", "my_sql_db", "my_sql"),
+    )
+    assert underscored_ev.is_mcp is True
+    assert underscored_ev.mcp_server == "my_sql_db"
+    assert underscored_ev.mcp_tool == "run_query"
+    assert underscored_ev.title == "@my_sql_db/run_query"
+
+    # Fallback when known_mcp_servers is empty or unmatched
+    fallback_ev = normalize_agy_tool_event(
+        tool_call_id="tc-4",
+        step_name="mcp_github_create_issue",
+        title="",
+        raw_input={"title": "Bug"},
+        known_mcp_servers=("gitlab",),
+    )
+    assert fallback_ev.is_mcp is True
+    assert fallback_ev.mcp_server == "github"
+    assert fallback_ev.mcp_tool == "create_issue"
+
+    # EngineWireAdapter.normalize_tool_event static helper alias
+    via_adapter = V3KasWireAdapter.normalize_tool_event(
+        tool_call_id="tc-5",
+        step_name="mcp_corp_auth_verify_token",
+        title="",
+        known_mcp_servers=["corp_auth"],
+    )
+    assert via_adapter.is_mcp is True
+    assert via_adapter.mcp_server == "corp_auth"
+    assert via_adapter.mcp_tool == "verify_token"

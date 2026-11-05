@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -126,6 +126,23 @@ class WireTurnTelemetry:
     turn_id: str = ""
 
 
+def _split_mcp_step_name(
+    remainder: str,
+    known_mcp_servers: Collection[str],
+) -> tuple[str, str] | None:
+    """Split `<server>_<tool>` matching the longest configured server prefix first."""
+    for candidate in sorted((str(s) for s in known_mcp_servers if s), key=len, reverse=True):
+        prefix = f"{candidate}_"
+        if remainder.startswith(prefix):
+            tool_part = remainder[len(prefix) :]
+            if tool_part:
+                return candidate, tool_part
+    srv, sep, tool = remainder.partition("_")
+    if sep and srv and tool:
+        return srv, tool
+    return None
+
+
 def normalize_agy_tool_event(
     *,
     tool_call_id: str,
@@ -136,6 +153,7 @@ def normalize_agy_tool_event(
     locations: Sequence[dict[str, Any]] = (),
     content: Sequence[dict[str, Any]] = (),
     agent_subtask_id: str = "",
+    known_mcp_servers: Collection[str] = (),
 ) -> NormalizedToolEvent:
     """Normalize an Antigravity CLI tool step into a `NormalizedToolEvent`."""
     args = dict(raw_input) if isinstance(raw_input, Mapping) else {}
@@ -161,9 +179,9 @@ def normalize_agy_tool_event(
         )
 
     if lower_step.startswith("mcp_"):
-        remainder = lower_step[len("mcp_") :]
-        if "_" in remainder:
-            srv, tool = remainder.split("_", 1)
+        split_pair = _split_mcp_step_name(lower_step[len("mcp_") :], known_mcp_servers)
+        if split_pair is not None:
+            srv, tool = split_pair
             return NormalizedToolEvent(
                 tool_call_id=tool_call_id,
                 title=title or f"@{srv}/{tool}",
@@ -248,6 +266,32 @@ class EngineWireAdapter(ABC):
     def build_permission_options() -> list[dict[str, str]]:
         """Return deep-copied explicit ACP permission options (`allow_once`, etc.)."""
         return [dict(opt) for opt in PERMISSION_OPTIONS]
+
+    @staticmethod
+    def normalize_tool_event(
+        *,
+        tool_call_id: str,
+        step_name: str,
+        title: str,
+        raw_input: Mapping[str, Any] | None = None,
+        status: str = "in_progress",
+        locations: Sequence[dict[str, Any]] = (),
+        content: Sequence[dict[str, Any]] = (),
+        agent_subtask_id: str = "",
+        known_mcp_servers: Collection[str] = (),
+    ) -> NormalizedToolEvent:
+        """Normalize an Antigravity CLI tool step into a `NormalizedToolEvent`."""
+        return normalize_agy_tool_event(
+            tool_call_id=tool_call_id,
+            step_name=step_name,
+            title=title,
+            raw_input=raw_input,
+            status=status,
+            locations=locations,
+            content=content,
+            agent_subtask_id=agent_subtask_id,
+            known_mcp_servers=known_mcp_servers,
+        )
 
     def build_initialize_result(
         self,
@@ -432,6 +476,8 @@ class EngineWireAdapter(ABC):
         session_id: str,
         thought: str,
         *,
+        prompt_received_at_ms: int | None = None,
+        first_chunk_emitted_at_ms: int | None = None,
         agent_subtask_id: str = "",
         replay: bool = False,
     ) -> dict[str, Any]:
@@ -441,6 +487,16 @@ class EngineWireAdapter(ABC):
             "content": {"type": "text", "text": thought},
         }
         kiro_meta: dict[str, Any] = {}
+        if (
+            self.engine_id == "v3"
+            and prompt_received_at_ms is not None
+            and first_chunk_emitted_at_ms is not None
+            and first_chunk_emitted_at_ms >= prompt_received_at_ms
+        ):
+            kiro_meta["ttft"] = {
+                "promptReceivedAt": int(prompt_received_at_ms),
+                "firstChunkEmittedAt": int(first_chunk_emitted_at_ms),
+            }
         if agent_subtask_id:
             kiro_meta["agentSubtaskId"] = agent_subtask_id
         if replay:

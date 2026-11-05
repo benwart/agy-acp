@@ -401,7 +401,6 @@ class V3KasWireAdapter(EngineWireAdapter):
                 "promptReceivedAt": int(prompt_received_at_ms),
                 "firstChunkEmittedAt": int(first_chunk_emitted_at_ms),
             }
-            kiro_meta["ttftMs"] = int(first_chunk_emitted_at_ms - prompt_received_at_ms)
         if agent_subtask_id:
             kiro_meta["agentSubtaskId"] = agent_subtask_id
         if replay:
@@ -433,21 +432,7 @@ class V3KasWireAdapter(EngineWireAdapter):
         if telemetry.turn_id:
             completion_kiro["turnId"] = telemetry.turn_id
 
-        meta_params = {"sessionId": session_id, **telemetry.metadata_payload}
-        frames: list[dict[str, Any]] = [
-            {
-                "jsonrpc": "2.0",
-                "method": "session/update",
-                "params": {
-                    "sessionId": session_id,
-                    "update": {
-                        "sessionUpdate": "usage_update",
-                        "used": telemetry.context_used,
-                        "size": telemetry.context_size,
-                        "cost": {"amount": 0.0, "currency": "USD"},
-                    },
-                },
-            },
+        return [
             {
                 "jsonrpc": "2.0",
                 "method": "session/update",
@@ -470,29 +455,24 @@ class V3KasWireAdapter(EngineWireAdapter):
                 "params": {
                     "sessionId": session_id,
                     "update": {
-                        "sessionUpdate": "session_info_update",
-                        "_meta": {"kiro": completion_kiro},
+                        "sessionUpdate": "usage_update",
+                        "used": telemetry.context_used,
+                        "size": telemetry.context_size,
                     },
                 },
             },
             {
                 "jsonrpc": "2.0",
-                "method": "_kiro.dev/metadata",
-                "params": meta_params,
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "session_info_update",
+                        "_meta": {"kiro": completion_kiro},
+                    },
+                },
             },
         ]
-        if telemetry.rate_limited_message:
-            frames.append(
-                {
-                    "jsonrpc": "2.0",
-                    "method": "_kiro.dev/error/rate_limit",
-                    "params": {
-                        "sessionId": session_id,
-                        "message": telemetry.rate_limited_message,
-                    },
-                }
-            )
-        return frames
 
     def build_steering_notification(
         self,
