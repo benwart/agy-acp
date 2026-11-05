@@ -194,10 +194,24 @@ async def test_session_manager_kirocrew_spawn_agent_and_agent_modes(tmp_path: Pa
 
 
 async def test_skill_view_agent_mcp_sync_and_pinned_model_on_set_mode(tmp_path: Path) -> None:
-    """Verify default_agent and set_mode sync agent-spec MCP servers and pinned model."""
+    """Verify default_agent and set_mode sync user-scope agent MCP servers and pinned model."""
     import json
 
-    agents_dir = tmp_path / ".kiro" / "agents"
+    # Untrusted project-scope .kiro/agents MUST NOT inject mcpServers
+    proj_agents_dir = tmp_path / ".kiro" / "agents"
+    proj_agents_dir.mkdir(parents=True)
+    (proj_agents_dir / "untrusted-proj.json").write_text(
+        json.dumps(
+            {
+                "name": "untrusted-proj",
+                "mcpServers": {"evil-proj-mcp": {"command": "echo", "args": ["pwn"]}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Trusted user-scope .kiro_user_agents supplies mcpServers cleanly
+    agents_dir = tmp_path / ".kiro_user_agents"
     agents_dir.mkdir(parents=True)
     (agents_dir / "kirocrew-skill-view-111.json").write_text(
         json.dumps(
@@ -236,7 +250,11 @@ async def test_skill_view_agent_mcp_sync_and_pinned_model_on_set_mode(tmp_path: 
     mcp_cfg = json.loads((tmp_path / "mcp_config.json").read_text(encoding="utf-8"))
     assert "crew-core" in mcp_cfg["mcpServers"]
     assert "legacy-srv" in mcp_cfg["mcpServers"]
+    assert "evil-proj-mcp" not in mcp_cfg["mcpServers"]
     assert [s["name"] for s in mgr.get_session(sid)["mcp_servers"]] == ["crew-core", "legacy-srv"]
+
+    await mgr.set_mode(session_id=sid, mode_id="untrusted-proj")
+    assert mgr.get_session(sid)["mcp_servers"] == []
 
     await mgr.set_mode(session_id=sid, mode_id="kirocrew-skill-view-222")
     session_after = mgr.get_session(sid)
@@ -252,7 +270,7 @@ async def test_skill_view_agent_mcp_sync_and_pinned_model_on_set_mode(tmp_path: 
 
 
 async def test_format_steer_message_and_markdown_local_images(tmp_path: Path) -> None:
-    """Verify markdown image links in prompts/steers are staged to temp dir with view_file hint."""
+    """Verify markdown image links inside cwd are staged to 0700 dir while escapes are blocked."""
     from agy_acp.logic.session_manager import _format_prompt_blocks, _format_steer_message
 
     uploads_dir = tmp_path / "uploads"
@@ -264,7 +282,12 @@ async def test_format_steer_message_and_markdown_local_images(tmp_path: Path) ->
     raw_steer = (
         f"<user_message>\n![image]({img_file})\n\nHere are the errors from the IDE\n</user_message>"
     )
-    formatted, staged_files = _format_steer_message(raw_steer)
+    priv_img_dir = tmp_path / "priv_images"
+    formatted, staged_files = _format_steer_message(
+        raw_steer,
+        cwd=str(tmp_path),
+        image_dir=priv_img_dir,
+    )
     try:
         assert "<user_message>" not in formatted
         assert "</user_message>" not in formatted
@@ -273,6 +296,7 @@ async def test_format_steer_message_and_markdown_local_images(tmp_path: Path) ->
         staged_path = staged_files[0]
         assert staged_path.is_file()
         assert staged_path.read_bytes() == png_bytes
+        assert (priv_img_dir.stat().st_mode & 0o777) == 0o700
         assert (staged_path.stat().st_mode & 0o777) == 0o600
         assert (
             f"[User attached an image: {staged_path} — inspect it with view_file if needed]"
@@ -282,9 +306,11 @@ async def test_format_steer_message_and_markdown_local_images(tmp_path: Path) ->
         for f in staged_files:
             f.unlink(missing_ok=True)
 
-    # Also verify _format_prompt_blocks extracts markdown local images from text blocks
+    # Also verify _format_prompt_blocks extracts markdown local images inside cwd
     prompt_text, prompt_files = _format_prompt_blocks(
-        [{"type": "text", "text": f"Check this screenshot: ![screenshot]({img_file})"}]
+        [{"type": "text", "text": f"Check this screenshot: ![screenshot]({img_file})"}],
+        cwd=str(tmp_path),
+        image_dir=priv_img_dir,
     )
     try:
         assert len(prompt_files) == 1
@@ -296,6 +322,24 @@ async def test_format_steer_message_and_markdown_local_images(tmp_path: Path) ->
     finally:
         for f in prompt_files:
             f.unlink(missing_ok=True)
+
+    # Markdown image outside cwd or without cwd MUST NOT be staged
+    outside_img = tmp_path.parent / f"outside_{tmp_path.name}.png"
+    outside_img.write_bytes(png_bytes)
+    try:
+        _, no_cwd_files = _format_prompt_blocks(
+            [{"type": "text", "text": f"![x]({img_file})"}],
+            image_dir=priv_img_dir,
+        )
+        assert no_cwd_files == []
+        _, escaped_files = _format_prompt_blocks(
+            [{"type": "text", "text": f"![x]({outside_img})"}],
+            cwd=str(tmp_path),
+            image_dir=priv_img_dir,
+        )
+        assert escaped_files == []
+    finally:
+        outside_img.unlink(missing_ok=True)
 
 
 async def test_prompt_isolates_per_session_mcp_token_and_injects_spawn_run_routing(
@@ -654,3 +698,156 @@ async def test_concurrent_sessions_mcp_shim_isolation_and_prober(tmp_path: Path)
     mcp_cfg = json.loads((tmp_path / "mcp_config.json").read_text(encoding="utf-8"))
     mux_entry = mcp_cfg["mcpServers"]["shared-shim"]
     assert "mcp_session_mux" in " ".join(mux_entry["args"])
+
+
+async def test_wave5b_session_manager_security_and_lifecycle(tmp_path: Path) -> None:
+    """Verify Wave 5B SessionManager fixes: tools=[], unshadowing, locks, mid-turn, delete MCP."""
+    import json
+    from typing import Any
+
+    from agy_acp.logic.wire import V3KasWireAdapter
+    from agy_acp.providers.agy_cli_provider import AgyCliProvider, PromptOutcome
+
+    turn_started = anyio.Event()
+    allow_finish = anyio.Event()
+    observed_skip_perms: list[bool | None] = []
+    active_count = 0
+    max_concurrent = 0
+
+    class _LockStubCli(AgyCliProvider):
+        async def stream_prompt(self, **kwargs: Any) -> PromptOutcome:
+            nonlocal active_count, max_concurrent
+            observed_skip_perms.append(kwargs.get("skip_permissions"))
+            active_count += 1
+            max_concurrent = max(max_concurrent, active_count)
+            turn_started.set()
+            await allow_finish.wait()
+            active_count -= 1
+            return PromptOutcome(
+                conversation_id="conv-locked-1",
+                stop_reason="end_turn",
+                response="ok",
+                usage={"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
+            )
+
+    cli = _LockStubCli(save_dir=tmp_path)
+    mgr = SessionManager(
+        save_dir=tmp_path,
+        cli_provider=cli,
+        wire_adapter=V3KasWireAdapter(),
+        default_agent="fallback-bundled",
+    )
+
+    # 1. CRITICAL-02: prompt() on unknown sessionId raises KeyError
+    with pytest.raises(KeyError):
+        await mgr.prompt(
+            session_id="non-existent-session",
+            prompt_blocks=[{"type": "text", "text": "hi"}],
+        )
+
+    # 2. Custom agent named "auto" is NOT shadowed; tools=[] sets agentReadOnly=True;
+    #    switching to virtual agent with spec=None clears stale agentPermissions/agentAllowedTools
+    meta = {
+        "kiro": {
+            "customAgents": [
+                {
+                    "id": "auto",
+                    "name": "Custom Auto Agent",
+                    "prompt": "You are custom auto.",
+                    "tools": [],
+                    "allowedTools": ["@srv/t"],
+                    "permissions": {"rules": [{"capability": "fs_read", "effect": "allow"}]},
+                }
+            ]
+        }
+    }
+    s1 = await mgr.create_session(
+        cwd=str(tmp_path),
+        mcp_servers=[
+            {"name": "exclusive-s1", "command": "echo", "args": ["1"]},
+            {"name": "shared-srv", "command": "echo", "args": ["shared"]},
+        ],
+        meta=meta,
+    )
+    s2 = await mgr.create_session(
+        cwd=str(tmp_path),
+        mcp_servers=[{"name": "shared-srv", "command": "echo", "args": ["shared"]}],
+    )
+    sid1 = s1["sessionId"]
+    sid2 = s2["sessionId"]
+
+    await mgr.set_mode(session_id=sid1, mode_id="auto")
+    st_auto = mgr.get_session(sid1)
+    assert st_auto["agent"] == "auto"
+    assert st_auto["agentPrompt"] == "You are custom auto."
+    assert st_auto["agentTools"] == []
+    assert st_auto["agentReadOnly"] is True
+    assert st_auto["agentPermissions"] is not None
+
+    # Switching to virtual default_agent (spec is None) clears stale permissions/tools/prompt
+    await mgr.set_mode(session_id=sid1, mode_id="fallback-bundled")
+    st_cleared = mgr.get_session(sid1)
+    assert st_cleared["agent"] == "fallback-bundled"
+    assert st_cleared["agentPrompt"] is None
+    assert st_cleared["agentTools"] is None
+    assert st_cleared["agentAllowedTools"] == []
+    assert st_cleared["agentPermissions"] is None
+    assert st_cleared["agentReadOnly"] is False
+
+    # Re-activate tools=[] custom agent and verify skip_permissions=False, empty steer rejected,
+    # per-session lock serialization, and mid-turn set_model preservation
+    await mgr.set_mode(session_id=sid1, mode_id="auto")
+
+    async def _turn_a() -> None:
+        await mgr.prompt(session_id=sid1, prompt_blocks=[{"type": "text", "text": "t1"}])
+
+    async def _turn_b() -> None:
+        await turn_started.wait()
+        await mgr.prompt(session_id=sid1, prompt_blocks=[{"type": "text", "text": "t2"}])
+
+    cli._active_turns.add(sid1)
+    assert await mgr.steer(session_id=sid1, message="<user_message>   \n  </user_message>") is False
+    cli._active_turns.discard(sid1)
+
+    with anyio.fail_after(5.0):
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(_turn_a)
+            tg.start_soon(_turn_b)
+            await turn_started.wait()
+            await anyio.sleep(0.02)
+            # Mutate model mid-turn; prompt completion must NOT clobber it!
+            await mgr.set_model(session_id=sid1, model_id="claude-sonnet-4-6")
+            allow_finish.set()
+
+    assert max_concurrent == 1
+    assert observed_skip_perms == [False, False]
+    after_turns = mgr.get_session(sid1)
+    assert after_turns["model"] == "claude-sonnet-4-6"
+    assert after_turns["agyConversationId"] == "conv-locked-1"
+
+    # 3. Mid-turn session deletion MUST NOT resurrect the deleted session row
+    turn_started = anyio.Event()
+    allow_finish = anyio.Event()
+
+    async def _turn_deleted() -> None:
+        await mgr.prompt(session_id=sid2, prompt_blocks=[{"type": "text", "text": "bye"}])
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(_turn_deleted)
+        await turn_started.wait()
+        mgr.state_store.delete_session(sid2)
+        allow_finish.set()
+
+    assert mgr.state_store.get_session(sid2) is None
+
+    # 4. close_session(delete_persisted=True) removes exclusive MCP servers from mcp_config.json
+    # Re-create s2 holding shared-srv, then delete s1: exclusive-s1 removed, shared-srv retained
+    s2_new = await mgr.create_session(
+        cwd=str(tmp_path),
+        mcp_servers=[{"name": "shared-srv", "command": "echo", "args": ["shared"]}],
+    )
+    _ = s2_new
+    await mgr.close_session(session_id=sid1, delete_persisted=True)
+    mcp_cfg = json.loads((tmp_path / "mcp_config.json").read_text(encoding="utf-8"))
+    assert "exclusive-s1" not in mcp_cfg["mcpServers"]
+    assert "shared-srv" in mcp_cfg["mcpServers"]

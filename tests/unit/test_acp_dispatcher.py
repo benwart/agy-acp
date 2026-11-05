@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -24,9 +24,10 @@ class _StubAgyCliProvider(AgyCliProvider):
         command: str,
         *,
         cwd: str | None = None,
+        session_id: str | None = None,
         timeout: float = 30.0,
     ) -> dict[str, Any]:
-        _ = (cwd, timeout)
+        _ = (cwd, session_id, timeout)
         if command.lstrip("/") == "usage":
             return {
                 "conversation_id": "",
@@ -80,6 +81,7 @@ class _StubAgyCliProvider(AgyCliProvider):
         skip_permissions: bool | None = None,
         sandbox: bool = False,
         env: dict[str, str] | None = None,
+        known_mcp_servers: Sequence[str] = (),
         on_thought: Callable[[str], Awaitable[None]] | None = None,
         on_text: Callable[[str], Awaitable[None]] | None = None,
         on_tool_call: Callable[[ToolCallEvent], Awaitable[bool]] | None = None,
@@ -97,6 +99,7 @@ class _StubAgyCliProvider(AgyCliProvider):
             skip_permissions,
             sandbox,
             env,
+            known_mcp_servers,
             on_usage,
             on_steer_consumed,
             on_subagent_list,
@@ -195,13 +198,27 @@ async def test_prompt_streams_chunks_and_usage() -> None:
         emitted.append(msg)
 
     dispatcher = _make_dispatcher(notification_sink=_sink)
+    new_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "session/new",
+                "params": {"cwd": "/tmp", "mcpServers": []},
+            }
+        )
+    )
+    assert new_resp is not None
+    sid = new_resp["result"]["sessionId"]
+    emitted.clear()
+
     resp = await dispatcher.handle_message(
         json.dumps(
             {
                 "jsonrpc": "2.0",
                 "id": 2,
                 "method": "session/prompt",
-                "params": {"sessionId": "s" * 36, "prompt": [{"type": "text", "text": "hi"}]},
+                "params": {"sessionId": sid, "prompt": [{"type": "text", "text": "hi"}]},
             }
         )
     )
@@ -229,7 +246,7 @@ async def test_prompt_streams_chunks_and_usage() -> None:
                 "jsonrpc": "2.0",
                 "id": 3,
                 "method": "session/prompt",
-                "params": {"sessionId": "s" * 36, "prompt": [{"type": "text", "text": "/quota"}]},
+                "params": {"sessionId": sid, "prompt": [{"type": "text", "text": "/quota"}]},
             }
         )
     )
@@ -259,13 +276,27 @@ async def test_tool_permission_request_allow_and_reject() -> None:
         return {"outcome": {"outcome": "selected", "optionId": selected_option}}
 
     dispatcher = _make_dispatcher(notification_sink=_sink, client_rpc_caller=_caller)
+    new_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/new",
+                "params": {"cwd": "/tmp", "mcpServers": []},
+            }
+        )
+    )
+    assert new_resp is not None
+    sid = new_resp["result"]["sessionId"]
+    emitted.clear()
+
     resp = await dispatcher.handle_message(
         json.dumps(
             {
                 "jsonrpc": "2.0",
                 "id": 3,
                 "method": "session/prompt",
-                "params": {"sessionId": "s" * 36, "prompt": [{"type": "text", "text": "tool"}]},
+                "params": {"sessionId": sid, "prompt": [{"type": "text", "text": "tool"}]},
             }
         )
     )
@@ -299,7 +330,7 @@ async def test_tool_permission_request_allow_and_reject() -> None:
                 "jsonrpc": "2.0",
                 "id": 4,
                 "method": "session/prompt",
-                "params": {"sessionId": "s" * 36, "prompt": [{"type": "text", "text": "tool"}]},
+                "params": {"sessionId": sid, "prompt": [{"type": "text", "text": "tool"}]},
             }
         )
     )
@@ -349,7 +380,19 @@ async def test_acp_dispatcher_logs_incoming_outgoing_and_unhandled_messages(
             }
         )
     )
-    assert unhandled_resp is None
+    assert unhandled_resp is not None
+    assert unhandled_resp["error"]["code"] == -32601
+
+    unhandled_notif = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "_kiro.dev/unknown_notif",
+                "params": {"foo": "baz"},
+            }
+        )
+    )
+    assert unhandled_notif is None
 
     assert log_file.exists()
     entries = [
@@ -721,7 +764,7 @@ async def test_kirocrew_0111_mcp_init_agent_switched_and_commands_inventory(
     tmp_path: Any,
 ) -> None:
     """Verify KiroCrew 0.11.1 MCP init frames, agent/switched, and /mcp + /tools inventory."""
-    agents_dir = tmp_path / ".kiro" / "agents"
+    agents_dir = tmp_path / ".kiro_user_agents"
     agents_dir.mkdir(parents=True)
     (agents_dir / "kirocrew-skill-view-a.json").write_text(
         json.dumps(
@@ -1296,7 +1339,7 @@ async def test_kas_v3_initialize_session_new_set_mode_load_replay_and_reset_serv
                 "params": {
                     "sessionId": sid,
                     "prompt": [{"type": "text", "text": "Hello v3"}],
-                    "_meta": {"kiro": {"reportTtft": True}},
+                    "_meta": {"kiro": {"ttft": True}},
                 },
             }
         )
@@ -1306,8 +1349,13 @@ async def test_kas_v3_initialize_session_new_set_mode_load_replay_and_reset_serv
     updates = [n["params"]["update"] for n in emitted if n.get("method") == "session/update"]
     assert updates[0]["sessionUpdate"] == "session_info_update"
     assert updates[0]["_meta"]["kiro"]["kind"] == "user_message_id_assigned"
-    msg_chunks = [u for u in updates if u.get("sessionUpdate") == "agent_message_chunk"]
-    assert "ttftMs" in msg_chunks[0]["_meta"]["kiro"]
+    displayed_chunks = [
+        u
+        for u in updates
+        if u.get("sessionUpdate") in {"agent_thought_chunk", "agent_message_chunk"}
+    ]
+    assert "ttftMs" in displayed_chunks[0]["_meta"]["kiro"]
+    assert displayed_chunks[0]["_meta"]["kiro"]["ttft"]["promptReceivedAt"] >= 1_700_000_000_000
     info_kinds = [
         u["_meta"]["kiro"]["kind"]
         for u in updates
@@ -1659,3 +1707,720 @@ async def test_kas_v3_tool_permissions_allow_deny_ask_subagents_steer_and_compac
     assert "summarization_completed" in compact_kinds
     assert "context_usage" in compact_kinds
     assert mgr.get_session(sid)["reinjectAgentPrompt"] is True
+
+
+async def test_wave5b_reset_server_emits_full_snapshot_without_reprobing_peers(
+    tmp_path: Path,
+) -> None:
+    """Verify `_kiro/mcp/resetServer` re-probes only target server and emits full roster."""
+    import sys
+
+    from agy_acp.logic.wire import V3KasWireAdapter
+
+    counts_dir = tmp_path / "counts"
+    counts_dir.mkdir()
+    probe_script = tmp_path / "probe_counter_mcp.py"
+    probe_script.write_text(
+        "import json, pathlib, sys\n"
+        "name = sys.argv[1]\n"
+        "cfile = pathlib.Path(sys.argv[2]) / f'{name}.count'\n"
+        "n = int(cfile.read_text()) + 1 if cfile.exists() else 1\n"
+        "cfile.write_text(str(n))\n"
+        "for raw in sys.stdin:\n"
+        "    msg = json.loads(raw)\n"
+        "    mid = msg.get('id')\n"
+        "    method = msg.get('method')\n"
+        "    if method == 'initialize':\n"
+        "        print(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': {"
+        "'protocolVersion': '2025-03-26', 'capabilities': {'tools': {}}, "
+        "'serverInfo': {'name': name, 'version': '1.0'}}}), flush=True)\n"
+        "    elif method == 'tools/list':\n"
+        "        print(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': {'tools': ["
+        "{'name': f'{name}_tool_v{n}', 'description': 'd'}]}}), flush=True)\n",
+        encoding="utf-8",
+    )
+
+    emitted: list[dict[str, Any]] = []
+
+    async def _sink(msg: dict[str, Any]) -> None:
+        emitted.append(msg)
+
+    adapter = V3KasWireAdapter()
+    cli = _StubAgyCliProvider(save_dir=tmp_path)
+    mgr = SessionManager(save_dir=tmp_path, cli_provider=cli, wire_adapter=adapter)
+    dispatcher = AcpDispatcher(
+        notification_sink=_sink,
+        session_manager=mgr,
+        quota_tracker=QuotaTracker(
+            provider=QuotaProvider(cli_provider=cli),
+            state_store=cli.state_store,
+        ),
+        wire_adapter=adapter,
+    )
+
+    server_names = ["srv_alpha", "srv_beta_under", "srv_gamma"]
+    new_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "session/new",
+                "params": {
+                    "cwd": str(tmp_path),
+                    "mcpServers": [
+                        {
+                            "name": sname,
+                            "command": sys.executable,
+                            "args": [str(probe_script), sname, str(counts_dir)],
+                        }
+                        for sname in server_names
+                    ],
+                },
+            }
+        )
+    )
+    assert new_resp is not None
+    sid = new_resp["result"]["sessionId"]
+    post_new = dispatcher.pop_post_response_notifications()
+    assert [s["name"] for s in post_new[0]["params"]["servers"]] == server_names
+    assert [int((counts_dir / f"{s}.count").read_text()) for s in server_names] == [1, 1, 1]
+
+    emitted.clear()
+    reset_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "_kiro/mcp/resetServer",
+                "params": {"sessionId": sid, "serverName": "srv_beta_under"},
+            }
+        )
+    )
+    assert reset_resp == {"jsonrpc": "2.0", "id": 2, "result": {}}
+    # Only srv_beta_under was re-probed; peers stayed at count 1!
+    assert [int((counts_dir / f"{s}.count").read_text()) for s in server_names] == [1, 2, 1]
+    status_frame = next(n for n in emitted if n.get("method") == "_kiro/mcp/status")
+    did_change_frame = next(n for n in emitted if n.get("method") == "_kiro/tools/didChange")
+    assert [s["name"] for s in status_frame["params"]["servers"]] == server_names
+    tools_by_srv = {s["name"]: s["tools"][0]["name"] for s in status_frame["params"]["servers"]}
+    assert tools_by_srv == {
+        "srv_alpha": "srv_alpha_tool_v1",
+        "srv_beta_under": "srv_beta_under_tool_v2",
+        "srv_gamma": "srv_gamma_tool_v1",
+    }
+    emitted_tags = {t["tag"] for t in did_change_frame["params"]["tags"]}
+    assert {
+        "@srv_alpha/srv_alpha_tool_v1",
+        "@srv_beta_under/srv_beta_under_tool_v2",
+        "@srv_gamma/srv_gamma_tool_v1",
+    }.issubset(emitted_tags)
+
+
+async def test_wave5b_strict_permission_evaluation_v2_v3_and_mcp_longest_prefix(
+    tmp_path: Path,
+) -> None:
+    """Verify strict fail-closed permission order, path normalization, and MCP prefix on v2/v3."""
+    from agy_acp.logic.wire import V2KiroWireAdapter, V3KasWireAdapter
+
+    aborted: list[str] = []
+    recorded_results: list[bool] = []
+
+    class _PermStubCli(_StubAgyCliProvider):
+        def abort_active_process(self, session_id: str) -> bool:
+            aborted.append(session_id)
+            return True
+
+        async def stream_prompt(self, **kwargs: Any) -> PromptOutcome:
+            on_tool_call = kwargs.get("on_tool_call")
+            assert on_tool_call is not None
+            prompt_tag = str(kwargs.get("prompt") or "")
+            if "EMPTY_TOOLS" in prompt_tag:
+                recorded_results.append(
+                    await on_tool_call(
+                        ToolCallEvent(
+                            tool_call_id="tc_empty_1",
+                            title="Read file",
+                            kind="read",
+                            status="in_progress",
+                            kas_builtin_id="read_file",
+                            raw_input={"Path": str(tmp_path / "README.md")},
+                        )
+                    )
+                )
+            elif "POLICY_MATRIX" in prompt_tag:
+                # 1. fs_write allowed via allowedTools: ["fs_write"] inside src/
+                recorded_results.append(
+                    await on_tool_call(
+                        ToolCallEvent(
+                            tool_call_id="tc_write_ok",
+                            title="Write file",
+                            kind="edit",
+                            status="in_progress",
+                            kas_builtin_id="fs_write",
+                            v2_tool_name="fs_write",
+                            raw_input={"Path": str(tmp_path / "src" / "main.py")},
+                        )
+                    )
+                )
+                # 2. delete_file MUST NOT match allowedTools: ["fs_write"] -> headless ask -> False
+                recorded_results.append(
+                    await on_tool_call(
+                        ToolCallEvent(
+                            tool_call_id="tc_del_block",
+                            title="Delete file",
+                            kind="delete",
+                            status="in_progress",
+                            kas_builtin_id="delete_file",
+                            v2_tool_name="fs_write",
+                            raw_input={"Path": str(tmp_path / "src" / "old.py")},
+                        )
+                    )
+                )
+                # 3. permissions deny on src/secret.py beats allowedTools: ["fs_write"]!
+                recorded_results.append(
+                    await on_tool_call(
+                        ToolCallEvent(
+                            tool_call_id="tc_perm_deny_beats_allow",
+                            title="Write secret",
+                            kind="edit",
+                            status="in_progress",
+                            kas_builtin_id="fs_write",
+                            v2_tool_name="fs_write",
+                            raw_input={"Path": "src/sub/../secret.py"},
+                        )
+                    )
+                )
+                # 4. read_file with exclude: ["secrets/**"] on secrets/key.pem -> ask -> False
+                recorded_results.append(
+                    await on_tool_call(
+                        ToolCallEvent(
+                            tool_call_id="tc_exclude_secret",
+                            title="Read secret",
+                            kind="read",
+                            status="in_progress",
+                            kas_builtin_id="read_file",
+                            v2_tool_name="fs_read",
+                            raw_input={"Path": str(tmp_path / "secrets" / "key.pem")},
+                        )
+                    )
+                )
+                # 5. read_file on src/ok.py -> permissions allow -> True
+                recorded_results.append(
+                    await on_tool_call(
+                        ToolCallEvent(
+                            tool_call_id="tc_read_ok",
+                            title="Read ok",
+                            kind="read",
+                            status="in_progress",
+                            kas_builtin_id="read_file",
+                            v2_tool_name="fs_read",
+                            raw_input={"Path": str(tmp_path / "src" / "ok.py")},
+                        )
+                    )
+                )
+                # 6. Bare MCP tool name "spawn_run" MUST NOT match @my_under_srv/spawn_run
+                recorded_results.append(
+                    await on_tool_call(
+                        ToolCallEvent(
+                            tool_call_id="tc_mcp_bare_block",
+                            title="mcp_my_under_srv_spawn_run",
+                            kind="other",
+                            status="in_progress",
+                            kiro_tool_id="mcp_my_under_srv_spawn_run",
+                            mcp_server="my",
+                            mcp_tool="under_srv_spawn_run",
+                        )
+                    )
+                )
+                # 7. Longest MCP server prefix resolves my_under_srv + run_safe
+                recorded_results.append(
+                    await on_tool_call(
+                        ToolCallEvent(
+                            tool_call_id="tc_mcp_longest_ok",
+                            title="mcp_my_under_srv_run_safe",
+                            kind="other",
+                            status="in_progress",
+                            kiro_tool_id="mcp_my_under_srv_run_safe",
+                            mcp_server="my",
+                            mcp_tool="under_srv_run_safe",
+                        )
+                    )
+                )
+            return PromptOutcome(
+                conversation_id="conv-perm-1",
+                stop_reason="end_turn",
+                response="ok",
+                usage={"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
+            )
+
+    for adapter in (V2KiroWireAdapter(), V3KasWireAdapter()):
+        recorded_results.clear()
+        aborted.clear()
+        sub_dir = tmp_path / adapter.engine_id
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        cli = _PermStubCli(save_dir=sub_dir)
+        mgr = SessionManager(save_dir=sub_dir, cli_provider=cli, wire_adapter=adapter)
+        # Note: client_rpc_caller=None verifies headless fail-closed (`ask` -> False)!
+        dispatcher = AcpDispatcher(
+            session_manager=mgr,
+            quota_tracker=QuotaTracker(
+                provider=QuotaProvider(cli_provider=cli),
+                state_store=cli.state_store,
+            ),
+            wire_adapter=adapter,
+        )
+        new_resp = await dispatcher.handle_message(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "session/new",
+                    "params": {
+                        "cwd": str(tmp_path),
+                        "mcpServers": [
+                            {"name": "my", "url": "http://127.0.0.1:9991/mcp"},
+                            {"name": "my_under_srv", "url": "http://127.0.0.1:9992/mcp"},
+                        ],
+                        "_meta": {
+                            "kiro": {
+                                "customAgents": [
+                                    {
+                                        "id": "locked-down",
+                                        "name": "Locked Down",
+                                        "tools": [],
+                                        "allowedTools": ["*"],
+                                    },
+                                    {
+                                        "id": "matrix-agent",
+                                        "name": "Matrix Agent",
+                                        "tools": [
+                                            "fs_read",
+                                            "fs_write",
+                                            "@my_under_srv",
+                                        ],
+                                        "allowedTools": [
+                                            "fs_write",
+                                            "spawn_run",
+                                            "@my_under_srv/run_safe",
+                                        ],
+                                        "permissions": {
+                                            "rules": [
+                                                {
+                                                    "capability": "fs_write",
+                                                    "match": ["src/secret.py"],
+                                                    "effect": "deny",
+                                                },
+                                                {
+                                                    "capability": "fs_read",
+                                                    "match": ["**"],
+                                                    "exclude": ["secrets/**"],
+                                                    "effect": "allow",
+                                                },
+                                            ]
+                                        },
+                                    },
+                                ]
+                            }
+                        },
+                    },
+                }
+            )
+        )
+        assert new_resp is not None
+        sid = new_resp["result"]["sessionId"]
+        dispatcher.pop_post_response_notifications()
+
+        await dispatcher.handle_message(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "session/set_mode",
+                    "params": {"sessionId": sid, "modeId": "locked-down"},
+                }
+            )
+        )
+        dispatcher.pop_post_response_notifications()
+        await dispatcher.handle_message(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "session/prompt",
+                    "params": {
+                        "sessionId": sid,
+                        "prompt": [{"type": "text", "text": "EMPTY_TOOLS"}],
+                    },
+                }
+            )
+        )
+        assert recorded_results == [False]
+        assert len(aborted) == 1
+
+        recorded_results.clear()
+        aborted.clear()
+        await dispatcher.handle_message(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "session/set_mode",
+                    "params": {"sessionId": sid, "modeId": "matrix-agent"},
+                }
+            )
+        )
+        dispatcher.pop_post_response_notifications()
+        await dispatcher.handle_message(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "session/prompt",
+                    "params": {
+                        "sessionId": sid,
+                        "prompt": [{"type": "text", "text": "POLICY_MATRIX"}],
+                    },
+                }
+            )
+        )
+        assert recorded_results == [True, False, False, False, True, False, True]
+        assert len(aborted) == 4
+
+
+async def test_wave5b_turn1_credit_baseline_ttft_gating_context_breakdown_and_eviction(
+    tmp_path: Path,
+) -> None:
+    """Verify Turn-1 delta_credits baseline, epoch-ms ttft gating, contextBreakdown, & eviction."""
+    from agy_acp.logic.wire import V3KasWireAdapter
+
+    usage_calls = 0
+    current_credits = 500
+
+    class _TelemetryStubCli(_StubAgyCliProvider):
+        async def run_slash_command(
+            self,
+            command: str,
+            *,
+            cwd: str | None = None,
+            session_id: str | None = None,
+            timeout: float = 30.0,
+        ) -> dict[str, Any]:
+            nonlocal usage_calls
+            _ = (cwd, session_id, timeout)
+            if command.lstrip("/") == "usage":
+                usage_calls += 1
+                return {
+                    "conversation_id": "",
+                    "status": "SUCCESS",
+                    "command": {
+                        "name": "usage",
+                        "data": {
+                            "groups": [
+                                {
+                                    "name": "Gemini Models",
+                                    "buckets": [
+                                        {
+                                            "id": "g5",
+                                            "name": "5h",
+                                            "window": "5h",
+                                            "remaining_fraction": 1.0,
+                                            "reset_time": "2026-12-01T00:00:00Z",
+                                        },
+                                        {
+                                            "id": "g7",
+                                            "name": "7d",
+                                            "window": "weekly",
+                                            "remaining_fraction": 1.0,
+                                            "reset_time": "2026-12-05T00:00:00Z",
+                                        },
+                                    ],
+                                }
+                            ]
+                        },
+                    },
+                }
+            return {
+                "conversation_id": "",
+                "status": "SUCCESS",
+                "command": {
+                    "name": "credits",
+                    "data": {"remaining_credits": current_credits, "upgrade_uri": ""},
+                },
+            }
+
+        async def stream_prompt(self, **kwargs: Any) -> PromptOutcome:
+            nonlocal current_credits
+            current_credits -= 2
+            on_thought = kwargs.get("on_thought")
+            on_text = kwargs.get("on_text")
+            if on_thought is not None:
+                await on_thought("Thinking first...")
+            if on_text is not None:
+                await on_text("Answer text.")
+            return PromptOutcome(
+                conversation_id="conv-tel-1",
+                stop_reason="end_turn",
+                response="Answer text.",
+                usage={"input_tokens": 10, "output_tokens": 4, "context_tokens": 1200},
+            )
+
+    emitted: list[dict[str, Any]] = []
+
+    async def _sink(msg: dict[str, Any]) -> None:
+        emitted.append(msg)
+
+    adapter = V3KasWireAdapter()
+    cli = _TelemetryStubCli(save_dir=tmp_path)
+    mgr = SessionManager(save_dir=tmp_path, cli_provider=cli, wire_adapter=adapter)
+    qt = QuotaTracker(provider=QuotaProvider(cli_provider=cli), state_store=cli.state_store)
+    dispatcher = AcpDispatcher(
+        notification_sink=_sink,
+        session_manager=mgr,
+        quota_tracker=qt,
+        wire_adapter=adapter,
+    )
+
+    new_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "session/new",
+                "params": {
+                    "cwd": str(tmp_path),
+                    "mcpServers": [],
+                    "_meta": {
+                        "kiro": {
+                            "customAgents": [
+                                {
+                                    "id": "sys-agent",
+                                    "name": "Sys Agent",
+                                    "prompt": "System prompt 24 chars!!",
+                                }
+                            ]
+                        }
+                    },
+                },
+            }
+        )
+    )
+    assert new_resp is not None
+    sid = new_resp["result"]["sessionId"]
+    dispatcher.pop_post_response_notifications()
+
+    await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/set_mode",
+                "params": {"sessionId": sid, "modeId": "sys-agent"},
+            }
+        )
+    )
+    dispatcher.pop_post_response_notifications()
+    emitted.clear()
+    usage_calls = 0
+
+    # Turn 1: no ttft requested, no contextBreakdown requested -> Turn 1 delta_credits == 2.0!
+    await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": sid,
+                    "prompt": [{"type": "text", "text": "Hello"}],
+                },
+            }
+        )
+    )
+    # 1 usage fetch in seed_session_baseline + 1 usage fetch in build_turn_telemetry = 2 total
+    assert usage_calls == 2
+    updates_t1 = [n["params"]["update"] for n in emitted if n.get("method") == "session/update"]
+    for u in updates_t1:
+        if u.get("sessionUpdate") in {"agent_thought_chunk", "agent_message_chunk"}:
+            assert "ttft" not in u.get("_meta", {}).get("kiro", {})
+            assert "ttftMs" not in u.get("_meta", {}).get("kiro", {})
+    completion_t1 = next(
+        u["_meta"]["kiro"]
+        for u in updates_t1
+        if u.get("sessionUpdate") == "session_info_update"
+        and u.get("_meta", {}).get("kiro", {}).get("kind") == "turn_completion"
+    )
+    assert completion_t1["promptTurnSummaries"] == [{"unit": "credit", "usage": 2.0}]
+    assert "contextBreakdown" not in completion_t1
+
+    # Turn 2: ttft=True + contextBreakdown="summary" -> single /usage & epoch-ms ttft on thought!
+    emitted.clear()
+    usage_calls = 0
+    await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": sid,
+                    "prompt": [{"type": "text", "text": "12345"}],
+                    "_meta": {"kiro": {"ttft": True, "contextBreakdown": "summary"}},
+                },
+            }
+        )
+    )
+    assert usage_calls == 1
+    updates_t2 = [n["params"]["update"] for n in emitted if n.get("method") == "session/update"]
+    thought_chunk = next(u for u in updates_t2 if u.get("sessionUpdate") == "agent_thought_chunk")
+    msg_chunk = next(u for u in updates_t2 if u.get("sessionUpdate") == "agent_message_chunk")
+    assert thought_chunk["_meta"]["kiro"]["ttft"]["promptReceivedAt"] >= 1_700_000_000_000
+    assert thought_chunk["_meta"]["kiro"]["ttftMs"] >= 0
+    assert "ttft" not in msg_chunk.get("_meta", {}).get("kiro", {})
+    completion_t2 = next(
+        u["_meta"]["kiro"]
+        for u in updates_t2
+        if u.get("sessionUpdate") == "session_info_update"
+        and u.get("_meta", {}).get("kiro", {}).get("kind") == "turn_completion"
+    )
+    cb = completion_t2["contextBreakdown"]
+    assert cb == {
+        "schema": 1,
+        "totalChars": len("System prompt 24 chars!!") + len("12345") + len("Answer text."),
+        "modelCalls": 1,
+        "categories": {
+            "system": {"chars": len("System prompt 24 chars!!")},
+            "history": {"chars": len("12345") + len("Answer text.")},
+        },
+    }
+
+    # Delete session evicts QuotaTracker tracking
+    assert qt.get_session_context_tokens(sid) == 1200
+    await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "_kiro/session/delete",
+                "params": {"sessionId": sid},
+            }
+        )
+    )
+    assert sid not in qt._session_context_tokens
+    assert sid not in qt._last_session_effective_credits
+
+
+async def test_wave5b_jsonrpc_input_validation_and_concurrent_post_notifications(
+    tmp_path: Path,
+) -> None:
+    """Verify strict JSON-RPC validation (-32600..-32002) and task-local post-notifications."""
+    import anyio
+
+    from agy_acp.logic.wire import V3KasWireAdapter
+
+    adapter = V3KasWireAdapter()
+    cli = _StubAgyCliProvider(save_dir=tmp_path)
+    mgr = SessionManager(save_dir=tmp_path, cli_provider=cli, wire_adapter=adapter)
+    dispatcher = AcpDispatcher(
+        session_manager=mgr,
+        quota_tracker=QuotaTracker(
+            provider=QuotaProvider(cli_provider=cli),
+            state_store=cli.state_store,
+        ),
+        wire_adapter=adapter,
+    )
+
+    for bad_frame in ("[]", "null", "123", '"hello"'):
+        r = await dispatcher.handle_message(bad_frame)
+        assert r is not None and r["error"]["code"] == -32600
+
+    # Invalid params type
+    r_params = await dispatcher.handle_message(
+        json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": [1, 2]})
+    )
+    assert r_params is not None and r_params["error"]["code"] == -32602
+
+    # Invalid protocolVersion values
+    for bad_pv in (True, False, 0, -1, "2025-01-01"):
+        r_pv = await dispatcher.handle_message(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "initialize",
+                    "params": {"protocolVersion": bad_pv},
+                }
+            )
+        )
+        assert r_pv is not None and r_pv["error"]["code"] == -32602
+
+    # Missing / non-str / whitespace required string params -> -32602
+    invalid_param_calls = [
+        ("session/new", {"cwd": ""}),
+        ("session/new", {"cwd": None}),
+        ("session/new", {"cwd": True}),
+        ("session/load", {"sessionId": None, "cwd": "/tmp"}),
+        ("session/set_mode", {"sessionId": "sid-1", "modeId": "   "}),
+        ("session/set_model", {"sessionId": True, "modelId": "gemini-3.8-flash"}),
+        ("session/set_config_option", {"sessionId": "sid-1", "configId": "", "value": "high"}),
+        ("session/prompt", {"sessionId": "sid-1", "prompt": "not-a-list"}),
+        ("_kiro/mcp/resetServer", {"sessionId": "sid-1", "serverName": ""}),
+        ("_session/steer", {"sessionId": "sid-1", "message": "   "}),
+        ("session/close", {"sessionId": 123}),
+        ("_kiro/session/delete", {"sessionId": None}),
+    ]
+    for idx, (method, bad_p) in enumerate(invalid_param_calls, start=10):
+        resp = await dispatcher.handle_message(
+            json.dumps({"jsonrpc": "2.0", "id": idx, "method": method, "params": bad_p})
+        )
+        assert resp is not None, f"Expected error response for {method} {bad_p}"
+        assert resp["error"]["code"] == -32602, f"Expected -32602 for {method} {bad_p}, got {resp}"
+
+    # Non-existent session -> -32002 across all session-bound handlers
+    missing_sid_calls = [
+        ("session/prompt", {"sessionId": "missing-sid", "prompt": [{"type": "text", "text": "x"}]}),
+        ("session/set_mode", {"sessionId": "missing-sid", "modeId": "auto"}),
+        ("session/set_model", {"sessionId": "missing-sid", "modelId": "gemini-3.8-flash"}),
+        (
+            "session/set_config_option",
+            {"sessionId": "missing-sid", "configId": "effortLevel", "value": "high"},
+        ),
+        ("_kiro/session/compact", {"sessionId": "missing-sid"}),
+        ("_kiro/mcp/resetServer", {"sessionId": "missing-sid", "serverName": "srv"}),
+        ("_session/steer", {"sessionId": "missing-sid", "message": "hi"}),
+        ("session/close", {"sessionId": "missing-sid"}),
+        ("_kiro/session/delete", {"sessionId": "missing-sid"}),
+    ]
+    for idx, (method, miss_p) in enumerate(missing_sid_calls, start=50):
+        resp = await dispatcher.handle_message(
+            json.dumps({"jsonrpc": "2.0", "id": idx, "method": method, "params": miss_p})
+        )
+        assert resp is not None
+        assert resp["error"]["code"] == -32002, f"Expected -32002 for {method}, got {resp}"
+
+    # Concurrent session/new calls isolate pop_post_response_notifications per task!
+    captured: dict[int, tuple[str, list[dict[str, Any]]]] = {}
+
+    async def _worker(req_id: int) -> None:
+        r = await dispatcher.handle_message(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "method": "session/new",
+                    "params": {"cwd": str(tmp_path), "mcpServers": []},
+                }
+            )
+        )
+        await anyio.sleep(0.01)
+        assert r is not None
+        sid_local = r["result"]["sessionId"]
+        captured[req_id] = (sid_local, dispatcher.pop_post_response_notifications())
+
+    async with anyio.create_task_group() as tg:
+        for req_id in (101, 102, 103, 104):
+            tg.start_soon(_worker, req_id)
+
+    for req_id in (101, 102, 103, 104):
+        sid_local, post_frames = captured[req_id]
+        assert [f["method"] for f in post_frames] == ["_kiro/mcp/status", "_kiro/tools/didChange"]
+        assert all(f["params"]["sessionId"] == sid_local for f in post_frames)

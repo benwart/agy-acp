@@ -18,8 +18,9 @@ class _StubAgyCliProvider(AgyCliProvider):
         *,
         cwd: str | None = None,
         timeout: float = 30.0,
+        session_id: str | None = None,
     ) -> dict[str, Any]:
-        _ = (cwd, timeout)
+        _ = (cwd, timeout, session_id)
         if command.lstrip("/") == "usage":
             return {
                 "conversation_id": "",
@@ -693,3 +694,84 @@ async def test_turn_telemetry_dataclass_delta_credits_and_rate_limit() -> None:
     assert t3.rate_limit_params["message"] == t3.rate_limit_message
     assert t3.rate_limit_params["resetTime"] == "2026-10-24T07:52:04Z"
     assert len(t3.rate_limit_params["exhaustedBuckets"]) == 1
+
+
+async def test_seed_session_baseline_single_usage_fetch_and_evict_session(tmp_path: Any) -> None:
+    """Verify single /usage fetch per turn, Turn-1 delta via seed_session_baseline, and eviction."""
+    from agy_acp.providers.state_store import SqliteStateStoreProvider
+
+    class _CountingQuotaProvider(QuotaProvider):
+        def __init__(self, fractions: list[float]) -> None:
+            super().__init__()
+            self._fractions = list(fractions)
+            self.usage_calls = 0
+            self.credits_calls = 0
+
+        async def fetch_quota_groups(self) -> list[dict[str, Any]]:
+            self.usage_calls += 1
+            idx = min(self.usage_calls - 1, len(self._fractions) - 1)
+            frac = self._fractions[idx]
+            return [
+                {
+                    "group": "Gemini Models",
+                    "buckets": [
+                        {
+                            "id": "gemini-5h",
+                            "group": "Gemini Models",
+                            "name": "Five Hour Limit Remaining",
+                            "window": "5h",
+                            "remaining_fraction": frac,
+                            "reset_time": "2026-10-24T07:52:04Z",
+                        },
+                        {
+                            "id": "gemini-weekly",
+                            "group": "Gemini Models",
+                            "name": "Weekly Limit Remaining",
+                            "window": "weekly",
+                            "remaining_fraction": 0.80,
+                            "reset_time": "2026-10-27T12:00:00Z",
+                        },
+                    ],
+                }
+            ]
+
+        async def fetch_credits(self) -> dict[str, Any]:
+            self.credits_calls += 1
+            return {"remaining_credits": 0, "upgrade_uri": "https://one.google.com/ai"}
+
+    # Pre-turn baseline = 0.95 (190.0 credits), post-Turn-1 = 0.94 (188.0 credits) -> delta = 2.0
+    provider = _CountingQuotaProvider([0.95, 0.94, 0.90])
+    state_dir = tmp_path / "private_state_dir"
+    store = SqliteStateStoreProvider(state_dir / "state.db")
+    assert (state_dir.stat().st_mode & 0o777) == 0o700
+    assert ((state_dir / "state.db").stat().st_mode & 0o777) == 0o600
+
+    tracker = QuotaTracker(provider=provider, state_store=store)
+
+    await tracker.seed_session_baseline("sess-turn1", model_id="gemini-3.7-pro")
+    assert provider.usage_calls == 1
+    assert provider.credits_calls == 1
+
+    # Second seed call for same session is a no-op
+    await tracker.seed_session_baseline("sess-turn1", model_id="gemini-3.7-pro")
+    assert provider.usage_calls == 1
+    assert provider.credits_calls == 1
+
+    t1 = await tracker.build_turn_telemetry(
+        session_id="sess-turn1",
+        model_id="gemini-3.7-pro",
+        input_tokens=400,
+        output_tokens=100,
+        context_tokens=500,
+    )
+    # build_turn_telemetry must fetch /usage only ONCE (total usage_calls: 1 + 1 = 2)
+    assert provider.usage_calls == 2
+    assert provider.credits_calls == 2
+    assert t1.delta_credits == 2.0
+    assert t1.metering_usage == [{"unit": "credit", "unitPlural": "credits", "value": 2.0}]
+    assert tracker.get_session_context_tokens("sess-turn1") == 500
+
+    # Evicting deleted session clears in-memory tracking
+    tracker.evict_session("sess-turn1")
+    assert "sess-turn1" not in tracker._session_context_tokens
+    assert "sess-turn1" not in tracker._last_session_effective_credits

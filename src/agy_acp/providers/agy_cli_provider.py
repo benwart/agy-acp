@@ -5,13 +5,14 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
+import secrets
 import shutil
 import signal
 import sys
-import tempfile
-import time
+import threading
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,11 @@ import anyio
 import anyio.abc
 from anyio.streams.text import TextReceiveStream
 
+from agy_acp.logic.custom_agents import (
+    CustomAgentSecurityError,
+    resolve_contained_prompt_file,
+    sanitize_project_agent_spec,
+)
 from agy_acp.providers.acp_logger import log_acp_event
 from agy_acp.providers.state_store import SqliteStateStoreProvider
 
@@ -239,12 +245,17 @@ def prepare_prompt_arg(
     if len(encoded) <= MAX_INLINE_PROMPT_BYTES:
         return prompt, None
 
-    target_dir = temp_dir or Path(tempfile.gettempdir())
-    target_dir.mkdir(parents=True, exist_ok=True)
-    tag = (session_id or "default")[:8]
-    filename = f"agy-acp-prompt-{tag}-{int(time.time() * 1000)}.md"
+    target_dir = (
+        Path(temp_dir) if temp_dir is not None else (Path.home() / ".config" / "agy-acp" / "tmp")
+    )
+    target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with contextlib.suppress(OSError):
+        target_dir.chmod(0o700)
+    tag = re.sub(r"[^A-Za-z0-9_-]", "", (session_id or "default"))[:8] or "default"
+    filename = f"agy-acp-prompt-{tag}-{secrets.token_hex(8)}.md"
     file_path = target_dir / filename
-    fd = os.open(file_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(file_path, flags, 0o600)
     try:
         os.write(fd, encoded)
     finally:
@@ -320,20 +331,42 @@ def load_kiro_agent_spec(
     *,
     cwd: str | None = None,
     include_home: bool = True,
+    user_agents_dir: Path | None = None,
 ) -> dict[str, Any]:
-    """Load `model` and `mcpServers` (enabled + disabled) from `.kiro/agents/<agent>.json`."""
+    """Load sanitized project agent fields and trusted user-scope `mcpServers`."""
     candidates: list[str] = []
     if agent_name and agent_name not in {"auto", "approve", "read-only"}:
         candidates.append(agent_name)
     if "kirocrew" not in candidates:
         candidates.append("kirocrew")
 
-    search_dirs: list[Path] = []
+    # Each entry is (agents_dir, is_project_scope, containment_root)
+    search_dirs: list[tuple[Path, bool, Path]] = []
     if cwd:
-        search_dirs.append(Path(cwd) / ".kiro" / "agents")
-    if include_home:
+        with contextlib.suppress(OSError, RuntimeError):
+            cwd_path = Path(cwd)
+            resolved_cwd = cwd_path.resolve()
+            kiro_dir = cwd_path / ".kiro"
+            proj_agents_dir = kiro_dir / "agents"
+            if (
+                not kiro_dir.is_symlink()
+                and not proj_agents_dir.is_symlink()
+                and proj_agents_dir.is_dir()
+                and proj_agents_dir.resolve().is_relative_to(resolved_cwd)
+            ):
+                search_dirs.append((proj_agents_dir, True, resolved_cwd))
+
+    trusted_user_dir: Path | None = None
+    if user_agents_dir is not None:
+        trusted_user_dir = Path(user_agents_dir)
+    elif include_home:
         with contextlib.suppress(RuntimeError, OSError):
-            search_dirs.append(Path.home() / ".kiro" / "agents")
+            trusted_user_dir = Path.home() / ".kiro" / "agents"
+
+    if trusted_user_dir is not None:
+        with contextlib.suppress(OSError, RuntimeError):
+            if not trusted_user_dir.is_symlink() and trusted_user_dir.is_dir():
+                search_dirs.append((trusted_user_dir, False, trusted_user_dir.resolve()))
 
     pinned_model: str | None = None
     agent_prompt: str | None = None
@@ -343,14 +376,32 @@ def load_kiro_agent_spec(
 
     for cand in candidates:
         found_candidate = False
-        for agents_dir in search_dirs:
+        for agents_dir, is_project_scope, containment_root in search_dirs:
             spec_path = agents_dir / f"{cand}.json"
-            if not spec_path.is_file():
+            if spec_path.is_symlink() or not spec_path.is_file():
                 continue
-            with contextlib.suppress(OSError, json.JSONDecodeError):
-                raw_spec = json.loads(spec_path.read_text(encoding="utf-8"))
-                if not isinstance(raw_spec, dict):
+            with contextlib.suppress(
+                OSError,
+                json.JSONDecodeError,
+                CustomAgentSecurityError,
+                ValueError,
+            ):
+                resolved_spec = spec_path.resolve(strict=True)
+                if not resolved_spec.is_relative_to(containment_root):
                     continue
+                loaded_spec = json.loads(resolved_spec.read_text(encoding="utf-8"))
+                if not isinstance(loaded_spec, dict):
+                    continue
+                if is_project_scope:
+                    raw_spec = sanitize_project_agent_spec(loaded_spec, agents_dir=agents_dir)
+                else:
+                    raw_spec = dict(loaded_spec)
+                    prompt_ref = raw_spec.get("prompt")
+                    if isinstance(prompt_ref, str) and prompt_ref.startswith("file://"):
+                        raw_spec["prompt"] = resolve_contained_prompt_file(
+                            prompt_ref,
+                            base_dir=agents_dir,
+                        )
                 found_candidate = True
                 raw_model = raw_spec.get("model")
                 if (
@@ -366,31 +417,34 @@ def load_kiro_agent_spec(
                 raw_tools = raw_spec.get("tools")
                 if agent_tools is None and isinstance(raw_tools, list):
                     agent_tools = [str(t).strip() for t in raw_tools if str(t).strip()]
-                raw_mcp = raw_spec.get("mcpServers")
-                if isinstance(raw_mcp, dict):
-                    for srv_name, srv_cfg in raw_mcp.items():
-                        if not isinstance(srv_name, str) or not srv_name:
-                            continue
-                        if not isinstance(srv_cfg, dict):
-                            continue
-                        if srv_cfg.get("disabled"):
-                            if srv_name not in disabled_names:
-                                disabled_names.append(srv_name)
-                        elif srv_name not in servers_by_name and srv_name not in disabled_names:
-                            servers_by_name[srv_name] = {"name": srv_name, **srv_cfg}
-                elif isinstance(raw_mcp, list):
-                    for item in raw_mcp:
-                        if isinstance(item, dict) and item.get("name"):
-                            sname = str(item["name"])
-                            if item.get("disabled"):
-                                if sname not in disabled_names:
-                                    disabled_names.append(sname)
-                            elif sname not in servers_by_name and sname not in disabled_names:
-                                servers_by_name[sname] = dict(item)
+                if not is_project_scope:
+                    raw_mcp = raw_spec.get("mcpServers")
+                    if isinstance(raw_mcp, dict):
+                        for srv_name, srv_cfg in raw_mcp.items():
+                            if not isinstance(srv_name, str) or not srv_name:
+                                continue
+                            if not isinstance(srv_cfg, dict):
+                                continue
+                            if srv_cfg.get("disabled"):
+                                if srv_name not in disabled_names:
+                                    disabled_names.append(srv_name)
+                            elif srv_name not in servers_by_name and srv_name not in disabled_names:
+                                servers_by_name[srv_name] = {"name": srv_name, **srv_cfg}
+                    elif isinstance(raw_mcp, list):
+                        for item in raw_mcp:
+                            if isinstance(item, dict) and item.get("name"):
+                                sname = str(item["name"])
+                                if item.get("disabled"):
+                                    if sname not in disabled_names:
+                                        disabled_names.append(sname)
+                                elif sname not in servers_by_name and sname not in disabled_names:
+                                    servers_by_name[sname] = dict(item)
         if found_candidate:
             break
 
-    is_read_only = bool(agent_tools) and all(tool in _READ_ONLY_KIRO_TOOLS for tool in agent_tools)
+    is_read_only = agent_tools is not None and all(
+        tool in _READ_ONLY_KIRO_TOOLS for tool in agent_tools
+    )
     return {
         "model": pinned_model,
         "prompt": agent_prompt,
@@ -406,9 +460,15 @@ def load_kiro_agent_mcp_servers(
     *,
     cwd: str | None = None,
     include_home: bool = True,
+    user_agents_dir: Path | None = None,
 ) -> list[dict[str, Any]]:
-    """Load `mcpServers` definitions from `<cwd>/.kiro/agents/<agent>.json` or `~/.kiro/agents`."""
-    spec = load_kiro_agent_spec(agent_name, cwd=cwd, include_home=include_home)
+    """Load `mcpServers` definitions strictly from trusted user-scope `.kiro/agents`."""
+    spec = load_kiro_agent_spec(
+        agent_name,
+        cwd=cwd,
+        include_home=include_home,
+        user_agents_dir=user_agents_dir,
+    )
     return list(spec["mcp_servers"])
 
 
@@ -419,6 +479,8 @@ _PATH_ARGUMENT_KEYS: tuple[str, ...] = (
     "TargetFile",
     "DirectoryPath",
     "SearchPath",
+    "SearchDirectory",
+    "TargetDirectory",
     "File",
     "file_path",
     "filePath",
@@ -472,6 +534,8 @@ _EXACT_BUILTIN_TABLE: dict[str, tuple[str, str, str]] = {
 def _extract_mcp_identity(
     raw_name: str,
     arguments: dict[str, Any],
+    *,
+    known_mcp_servers: Sequence[str] = (),
 ) -> tuple[str, str]:
     """Return `(server_name, tool_name)` when the step invokes an MCP tool, else `('', '')`."""
     lower_name = raw_name.lower()
@@ -495,6 +559,16 @@ def _extract_mcp_identity(
             return server, tool
     elif raw_name.startswith("mcp_"):
         rest = raw_name[len("mcp_") :]
+        if known_mcp_servers:
+            ordered = sorted(
+                {s.strip() for s in known_mcp_servers if isinstance(s, str) and s.strip()},
+                key=len,
+                reverse=True,
+            )
+            for srv in ordered:
+                prefix = f"{srv}_"
+                if rest.startswith(prefix) and len(rest) > len(prefix):
+                    return srv, rest[len(prefix) :]
         server, sep, tool = rest.partition("_")
         if sep and server and tool:
             return server, tool
@@ -636,10 +710,16 @@ def classify_tool_call_step(
     step_type: str,
     tool_name: str,
     arguments: dict[str, Any],
+    *,
+    known_mcp_servers: Sequence[str] = (),
 ) -> ToolCallClassification:
     """Classify an `agy` step into normalized KAS v3 and Kiro v2 tool metadata."""
     raw_name = (tool_name or step_type).strip()
-    mcp_server, mcp_tool = _extract_mcp_identity(raw_name, arguments)
+    mcp_server, mcp_tool = _extract_mcp_identity(
+        raw_name,
+        arguments,
+        known_mcp_servers=known_mcp_servers,
+    )
     if mcp_server and mcp_tool:
         title = (
             "spawn_run"
@@ -692,9 +772,16 @@ def _resolve_kiro_tool_identity(
     step_type: str,
     tool_name: str,
     arguments: dict[str, Any],
+    *,
+    known_mcp_servers: Sequence[str] = (),
 ) -> tuple[str, str, str]:
     """Resolve `(kiro_tool_name, mcp_server_name, kiro_tool_id)` for ACP `_meta.kiro`."""
-    cls = classify_tool_call_step(step_type, tool_name, arguments)
+    cls = classify_tool_call_step(
+        step_type,
+        tool_name,
+        arguments,
+        known_mcp_servers=known_mcp_servers,
+    )
     return cls.v2_tool_name, cls.mcp_server, cls.kiro_tool_id
 
 
@@ -972,10 +1059,56 @@ def _classify_tool_step(
     step_type: str,
     tool_name: str,
     arguments: dict[str, Any],
+    *,
+    known_mcp_servers: Sequence[str] = (),
 ) -> tuple[str, str, list[dict[str, Any]]]:
     """Map an `agy` step/tool name and arguments to ACP `(kind, title, locations)`."""
-    cls = classify_tool_call_step(step_type, tool_name, arguments)
+    cls = classify_tool_call_step(
+        step_type,
+        tool_name,
+        arguments,
+        known_mcp_servers=known_mcp_servers,
+    )
     return cls.acp_kind, cls.title, cls.locations
+
+
+def _write_atomic_private_json(path: Path, payload: dict[str, Any]) -> None:
+    """Write JSON atomically via a 0600 temporary file and os.replace."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.parent / f".{path.name}.{secrets.token_hex(8)}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(tmp_path, flags, 0o600)
+    try:
+        try:
+            os.write(fd, (json.dumps(payload, indent=2) + "\n").encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        tmp_path.chmod(0o600)
+        os.replace(tmp_path, path)
+        path.chmod(0o600)
+    except Exception:
+        with contextlib.suppress(OSError):
+            tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _signal_process_group(proc: anyio.abc.Process, sig: signal.Signals) -> None:
+    """Send `sig` to the process group of `proc`, falling back to `proc` directly."""
+    pid = getattr(proc, "pid", None)
+    if isinstance(pid, int) and pid > 0:
+        try:
+            os.killpg(pid, sig)
+            return
+        except ProcessLookupError, PermissionError, OSError:
+            pass
+    with contextlib.suppress(ProcessLookupError, OSError):
+        if sig == signal.SIGKILL:
+            proc.kill()
+        elif sig == signal.SIGTERM:
+            proc.terminate()
+        else:
+            proc.send_signal(sig)
 
 
 class AgyCliProvider:
@@ -1007,6 +1140,7 @@ class AgyCliProvider:
                 else (Path.home() / ".gemini" / "config" / "mcp_config.json")
             )
         self._active_processes: dict[str, anyio.abc.Process] = {}
+        self._abort_timers: dict[str, threading.Timer] = {}
         self._cancelled_sessions: set[str] = set()
         self._active_turns: set[str] = set()
         self._steer_queues: dict[str, list[QueuedSteer]] = {}
@@ -1122,7 +1256,8 @@ class AgyCliProvider:
                     continue
                 entry["command"] = cmd
                 entry["args"] = [str(a) for a in translated.get("args", [])]
-                if isinstance(translated.get("env"), dict) and translated["env"]:
+                has_any_env = bool(isinstance(translated.get("env"), dict) and translated["env"])
+                if has_any_env:
                     static_env = {
                         str(k): str(v)
                         for k, v in translated["env"].items()
@@ -1130,7 +1265,7 @@ class AgyCliProvider:
                     }
                     if static_env:
                         entry["env"] = static_env
-                if self._has_conflicting_stdio_server(
+                if session_id is not None or self._has_conflicting_stdio_server(
                     name,
                     entry,
                     exclude_session_id=session_id,
@@ -1143,11 +1278,7 @@ class AgyCliProvider:
 
         if changed:
             with contextlib.suppress(OSError):
-                self._mcp_config_path.parent.mkdir(parents=True, exist_ok=True)
-                self._mcp_config_path.write_text(
-                    json.dumps(existing_data, indent=2) + "\n",
-                    encoding="utf-8",
-                )
+                _write_atomic_private_json(self._mcp_config_path, existing_data)
         return synced
 
     @property
@@ -1202,6 +1333,7 @@ class AgyCliProvider:
         *,
         cwd: str | None = None,
         timeout: float = 30.0,
+        session_id: str | None = None,
     ) -> dict[str, Any]:
         """Run a non-interactive slash command (`agy -p <cmd> --output-format json`) via anyio."""
         normalized = command.strip()
@@ -1213,8 +1345,13 @@ class AgyCliProvider:
             args.extend(["--add-dir", cwd])
         args.extend(["--output-format", "json", "-p", normalized])
 
+        child_env = dict(os.environ)
+        if session_id:
+            child_env["AGY_ACP_SESSION_ID"] = session_id
+            child_env.setdefault("AGY_ACP_STATE_DB", str(self._store.db_path))
+
         with anyio.fail_after(timeout):
-            result = await anyio.run_process(args, check=False)
+            result = await anyio.run_process(args, check=False, env=child_env)
 
         stdout = result.stdout.decode("utf-8", errors="replace").strip()
         stderr = result.stderr.decode("utf-8", errors="replace").strip()
@@ -1260,6 +1397,7 @@ class AgyCliProvider:
         """Initialize or resume a session backed by SQLite state storage and the `agy` CLI."""
         await anyio.sleep(0)
         sid = session_id or str(uuid.uuid4())
+        self._cancelled_sessions.discard(sid)
         existing = (self._store.get_session(sid) if session_id is not None else None) or {}
 
         raw_mcp = (
@@ -1288,6 +1426,11 @@ class AgyCliProvider:
                 agent_name,
                 cwd=cwd,
                 include_home=not self._is_custom_store,
+                user_agents_dir=(
+                    (self._store.db_path.parent / ".kiro_user_agents")
+                    if self._is_custom_store
+                    else None
+                ),
             )
         wire_translated = _dedupe_mcp_servers([translate_mcp_server(srv) for srv in raw_mcp])
         agent_translated = [translate_mcp_server(srv) for srv in spec["mcp_servers"]]
@@ -1343,10 +1486,8 @@ class AgyCliProvider:
             return
         proc = self._active_processes.get(session_id)
         if proc is not None and proc.returncode is None:
-            with contextlib.suppress(ProcessLookupError, OSError):
-                proc.send_signal(signal.SIGINT)
-            with contextlib.suppress(ProcessLookupError, OSError):
-                proc.terminate()
+            _signal_process_group(proc, signal.SIGINT)
+            _signal_process_group(proc, signal.SIGTERM)
 
     async def steer_session(
         self,
@@ -1371,33 +1512,52 @@ class AgyCliProvider:
             self._interrupt_process_for_steer(session_id)
         return True
 
+    def _cancel_abort_timer(self, session_id: str) -> None:
+        """Cancel and remove any pending SIGKILL escalation timer for `session_id`."""
+        timer = self._abort_timers.pop(session_id, None)
+        if timer is not None:
+            timer.cancel()
+
     def abort_active_process(self, session_id: str) -> bool:
-        """Terminate an active `agy` subprocess for `session_id` without marking turn cancelled."""
+        """Terminate an active `agy` subprocess group and escalate to SIGKILL after 0.25s."""
         proc = self._active_processes.get(session_id)
         if proc is not None and proc.returncode is None:
-            with contextlib.suppress(ProcessLookupError, OSError):
-                proc.send_signal(signal.SIGINT)
-            with contextlib.suppress(ProcessLookupError, OSError):
-                proc.terminate()
+            _signal_process_group(proc, signal.SIGINT)
+            _signal_process_group(proc, signal.SIGTERM)
+            self._cancel_abort_timer(session_id)
+
+            def _escalate() -> None:
+                self._abort_timers.pop(session_id, None)
+                if proc.returncode is None:
+                    _signal_process_group(proc, signal.SIGKILL)
+
+            timer = threading.Timer(0.25, _escalate)
+            timer.daemon = True
+            self._abort_timers[session_id] = timer
+            timer.start()
             return True
         return False
 
+    def discard_cancelled(self, session_id: str) -> None:
+        """Clear any stale cancellation marker for `session_id`."""
+        self._cancelled_sessions.discard(session_id)
+
     async def cancel_session(self, session_id: str) -> bool:
-        """Send SIGINT/terminate to an active `agy` subprocess for `session_id`."""
+        """Send SIGINT/SIGTERM to an active `agy` subprocess group for `session_id`."""
         await anyio.sleep(0)
-        self._cancelled_sessions.add(session_id)
+        active = self.is_turn_active(session_id)
+        if active:
+            self._cancelled_sessions.add(session_id)
         for steer in self._pop_queued_steers(session_id):
             for tmp in steer.temp_files:
                 with contextlib.suppress(OSError):
                     tmp.unlink(missing_ok=True)
         proc = self._active_processes.get(session_id)
         if proc is not None and proc.returncode is None:
-            with contextlib.suppress(ProcessLookupError, OSError):
-                proc.send_signal(signal.SIGINT)
-            with contextlib.suppress(ProcessLookupError, OSError):
-                proc.terminate()
+            _signal_process_group(proc, signal.SIGINT)
+            _signal_process_group(proc, signal.SIGTERM)
             return True
-        return False
+        return active
 
     async def stream_prompt(
         self,
@@ -1412,6 +1572,7 @@ class AgyCliProvider:
         skip_permissions: bool | None = None,
         sandbox: bool = False,
         env: dict[str, str] | None = None,
+        known_mcp_servers: Sequence[str] = (),
         on_thought: Callable[[str], Awaitable[None]] | None = None,
         on_text: Callable[[str], Awaitable[None]] | None = None,
         on_tool_call: Callable[[ToolCallEvent], Awaitable[bool]] | None = None,
@@ -1438,6 +1599,19 @@ class AgyCliProvider:
             )
 
         merged_env = {**os.environ, **(env or {})}
+        if session_id:
+            merged_env["AGY_ACP_SESSION_ID"] = session_id
+            merged_env.setdefault("AGY_ACP_STATE_DB", str(self._store.db_path))
+
+        effective_known_mcp: tuple[str, ...] = tuple(known_mcp_servers)
+        if not effective_known_mcp and session_id:
+            persisted_sess = self._store.get_session(session_id)
+            if persisted_sess is not None:
+                effective_known_mcp = tuple(
+                    str(srv.get("name") or "").strip()
+                    for srv in (persisted_sess.get("mcp_servers") or [])
+                    if isinstance(srv, dict) and str(srv.get("name") or "").strip()
+                )
         effective_cwd = cwd if cwd and Path(cwd).is_dir() else None
 
         resolved_conv_id = conversation_id or ""
@@ -1456,6 +1630,7 @@ class AgyCliProvider:
             "context_tokens": 0,
         }
         steer_temp_files: list[Path] = []
+        active_temp_file: Path | None = None
         subagent_tracker = _SubagentRosterTracker()
         self._active_turns.add(sid)
         self._turn_conv_ids[sid] = resolved_conv_id
@@ -1463,6 +1638,7 @@ class AgyCliProvider:
         try:
             while True:
                 prompt_arg, temp_file = prepare_prompt_arg(current_prompt, session_id=sid)
+                active_temp_file = temp_file
                 args = build_agy_args(
                     cwd=cwd,
                     prompt_arg=prompt_arg,
@@ -1561,7 +1737,12 @@ class AgyCliProvider:
                         if not raw_args and subagent_entries:
                             raw_args = _synthesize_subagent_arguments(subagent_entries)
 
-                        cls = classify_tool_call_step(step_type, tool_name, raw_args)
+                        cls = classify_tool_call_step(
+                            step_type,
+                            tool_name,
+                            raw_args,
+                            known_mcp_servers=effective_known_mcp,
+                        )
                         raw_args = _normalize_tool_arguments(raw_args, tool_name=tool_name)
                         is_done = any(
                             tok in status_raw
@@ -1804,6 +1985,7 @@ class AgyCliProvider:
                         [self.bin_path, *args],
                         cwd=effective_cwd,
                         env=merged_env,
+                        start_new_session=True,
                     )
                     self._active_processes[sid] = proc
                     if self._steer_queues.get(sid) and self._turn_conv_ids.get(sid):
@@ -1824,10 +2006,8 @@ class AgyCliProvider:
                     )
                 except anyio.get_cancelled_exc_class():
                     if proc is not None and proc.returncode is None:
-                        with contextlib.suppress(ProcessLookupError, OSError):
-                            proc.send_signal(signal.SIGINT)
-                        with contextlib.suppress(ProcessLookupError, OSError):
-                            proc.terminate()
+                        _signal_process_group(proc, signal.SIGINT)
+                        _signal_process_group(proc, signal.SIGTERM)
                     if on_subagent_list is not None:
                         cancelled_snap = subagent_tracker.finalize_turn(cancelled=True)
                         if cancelled_snap is not None:
@@ -1835,10 +2015,12 @@ class AgyCliProvider:
                                 await on_subagent_list(cancelled_snap)
                     raise
                 finally:
+                    self._cancel_abort_timer(sid)
                     self._active_processes.pop(sid, None)
                     if temp_file is not None:
                         with contextlib.suppress(OSError):
                             temp_file.unlink(missing_ok=True)
+                    active_temp_file = None
 
                 final_result_obj = run_result_obj
                 was_cancelled = sid in self._cancelled_sessions or (
@@ -1910,9 +2092,13 @@ class AgyCliProvider:
 
                 break
         finally:
+            self._cancel_abort_timer(sid)
             self._active_turns.discard(sid)
             self._turn_conv_ids.pop(sid, None)
             self._in_permission_request.pop(sid, None)
+            if active_temp_file is not None:
+                with contextlib.suppress(OSError):
+                    active_temp_file.unlink(missing_ok=True)
             for leftover in self._pop_queued_steers(sid):
                 steer_temp_files.extend(leftover.temp_files)
             for tmp_path in steer_temp_files:

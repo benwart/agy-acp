@@ -74,6 +74,11 @@ async def default(
         return 0
 
     provider = AgyCliProvider()
-    outcome = await provider.stream_prompt(cwd=".", prompt=prompt_text, model=model)
+    outcome = await provider.stream_prompt(
+        cwd=".",
+        prompt=prompt_text,
+        model=model,
+        session_id="cli-chat",
+    )
     print(outcome.response)
     return 0

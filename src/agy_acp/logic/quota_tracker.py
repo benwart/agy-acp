@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from datetime import UTC, datetime, tzinfo
 from typing import Any
@@ -142,6 +143,36 @@ class QuotaTracker:
         self._total_tokens: int = self.total_tokens
         self._session_context_tokens: dict[str, int] = {}
         self._last_session_effective_credits: dict[str, float] = {}
+
+    def evict_session(self, session_id: str) -> None:
+        """Evict per-session token and credit baseline tracking for `session_id`."""
+        if not session_id:
+            return
+        self._session_context_tokens.pop(session_id, None)
+        self._last_session_effective_credits.pop(session_id, None)
+
+    async def seed_session_baseline(
+        self,
+        session_id: str,
+        *,
+        model_id: str | None = None,
+    ) -> None:
+        """Seed pre-turn effective Kiro credits for `session_id` if not yet recorded."""
+        if not session_id or session_id in self._last_session_effective_credits:
+            return
+        with contextlib.suppress(Exception):
+            five_hour, seven_day = await self._fetch_both_quotas()
+            credits_info = await self._provider.fetch_credits()
+            g1_overage = int(credits_info.get("remaining_credits", 0))
+            kiro_credits = self.calculate_effective_kiro_credits(
+                five_hour["buckets"],
+                seven_day["buckets"],
+                model_id=model_id,
+                g1_overage_credits=g1_overage,
+            )
+            self._last_session_effective_credits[session_id] = float(
+                kiro_credits["effective_credits"]
+            )
 
     def get_session_context_tokens(self, session_id: str) -> int | None:
         """Return the active context window token count for `session_id`, if recorded."""
@@ -340,6 +371,28 @@ class QuotaTracker:
             "seven_day_credits": round(credits_7d, 2) if credits_7d is not None else 0.0,
         }
 
+    async def _fetch_both_quotas(
+        self,
+        *,
+        group: str | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Fetch raw quota groups once and partition into formatted 5h and 7d snapshots."""
+        raw = await self._extract_raw_buckets(group=group)
+        five_hour_buckets = [
+            self._format_bucket(bucket, window="5h")
+            for bucket in raw
+            if bucket.get("window") == "5h"
+        ]
+        seven_day_buckets = [
+            self._format_bucket(bucket, window="7d")
+            for bucket in raw
+            if bucket.get("window") in {"weekly", "7d"}
+        ]
+        return (
+            {"window": "5h", "buckets": five_hour_buckets},
+            {"window": "7d", "buckets": seven_day_buckets},
+        )
+
     async def get_five_hour_quota(self, *, group: str | None = None) -> dict[str, Any]:
         """Return 5-hour rolling quota buckets and reset times."""
         buckets = [
@@ -361,8 +414,7 @@ class QuotaTracker:
     async def get_credits_and_tokens(self, *, group: str | None = None) -> dict[str, Any]:
         """Return G1 credit balance, converted Kiro quota credits, and session token ledger."""
         credits = await self._provider.fetch_credits()
-        five_hour = await self.get_five_hour_quota(group=group)
-        seven_day = await self.get_seven_day_quota(group=group)
+        five_hour, seven_day = await self._fetch_both_quotas(group=group)
         g1_overage = int(credits.get("remaining_credits", 0))
         kiro_credits = self.calculate_effective_kiro_credits(
             five_hour["buckets"],
@@ -385,8 +437,7 @@ class QuotaTracker:
 
     async def get_unified_status(self, *, group: str | None = None) -> dict[str, Any]:
         """Return combined 5-hour, 7-day, credit, and token usage snapshot."""
-        five_hour = await self.get_five_hour_quota(group=group)
-        seven_day = await self.get_seven_day_quota(group=group)
+        five_hour, seven_day = await self._fetch_both_quotas(group=group)
         raw_credits = await self._provider.fetch_credits()
         g1_overage = int(raw_credits.get("remaining_credits", 0))
         kiro_credits = self.calculate_effective_kiro_credits(
@@ -439,8 +490,7 @@ class QuotaTracker:
             context_tokens=active_context_tokens,
         )
 
-        five_hour = await self.get_five_hour_quota()
-        seven_day = await self.get_seven_day_quota()
+        five_hour, seven_day = await self._fetch_both_quotas()
         credits_info = await self._provider.fetch_credits()
         g1_overage = int(credits_info.get("remaining_credits", 0))
         kiro_credits = self.calculate_effective_kiro_credits(
@@ -571,10 +621,21 @@ class QuotaTracker:
         if not normalized.startswith("/"):
             normalized = f"/{normalized}"
 
-        five_hour = (await self.get_five_hour_quota())["buckets"]
-        seven_day = (await self.get_seven_day_quota())["buckets"]
-        credits_and_tokens = await self.get_credits_and_tokens()
-        tokens = credits_and_tokens["token_usage"]
+        five_hour_snap, seven_day_snap = await self._fetch_both_quotas()
+        five_hour = five_hour_snap["buckets"]
+        seven_day = seven_day_snap["buckets"]
+        credits = await self._provider.fetch_credits()
+        tokens = {
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "cached_read_tokens": self.cached_read_tokens,
+            "thinking_tokens": self.thinking_tokens,
+            "total_tokens": self.total_tokens,
+        }
+        credits_and_tokens = {
+            "remaining_credits": int(credits.get("remaining_credits", 0)),
+            "upgrade_uri": credits.get("upgrade_uri"),
+        }
 
         lines = [
             f"### Antigravity Quota & Usage (`{normalized}`)",
