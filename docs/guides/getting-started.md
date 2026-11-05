@@ -16,6 +16,8 @@ pre-commit install
 # Inspect CLI hierarchy and help
 uv run agy-acp --help
 uv run agy-acp acp --help
+uv run agy-acp acp --agent-engine v2
+uv run agy-acp acp --agent-engine v3
 uv run agy-acp auth --help
 uv run agy-acp quota --help
 uv run agy-acp docs --help

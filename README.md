@@ -12,7 +12,7 @@ pre-commit install
 
 ## CLI Structure
 
-- `agy-acp serve` / `agy-acp acp serve`: Start ACP JSON-RPC 2.0 server over stdio.
+- `agy-acp serve` / `agy-acp acp serve`: Start ACP JSON-RPC 2.0 server over stdio (`--agent-engine v2` default Kiro ACP wire; `--agent-engine v3` KAS wire with `_kiro/*` extensions, `effortLevel`, and custom agent permissions).
 - `agy-acp acp validate-gate`: Validate KiroCrew tool-gate policy and session marker.
 - `agy-acp auth login | logout | status`: Out-of-band authentication with zero-downtime hot-reload in connected ACP servers.
 - `agy-acp quota status | five-hour | seven-day | credits`: Inspect 5-hour and 7-day rolling quotas, G1 credits, and session token usage.
