@@ -371,7 +371,7 @@ def _stamp_ttft_meta(
     prompt_received_ms: int,
     emitted_ms: int,
 ) -> dict[str, Any]:
-    """Attach `_meta.kiro.ttft` and `ttftMs` onto a v3 thought or message chunk frame."""
+    """Attach `_meta.kiro.ttft` onto a v3 thought or message chunk frame."""
     params = dict(frame.get("params") or {})
     update = dict(params.get("update") or {})
     update_meta = dict(update.get("_meta") or {})
@@ -380,7 +380,6 @@ def _stamp_ttft_meta(
         "promptReceivedAt": prompt_received_ms,
         "firstChunkEmittedAt": emitted_ms,
     }
-    update_kiro["ttftMs"] = max(0, emitted_ms - prompt_received_ms)
     update_meta["kiro"] = update_kiro
     update["_meta"] = update_meta
     params["update"] = update
@@ -1099,12 +1098,12 @@ class AcpDispatcher:
             )
 
         async def _on_usage(ctx_tokens: int) -> None:
-            await self._emit_notification(
-                self._quota_tracker.build_usage_update_notification(
-                    session_id=session_id,
-                    context_tokens=ctx_tokens,
-                )
+            notif = self._quota_tracker.build_usage_update_notification(
+                session_id=session_id,
+                context_tokens=ctx_tokens,
             )
+            if self._wire_adapter.engine_id != "v3":
+                await self._emit_notification(notif)
 
         async def _on_steer_consumed(raw_content: str) -> None:
             await self._emit_notification(
@@ -1198,6 +1197,22 @@ class AcpDispatcher:
                 },
             },
         }
+
+    async def _emit_persisted_usage_update(
+        self,
+        session_id: str,
+        context_tokens: int,
+    ) -> None:
+        """Emit persisted `usage_update` (omitting hardcoded `cost` on KAS v3)."""
+        notif = self._quota_tracker.build_usage_update_notification(
+            session_id=session_id,
+            context_tokens=context_tokens,
+        )
+        if self._wire_adapter.engine_id == "v3":
+            upd = dict(notif["params"]["update"])
+            upd.pop("cost", None)
+            notif = {**notif, "params": {**notif["params"], "update": upd}}
+        await self._emit_notification(notif)
 
     async def _emit_available_commands_update(self, session_id: str) -> None:
         """Emit the `available_commands_update` notification for a session."""
@@ -1338,12 +1353,7 @@ class AcpDispatcher:
         )
         persisted_ctx = self._quota_tracker.get_session_context_tokens(sid)
         if persisted_ctx is not None and persisted_ctx > 0:
-            await self._emit_notification(
-                self._quota_tracker.build_usage_update_notification(
-                    session_id=sid,
-                    context_tokens=persisted_ctx,
-                )
-            )
+            await self._emit_persisted_usage_update(sid, persisted_ctx)
         return {
             "jsonrpc": "2.0",
             "id": message_id,
@@ -1403,12 +1413,7 @@ class AcpDispatcher:
         )
         persisted_ctx = self._quota_tracker.get_session_context_tokens(sid)
         if persisted_ctx is not None and persisted_ctx > 0:
-            await self._emit_notification(
-                self._quota_tracker.build_usage_update_notification(
-                    session_id=sid,
-                    context_tokens=persisted_ctx,
-                )
-            )
+            await self._emit_persisted_usage_update(sid, persisted_ctx)
         return {
             "jsonrpc": "2.0",
             "id": message_id,
@@ -1673,12 +1678,7 @@ class AcpDispatcher:
             if session_id:
                 persisted_ctx = self._quota_tracker.get_session_context_tokens(session_id)
                 if persisted_ctx is not None and persisted_ctx > 0:
-                    await self._emit_notification(
-                        self._quota_tracker.build_usage_update_notification(
-                            session_id=session_id,
-                            context_tokens=persisted_ctx,
-                        )
-                    )
+                    await self._emit_persisted_usage_update(session_id, persisted_ctx)
             return {
                 "jsonrpc": "2.0",
                 "id": message_id,

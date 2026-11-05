@@ -1354,7 +1354,7 @@ async def test_kas_v3_initialize_session_new_set_mode_load_replay_and_reset_serv
         for u in updates
         if u.get("sessionUpdate") in {"agent_thought_chunk", "agent_message_chunk"}
     ]
-    assert "ttftMs" in displayed_chunks[0]["_meta"]["kiro"]
+    assert "ttftMs" not in displayed_chunks[0]["_meta"]["kiro"]
     assert displayed_chunks[0]["_meta"]["kiro"]["ttft"]["promptReceivedAt"] >= 1_700_000_000_000
     info_kinds = [
         u["_meta"]["kiro"]["kind"]
@@ -2274,7 +2274,7 @@ async def test_wave5b_turn1_credit_baseline_ttft_gating_context_breakdown_and_ev
     thought_chunk = next(u for u in updates_t2 if u.get("sessionUpdate") == "agent_thought_chunk")
     msg_chunk = next(u for u in updates_t2 if u.get("sessionUpdate") == "agent_message_chunk")
     assert thought_chunk["_meta"]["kiro"]["ttft"]["promptReceivedAt"] >= 1_700_000_000_000
-    assert thought_chunk["_meta"]["kiro"]["ttftMs"] >= 0
+    assert "ttftMs" not in thought_chunk["_meta"]["kiro"]
     assert "ttft" not in msg_chunk.get("_meta", {}).get("kiro", {})
     completion_t2 = next(
         u["_meta"]["kiro"]

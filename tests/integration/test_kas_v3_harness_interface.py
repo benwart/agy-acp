@@ -939,3 +939,700 @@ async def test_kas_v3_compact_steer_reset_server_and_delete_extensions(
         {"sessionId": sid, "cwd": str(tmp_path), "mcpServers": []},
     )
     assert missing_load["error"]["code"] == -32002
+
+
+def _write_named_mcp_stdio_stub(
+    script_path: Path,
+    server_name: str,
+    default_tools: list[dict[str, str]],
+) -> Path:
+    """Create a JSON-RPC 2.0 MCP stdio server stub for `server_name` with optional file override."""
+    default_tools_json = json.dumps(default_tools)
+    script_path.write_text(
+        "import json, pathlib, sys\n"
+        f"DEFAULT_TOOLS = json.loads({default_tools_json!r})\n"
+        "tools_file = sys.argv[1] if len(sys.argv) > 1 else ''\n"
+        "for raw in sys.stdin:\n"
+        "    line = raw.strip()\n"
+        "    if not line:\n"
+        "        continue\n"
+        "    msg = json.loads(line)\n"
+        "    mid = msg.get('id')\n"
+        "    method = msg.get('method')\n"
+        "    if method == 'initialize':\n"
+        "        print(json.dumps({\n"
+        "            'jsonrpc': '2.0',\n"
+        "            'id': mid,\n"
+        "            'result': {\n"
+        "                'protocolVersion': '2025-03-26',\n"
+        "                'capabilities': {'tools': {}},\n"
+        f"                'serverInfo': {{'name': {server_name!r}, 'version': '1.0.0'}},\n"
+        "            },\n"
+        "        }), flush=True)\n"
+        "    elif method == 'tools/list':\n"
+        "        if tools_file and pathlib.Path(tools_file).is_file():\n"
+        "            tools = json.loads(pathlib.Path(tools_file).read_text(encoding='utf-8'))\n"
+        "        else:\n"
+        "            tools = DEFAULT_TOOLS\n"
+        "        print(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': {'tools': tools}}), "
+        "flush=True)\n",
+        encoding="utf-8",
+    )
+    return script_path
+
+
+def _write_wave6_fake_agy(
+    bin_path: Path,
+    *,
+    turn_counter_file: Path,
+    leak_dir: Path,
+) -> Path:
+    """Write fake `agy` binary supporting multi-turn `/usage` deltas and tool mount probes."""
+    bin_path.write_text(
+        f"""#!/usr/bin/env python3
+import json, pathlib, sys, time
+
+TURN_COUNTER = pathlib.Path({str(turn_counter_file)!r})
+LEAK_DIR = pathlib.Path({str(leak_dir)!r})
+
+args = sys.argv[1:]
+if args and args[0] == "models":
+    print("gemini-3.7-pro\\tGemini 3.7 Pro")
+    sys.exit(0)
+
+prompt = ""
+conv_id = ""
+for i, arg in enumerate(args):
+    if arg in ("-p", "--print", "--prompt") and i + 1 < len(args):
+        prompt = args[i + 1]
+    elif arg == "--conversation" and i + 1 < len(args):
+        conv_id = args[i + 1]
+
+if prompt == "/usage":
+    turns = int(TURN_COUNTER.read_text(encoding="utf-8")) if TURN_COUNTER.is_file() else 0
+    rem = max(0.10, round(0.96 - 0.01 * turns, 4))
+    print(json.dumps({{
+        "conversation_id": "",
+        "status": "SUCCESS",
+        "command": {{"name": "usage", "data": {{"groups": [{{
+            "name": "Gemini Models",
+            "buckets": [
+                {{"id": "g5", "name": "5h", "window": "5h",
+                  "remaining_fraction": rem, "reset_time": "2026-12-01T00:00:00Z"}},
+                {{"id": "g7", "name": "7d", "window": "weekly",
+                  "remaining_fraction": rem, "reset_time": "2026-12-05T00:00:00Z"}},
+            ],
+        }}]}}}},
+    }}))
+    sys.exit(0)
+
+if prompt == "/credits":
+    print(json.dumps({{
+        "conversation_id": "",
+        "status": "SUCCESS",
+        "command": {{"name": "credits", "data": {{
+            "remaining_credits": 0, "upgrade_uri": "https://one.google.com/ai"
+        }}}},
+    }}))
+    sys.exit(0)
+
+prev_turns = int(TURN_COUNTER.read_text(encoding="utf-8")) if TURN_COUNTER.is_file() else 0
+TURN_COUNTER.write_text(str(prev_turns + 1), encoding="utf-8")
+
+active_conv = conv_id or "conv-kas-wave6-001"
+print(json.dumps({{"event": "init", "init": {{"conversation_id": active_conv}}}}), flush=True)
+
+if "SCENARIO_MOUNT_ZERO_TOOLS" in prompt:
+    print(json.dumps({{
+        "event": "step_update",
+        "step_update": {{
+            "step_index": 1,
+            "step_type": "run_command",
+            "status": "RUNNING",
+            "tool_name": "run_command",
+            "tool_info": {{
+                "tool_name": "run_command",
+                "arguments": {{"CommandLine": "rm -rf /tmp/forbidden"}},
+            }},
+        }},
+    }}), flush=True)
+    time.sleep(0.35)
+    (LEAK_DIR / "zero_tools_leaked.txt").write_text("LEAKED", encoding="utf-8")
+    sys.exit(0)
+
+if "SCENARIO_MOUNT_READ_ONLY" in prompt:
+    print(json.dumps({{
+        "event": "step_update",
+        "step_update": {{
+            "step_index": 1,
+            "step_type": "read_file",
+            "status": "RUNNING",
+            "tool_name": "read_file",
+            "tool_info": {{
+                "tool_name": "read_file",
+                "arguments": {{"Path": "/repo/allowed.txt"}},
+            }},
+        }},
+    }}), flush=True)
+    time.sleep(0.05)
+    print(json.dumps({{
+        "event": "step_update",
+        "step_update": {{
+            "step_index": 1,
+            "step_type": "read_file",
+            "status": "DONE",
+            "tool_name": "read_file",
+            "tool_info": {{
+                "tool_name": "read_file",
+                "arguments": {{"Path": "/repo/allowed.txt"}},
+                "output": "allowed contents",
+            }},
+        }},
+    }}), flush=True)
+    print(json.dumps({{
+        "event": "step_update",
+        "step_update": {{
+            "step_index": 2,
+            "step_type": "delete_file",
+            "status": "RUNNING",
+            "tool_name": "delete_file",
+            "tool_info": {{
+                "tool_name": "delete_file",
+                "arguments": {{"Path": "/repo/secret.txt"}},
+            }},
+        }},
+    }}), flush=True)
+    time.sleep(0.35)
+    (LEAK_DIR / "read_only_leaked.txt").write_text("LEAKED", encoding="utf-8")
+    sys.exit(0)
+
+if "SCENARIO_ALLOWED_FS_WRITE_ALIAS" in prompt:
+    print(json.dumps({{
+        "event": "step_update",
+        "step_update": {{
+            "step_index": 1,
+            "step_type": "edit_file",
+            "status": "RUNNING",
+            "tool_name": "edit_file",
+            "tool_info": {{
+                "tool_name": "edit_file",
+                "arguments": {{
+                    "Path": "/repo/module.py",
+                    "Target": "x = 1",
+                    "Replacement": "x = 2",
+                }},
+            }},
+        }},
+    }}), flush=True)
+    time.sleep(0.05)
+    print(json.dumps({{
+        "event": "step_update",
+        "step_update": {{
+            "step_index": 1,
+            "step_type": "edit_file",
+            "status": "DONE",
+            "tool_name": "edit_file",
+            "tool_info": {{
+                "tool_name": "edit_file",
+                "arguments": {{
+                    "Path": "/repo/module.py",
+                    "Target": "x = 1",
+                    "Replacement": "x = 2",
+                }},
+                "output": "Edited /repo/module.py",
+            }},
+        }},
+    }}), flush=True)
+    print(json.dumps({{
+        "event": "step_update",
+        "step_update": {{
+            "step_index": 2,
+            "step_type": "delete_file",
+            "status": "RUNNING",
+            "tool_name": "delete_file",
+            "tool_info": {{
+                "tool_name": "delete_file",
+                "arguments": {{"Path": "/repo/critical.py"}},
+            }},
+        }},
+    }}), flush=True)
+    time.sleep(0.35)
+    (LEAK_DIR / "fs_write_delete_leaked.txt").write_text("LEAKED", encoding="utf-8")
+    sys.exit(0)
+
+last_line = prompt.splitlines()[-1] if prompt else ""
+reply_text = f"WAVE6_ACK: {{last_line}}"
+print(json.dumps({{
+    "event": "step_update",
+    "step_update": {{
+        "step_index": 1,
+        "step_type": "thinking",
+        "status": "RUNNING",
+        "thinking_delta": "Reasoning about turn...",
+    }},
+}}), flush=True)
+print(json.dumps({{
+    "event": "step_update",
+    "step_update": {{
+        "step_index": 2,
+        "step_type": "planner_response",
+        "status": "DONE",
+        "text_delta": reply_text,
+        "usage": {{"input_tokens": 1200, "output_tokens": 300, "cache_read_tokens": 100}},
+    }},
+}}), flush=True)
+print(json.dumps({{
+    "event": "result",
+    "result": {{
+        "conversation_id": active_conv,
+        "status": "SUCCESS",
+        "response": reply_text,
+        "usage": {{
+            "input_tokens": 1200,
+            "output_tokens": 300,
+            "cache_read_tokens": 100,
+            "context_tokens": 3600,
+        }},
+    }},
+}}), flush=True)
+""",
+        encoding="utf-8",
+    )
+    bin_path.chmod(bin_path.stat().st_mode | stat.S_IEXEC)
+    return bin_path
+
+
+def _assert_kas_v3_turn_telemetry_frames(
+    notifications: list[dict[str, Any]],
+    *,
+    expected_credits: float,
+    expect_breakdown: bool,
+    expect_ttft: bool,
+) -> None:
+    """Assert KAS v3 turn telemetry ordering, credit delta, breakdown, and TTFT gating."""
+    methods = [n.get("method") for n in notifications]
+    assert "_kiro.dev/metadata" not in methods
+    assert "_kiro.dev/error/rate_limit" not in methods
+
+    updates = [
+        n["params"]["update"]
+        for n in notifications
+        if n.get("method") == "session/update" and isinstance(n.get("params"), dict)
+    ]
+
+    usage_indices = [
+        idx for idx, upd in enumerate(updates) if upd.get("sessionUpdate") == "usage_update"
+    ]
+    context_usage_indices = [
+        idx
+        for idx, upd in enumerate(updates)
+        if upd.get("sessionUpdate") == "session_info_update"
+        and upd.get("_meta", {}).get("kiro", {}).get("kind") == "context_usage"
+    ]
+    completion_indices = [
+        idx
+        for idx, upd in enumerate(updates)
+        if upd.get("sessionUpdate") == "session_info_update"
+        and upd.get("_meta", {}).get("kiro", {}).get("kind") == "turn_completion"
+    ]
+
+    assert len(context_usage_indices) == 1
+    assert len(usage_indices) == 1
+    assert len(completion_indices) == 1
+    assert context_usage_indices[0] < usage_indices[0] < completion_indices[0]
+
+    usage_upd = updates[usage_indices[0]]
+    assert "cost" not in usage_upd
+    assert usage_upd["used"] == 1600
+
+    completion_kiro = updates[completion_indices[0]]["_meta"]["kiro"]
+    assert completion_kiro["promptTurnSummaries"] == [
+        {"unit": "credit", "usage": expected_credits},
+    ]
+    if expect_breakdown:
+        breakdown = completion_kiro["contextBreakdown"]
+        assert breakdown["schema"] == 1
+        assert breakdown["modelCalls"] == 1
+        assert breakdown["totalChars"] > 0
+        assert breakdown["categories"]["system"]["chars"] > 0
+        assert breakdown["categories"]["history"]["chars"] > 0
+    else:
+        assert "contextBreakdown" not in completion_kiro
+
+    displayed_chunks = [
+        upd
+        for upd in updates
+        if upd.get("sessionUpdate") in {"agent_thought_chunk", "agent_message_chunk"}
+    ]
+    assert len(displayed_chunks) >= 2
+    for idx, chunk in enumerate(displayed_chunks):
+        chunk_kiro = chunk.get("_meta", {}).get("kiro", {})
+        assert "ttftMs" not in chunk_kiro
+        if expect_ttft and idx == 0:
+            ttft = chunk_kiro["ttft"]
+            assert ttft["promptReceivedAt"] > 1_700_000_000_000
+            assert ttft["firstChunkEmittedAt"] >= ttft["promptReceivedAt"]
+        else:
+            assert "ttft" not in chunk_kiro
+
+
+async def test_kas_v3_multi_turn_credit_deltas_telemetry_order_breakdown_and_ttft_gating(
+    acp_harness_factory: HarnessFactory,
+    tmp_path: Path,
+) -> None:
+    """Wave 6A Gap 1: Multi-turn credit deltas, v3 telemetry order, breakdown, and ttft gating."""
+    leak_dir = tmp_path / "leaks"
+    leak_dir.mkdir()
+    custom_agy = _write_wave6_fake_agy(
+        tmp_path / "wave6-agy",
+        turn_counter_file=tmp_path / "turn_count.txt",
+        leak_dir=leak_dir,
+    )
+    harness = await acp_harness_factory.spawn(
+        args=["acp", "--agent-engine", "v3", "--save-dir", str(tmp_path / "store")],
+        env={"AGY_BIN": str(custom_agy), "PYTHONPATH": SRC_ROOT},
+    )
+    await harness.send_request("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
+    new_resp = await harness.send_request(
+        "session/new",
+        {
+            "cwd": str(tmp_path),
+            "mcpServers": [],
+            "_meta": {
+                "kiro": {
+                    "customAgents": [
+                        {
+                            "id": "telemetry-agent",
+                            "name": "Telemetry Agent",
+                            "prompt": "Telemetry system prompt.",
+                            "tools": ["*"],
+                        }
+                    ]
+                }
+            },
+        },
+    )
+    sid = new_resp["result"]["sessionId"]
+    await _read_next_notifications(harness, count=2)
+    await harness.send_request("session/set_mode", {"sessionId": sid, "modeId": "telemetry-agent"})
+    await _read_next_notifications(harness, count=2)
+
+    # Turn 1: omit _meta.kiro.ttft and _meta.kiro.contextBreakdown -> delta_credits == 2.0
+    harness.notifications.clear()
+    turn1_resp = await harness.send_request(
+        "session/prompt",
+        {"sessionId": sid, "prompt": [{"type": "text", "text": "Turn one telemetry"}]},
+        timeout=5.0,
+    )
+    assert turn1_resp["result"]["stopReason"] == "end_turn"
+    _assert_kas_v3_turn_telemetry_frames(
+        harness.notifications,
+        expected_credits=2.0,
+        expect_breakdown=False,
+        expect_ttft=False,
+    )
+
+    # Turn 2: request _meta.kiro.ttft=True and contextBreakdown="summary" -> delta_credits == 2.0
+    harness.notifications.clear()
+    turn2_resp = await harness.send_request(
+        "session/prompt",
+        {
+            "sessionId": sid,
+            "prompt": [{"type": "text", "text": "Turn two telemetry"}],
+            "_meta": {"kiro": {"ttft": True, "contextBreakdown": "summary"}},
+        },
+        timeout=5.0,
+    )
+    assert turn2_resp["result"]["stopReason"] == "end_turn"
+    _assert_kas_v3_turn_telemetry_frames(
+        harness.notifications,
+        expected_credits=2.0,
+        expect_breakdown=True,
+        expect_ttft=True,
+    )
+
+
+async def test_kas_v3_multi_server_reset_preserves_peer_mcp_snapshot_and_catalog(
+    acp_harness_factory: HarnessFactory,
+    tmp_path: Path,
+) -> None:
+    """Wave 6A Gap 2: `_kiro/mcp/resetServer` on `echo-mcp` keeps `peer-mcp` in full snapshot."""
+    echo_tools_json = tmp_path / "echo_tools.json"
+    echo_tools_json.write_text(
+        json.dumps([{"name": "echo_v1", "description": "Echo tool v1"}]),
+        encoding="utf-8",
+    )
+    echo_stub = _write_named_mcp_stdio_stub(
+        tmp_path / "echo_mcp_stub.py",
+        "echo-mcp",
+        [{"name": "echo_fallback", "description": "Fallback"}],
+    )
+    peer_stub = _write_named_mcp_stdio_stub(
+        tmp_path / "peer_mcp_stub.py",
+        "peer-mcp",
+        [
+            {"name": "peer_ping", "description": "Ping peer"},
+            {"name": "peer_status", "description": "Status peer"},
+        ],
+    )
+
+    harness = await acp_harness_factory.spawn(
+        args=["acp", "--agent-engine", "v3", "--save-dir", str(tmp_path / "store")],
+        env={"PYTHONPATH": SRC_ROOT},
+    )
+    await harness.send_request("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
+    new_resp = await harness.send_request(
+        "session/new",
+        {
+            "cwd": str(tmp_path),
+            "mcpServers": [
+                {
+                    "name": "echo-mcp",
+                    "command": sys.executable,
+                    "args": [str(echo_stub), str(echo_tools_json)],
+                },
+                {
+                    "name": "peer-mcp",
+                    "command": sys.executable,
+                    "args": [str(peer_stub)],
+                },
+            ],
+        },
+        timeout=5.0,
+    )
+    sid = new_resp["result"]["sessionId"]
+    initial_mcp = await _read_next_notifications(harness, count=2)
+    initial_servers = {s["name"]: s for s in initial_mcp[0]["params"]["servers"]}
+    assert set(initial_servers) == {"echo-mcp", "peer-mcp"}
+    assert initial_servers["echo-mcp"]["tools"][0]["name"] == "echo_v1"
+
+    # Update echo-mcp's tools and reset ONLY echo-mcp
+    echo_tools_json.write_text(
+        json.dumps([{"name": "echo_v2_refreshed", "description": "Echo tool v2"}]),
+        encoding="utf-8",
+    )
+    harness.notifications.clear()
+    reset_resp = await harness.send_request(
+        "_kiro/mcp/resetServer",
+        {"sessionId": sid, "serverName": "echo-mcp"},
+        timeout=5.0,
+    )
+    assert reset_resp["result"] == {}
+
+    status_frame = next(n for n in harness.notifications if n.get("method") == "_kiro/mcp/status")
+    did_change_frame = next(
+        n for n in harness.notifications if n.get("method") == "_kiro/tools/didChange"
+    )
+
+    servers_by_name = {s["name"]: s for s in status_frame["params"]["servers"]}
+    assert set(servers_by_name) == {"echo-mcp", "peer-mcp"}
+    assert servers_by_name["echo-mcp"]["status"] == "connected"
+    assert [t["name"] for t in servers_by_name["echo-mcp"]["tools"]] == ["echo_v2_refreshed"]
+    assert servers_by_name["peer-mcp"]["status"] == "connected"
+    assert [t["name"] for t in servers_by_name["peer-mcp"]["tools"]] == ["peer_ping", "peer_status"]
+
+    expected_tool_ids = [
+        "mcp_echo-mcp_echo_v2_refreshed",
+        "mcp_peer-mcp_peer_ping",
+        "mcp_peer-mcp_peer_status",
+    ]
+    assert did_change_frame["params"]["initial"]["tools"] == expected_tool_ids
+    assert did_change_frame["params"]["added"]["tools"] == expected_tool_ids
+    tags = did_change_frame["params"]["tags"]
+    assert {"source": "mcp", "tag": "@echo-mcp/echo_v2_refreshed"} in tags
+    assert {"source": "mcp", "tag": "@peer-mcp/peer_ping"} in tags
+    assert {"source": "mcp", "tag": "@peer-mcp/peer_status"} in tags
+
+
+async def test_kas_v3_custom_agent_tools_mount_allowlist_and_delete_file_alias_guard(
+    acp_harness_factory: HarnessFactory,
+    tmp_path: Path,
+) -> None:
+    """Wave 6A Gap 3: `tools: []`, `tools: ['read_file']`, and `allowedTools: ['fs_write']`."""
+    leak_dir = tmp_path / "leaks"
+    leak_dir.mkdir()
+    custom_agy = _write_wave6_fake_agy(
+        tmp_path / "wave6-agy",
+        turn_counter_file=tmp_path / "turn_count.txt",
+        leak_dir=leak_dir,
+    )
+    harness = await acp_harness_factory.spawn(
+        args=["acp", "--agent-engine", "v3", "--save-dir", str(tmp_path / "store")],
+        env={"AGY_BIN": str(custom_agy), "PYTHONPATH": SRC_ROOT},
+    )
+    harness.on_permission_request(
+        lambda _params: {"outcome": {"outcome": "selected", "optionId": "reject_once"}}
+    )
+
+    await harness.send_request("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
+    new_resp = await harness.send_request(
+        "session/new",
+        {
+            "cwd": str(tmp_path),
+            "mcpServers": [],
+            "_meta": {
+                "kiro": {
+                    "customAgents": [
+                        {
+                            "id": "zero-tools-agent",
+                            "name": "Zero Tools Agent",
+                            "prompt": "No tools mounted.",
+                            "tools": [],
+                        },
+                        {
+                            "id": "read-only-mount-agent",
+                            "name": "Read Only Mount Agent",
+                            "prompt": "Only read_file mounted.",
+                            "tools": ["read_file"],
+                            "allowedTools": ["read_file"],
+                        },
+                        {
+                            "id": "fs-write-alias-agent",
+                            "name": "FS Write Alias Agent",
+                            "prompt": "fs_write allowed, delete_file must still prompt.",
+                            "tools": ["*"],
+                            "allowedTools": ["fs_write"],
+                        },
+                    ]
+                }
+            },
+        },
+    )
+    sid = new_resp["result"]["sessionId"]
+    await _read_next_notifications(harness, count=2)
+
+    # Case A: tools: [] denies run_command without prompting client or leaking execution
+    await harness.send_request("session/set_mode", {"sessionId": sid, "modeId": "zero-tools-agent"})
+    await _read_next_notifications(harness, count=2)
+    harness.notifications.clear()
+    harness.server_requests.clear()
+
+    await harness.send_request(
+        "session/prompt",
+        {"sessionId": sid, "prompt": [{"type": "text", "text": "SCENARIO_MOUNT_ZERO_TOOLS"}]},
+        timeout=5.0,
+    )
+    assert harness.server_requests == []
+    zero_tool_updates = [
+        n["params"]["update"]
+        for n in harness.notifications
+        if n.get("method") == "session/update"
+        and n["params"]["update"].get("sessionUpdate") == "tool_call_update"
+    ]
+    assert len(zero_tool_updates) == 1
+    assert zero_tool_updates[0]["status"] == "failed"
+    assert zero_tool_updates[0]["rawOutput"]["allowed"] is False
+
+    # Case B: tools: ["read_file"] allows read_file, denies delete_file without prompting client
+    await harness.send_request(
+        "session/set_mode",
+        {"sessionId": sid, "modeId": "read-only-mount-agent"},
+    )
+    await _read_next_notifications(harness, count=2)
+    harness.notifications.clear()
+    harness.server_requests.clear()
+
+    await harness.send_request(
+        "session/prompt",
+        {"sessionId": sid, "prompt": [{"type": "text", "text": "SCENARIO_MOUNT_READ_ONLY"}]},
+        timeout=5.0,
+    )
+    assert harness.server_requests == []
+    ro_tool_updates = [
+        n["params"]["update"]
+        for n in harness.notifications
+        if n.get("method") == "session/update"
+        and n["params"]["update"].get("sessionUpdate") == "tool_call_update"
+    ]
+    assert [u["status"] for u in ro_tool_updates] == ["completed", "failed"]
+    assert ro_tool_updates[0]["rawOutput"]["allowed"] is True
+    assert ro_tool_updates[1]["rawOutput"]["allowed"] is False
+
+    # Case C: allowedTools: ["fs_write"] auto-approves str_replace, NOT delete_file
+    await harness.send_request(
+        "session/set_mode",
+        {"sessionId": sid, "modeId": "fs-write-alias-agent"},
+    )
+    await _read_next_notifications(harness, count=2)
+    harness.notifications.clear()
+    harness.server_requests.clear()
+
+    await harness.send_request(
+        "session/prompt",
+        {"sessionId": sid, "prompt": [{"type": "text", "text": "SCENARIO_ALLOWED_FS_WRITE_ALIAS"}]},
+        timeout=5.0,
+    )
+    assert [r["params"]["_meta"]["kiro"]["toolId"] for r in harness.server_requests] == [
+        "delete_file"
+    ]
+    alias_updates = [
+        n["params"]["update"]
+        for n in harness.notifications
+        if n.get("method") == "session/update"
+        and n["params"]["update"].get("sessionUpdate") == "tool_call_update"
+    ]
+    assert [u["status"] for u in alias_updates] == ["completed", "failed"]
+
+    await asyncio.sleep(0.4)
+    assert list(leak_dir.iterdir()) == []
+
+
+async def test_kas_v3_close_load_prompt_resumes_cleanly_with_end_turn(
+    acp_harness_factory: HarnessFactory,
+    tmp_path: Path,
+) -> None:
+    """Wave 6A Gap 4: `session/close` -> `session/load` -> `session/prompt` yields `end_turn`."""
+    leak_dir = tmp_path / "leaks"
+    leak_dir.mkdir()
+    custom_agy = _write_wave6_fake_agy(
+        tmp_path / "wave6-agy",
+        turn_counter_file=tmp_path / "turn_count.txt",
+        leak_dir=leak_dir,
+    )
+    harness = await acp_harness_factory.spawn(
+        args=["acp", "--agent-engine", "v3", "--save-dir", str(tmp_path / "store")],
+        env={"AGY_BIN": str(custom_agy), "PYTHONPATH": SRC_ROOT},
+    )
+    await harness.send_request("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
+    new_resp = await harness.send_request(
+        "session/new",
+        {"cwd": str(tmp_path), "mcpServers": []},
+    )
+    sid = new_resp["result"]["sessionId"]
+    await _read_next_notifications(harness, count=2)
+
+    first_prompt = await harness.send_request(
+        "session/prompt",
+        {"sessionId": sid, "prompt": [{"type": "text", "text": "Initial turn before close"}]},
+        timeout=5.0,
+    )
+    assert first_prompt["result"]["stopReason"] == "end_turn"
+
+    close_resp = await harness.send_request("session/close", {"sessionId": sid})
+    assert close_resp["result"] == {}
+
+    harness.notifications.clear()
+    load_resp = await harness.send_request(
+        "session/load",
+        {"sessionId": sid, "cwd": str(tmp_path), "mcpServers": []},
+        timeout=5.0,
+    )
+    assert load_resp["result"]["sessionId"] == sid
+    await _read_next_notifications(harness, count=2)
+
+    harness.notifications.clear()
+    resumed_prompt = await harness.send_request(
+        "session/prompt",
+        {"sessionId": sid, "prompt": [{"type": "text", "text": "Resumed turn after reload"}]},
+        timeout=5.0,
+    )
+    assert resumed_prompt["result"]["stopReason"] == "end_turn"
+
+    live_agent_chunks = [
+        n["params"]["update"]["content"]["text"]
+        for n in harness.notifications
+        if n.get("method") == "session/update"
+        and n["params"]["update"].get("sessionUpdate") == "agent_message_chunk"
+        and not n["params"]["update"].get("_meta", {}).get("kiro", {}).get("replay")
+    ]
+    assert "".join(live_agent_chunks) == "WAVE6_ACK: Resumed turn after reload"
