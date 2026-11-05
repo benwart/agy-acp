@@ -7,9 +7,8 @@ import contextlib
 import copy
 import os
 import re
+import secrets
 import shutil
-import tempfile
-import uuid
 from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -129,13 +128,14 @@ def _session_has_kirocrew_spawn_run(session: dict[str, Any]) -> bool:
 def _extract_session_mcp_env(
     session: dict[str, Any],
     *,
+    session_id: str | None = None,
     state_db_path: Path | None = None,
 ) -> dict[str, str]:
     """Build isolated per-session MCP identity environment variables for an `agy` subprocess."""
     env: dict[str, str] = dict.fromkeys(PER_SESSION_MCP_ENV_KEYS, "")
     env["KIROCREW_ROUTE_SPAWN_RUN"] = "1" if _session_has_kirocrew_spawn_run(session) else ""
 
-    sid = str(session.get("sessionId") or "")
+    sid = str(session_id or session.get("sessionId") or "").strip()
     if sid:
         env["AGY_ACP_SESSION_ID"] = sid
     if state_db_path is not None:
@@ -232,18 +232,44 @@ _MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
 _USER_MESSAGE_BLOCK_RE = re.compile(r"<user_message>\s*(.*?)\s*</user_message>", re.DOTALL)
 
 
-def _stage_local_image_file(src_path: Path) -> Path | None:
-    """Copy a local image file into the 0600 `agy-acp-images` temp directory for `agy` access."""
+def _ensure_private_images_dir(image_dir: Path | None = None) -> Path:
+    """Create and return a 0700 private directory for staged prompt/steer images."""
+    target = (
+        Path(image_dir)
+        if image_dir is not None
+        else (Path.home() / ".config" / "agy-acp" / "images")
+    )
+    target.mkdir(parents=True, exist_ok=True, mode=0o700)
     with contextlib.suppress(OSError):
-        if not src_path.is_file():
+        target.chmod(0o700)
+    return target
+
+
+def _stage_local_image_file(
+    src_path: Path,
+    *,
+    cwd: str | None = None,
+    image_dir: Path | None = None,
+) -> Path | None:
+    """Copy a `cwd`-contained local image file into a 0700 private directory with mode 0600."""
+    if not cwd or not cwd.strip():
+        return None
+    with contextlib.suppress(OSError, RuntimeError):
+        cwd_root = Path(cwd).resolve()
+        candidate = src_path if src_path.is_absolute() else (Path(cwd) / src_path)
+        resolved_src = candidate.resolve(strict=True)
+        if not resolved_src.is_relative_to(cwd_root) or not resolved_src.is_file():
             return None
-        ext = src_path.suffix.lower().lstrip(".") or "png"
-        img_dir = Path(tempfile.gettempdir()) / "agy-acp-images"
-        img_dir.mkdir(parents=True, exist_ok=True)
-        dest_path = img_dir / f"img-{uuid.uuid4().hex[:12]}.{ext}"
-        fd = os.open(dest_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        ext = resolved_src.suffix.lower().lstrip(".") or "png"
+        img_dir = _ensure_private_images_dir(image_dir)
+        dest_path = img_dir / f"img-{secrets.token_hex(8)}.{ext}"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(dest_path, flags, 0o600)
         try:
-            with src_path.open("rb") as src_file, os.fdopen(fd, "wb", closefd=False) as dst_file:
+            with (
+                resolved_src.open("rb") as src_file,
+                os.fdopen(fd, "wb", closefd=False) as dst_file,
+            ):
                 shutil.copyfileobj(src_file, dst_file)
         finally:
             os.close(fd)
@@ -252,8 +278,15 @@ def _stage_local_image_file(src_path: Path) -> Path | None:
     return None
 
 
-def _extract_markdown_local_images(text: str) -> tuple[list[str], list[Path]]:
-    """Find local markdown image links (`![...](/path/img.png)`) and stage them to temp files."""
+def _extract_markdown_local_images(
+    text: str,
+    *,
+    cwd: str | None = None,
+    image_dir: Path | None = None,
+) -> tuple[list[str], list[Path]]:
+    """Find `cwd`-contained markdown image links (`![...](path.png)`) and stage them privately."""
+    if not cwd or not cwd.strip():
+        return [], []
     hints: list[str] = []
     staged: list[Path] = []
     seen_targets: set[str] = set()
@@ -267,7 +300,7 @@ def _extract_markdown_local_images(text: str) -> tuple[list[str], list[Path]]:
         if candidate.suffix.lower() not in _IMAGE_EXTS:
             continue
         seen_targets.add(raw_target)
-        staged_path = _stage_local_image_file(candidate)
+        staged_path = _stage_local_image_file(candidate, cwd=cwd, image_dir=image_dir)
         if staged_path is not None:
             staged.append(staged_path)
             hints.append(
@@ -276,11 +309,16 @@ def _extract_markdown_local_images(text: str) -> tuple[list[str], list[Path]]:
     return hints, staged
 
 
-def _format_steer_message(raw_message: str) -> tuple[str, list[Path]]:
-    """Unwrap `<user_message>` steer text and stage any referenced local markdown images."""
+def _format_steer_message(
+    raw_message: str,
+    *,
+    cwd: str | None = None,
+    image_dir: Path | None = None,
+) -> tuple[str, list[Path]]:
+    """Unwrap `<user_message>` steer text and stage any `cwd`-contained markdown images."""
     matches = _USER_MESSAGE_BLOCK_RE.findall(raw_message)
     body = "\n\n".join(m.strip() for m in matches if m.strip()) if matches else raw_message.strip()
-    hints, staged_images = _extract_markdown_local_images(body)
+    hints, staged_images = _extract_markdown_local_images(body, cwd=cwd, image_dir=image_dir)
     parts = [body] if body else []
     parts.extend(hints)
     return "\n\n".join(parts).strip(), staged_images
@@ -304,6 +342,9 @@ def _write_dsh_gate_marker_if_configured() -> None:
 
 def _format_prompt_blocks(
     prompt_blocks: list[dict[str, Any]],
+    *,
+    cwd: str | None = None,
+    image_dir: Path | None = None,
 ) -> tuple[str, list[Path]]:
     """Convert ACP prompt content blocks into a text prompt and temporary image files."""
     parts: list[str] = []
@@ -317,7 +358,11 @@ def _format_prompt_blocks(
             text = str(block.get("text", ""))
             if text:
                 parts.append(text)
-                md_hints, md_images = _extract_markdown_local_images(text)
+                md_hints, md_images = _extract_markdown_local_images(
+                    text,
+                    cwd=cwd,
+                    image_dir=image_dir,
+                )
                 parts.extend(md_hints)
                 temp_images.extend(md_images)
         elif btype == "resource_link":
@@ -336,10 +381,10 @@ def _format_prompt_blocks(
             if raw_b64:
                 with contextlib.suppress(ValueError, OSError):
                     decoded = base64.b64decode(raw_b64)
-                    img_dir = Path(tempfile.gettempdir()) / "agy-acp-images"
-                    img_dir.mkdir(parents=True, exist_ok=True)
-                    img_path = img_dir / f"img-{uuid.uuid4().hex[:12]}.{ext}"
-                    fd = os.open(img_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                    img_dir = _ensure_private_images_dir(image_dir)
+                    img_path = img_dir / f"img-{secrets.token_hex(8)}.{ext}"
+                    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+                    fd = os.open(img_path, flags, 0o600)
                     try:
                         os.write(fd, decoded)
                     finally:
@@ -424,6 +469,12 @@ class SessionManager:
         self._mcp_prober: McpCatalogProber = mcp_prober or McpCatalogProber()
         self._cancel_scopes: dict[str, anyio.CancelScope] = {}
         self._active_cancel_scopes: dict[str, anyio.CancelScope] = self._cancel_scopes
+        self._turn_locks: dict[str, anyio.Lock] = {}
+        self._mcp_status_cache: dict[str, dict[str, McpServerStatus]] = {}
+
+    def _private_images_dir(self) -> Path:
+        """Return a 0700 private image staging directory colocated with the state store."""
+        return _ensure_private_images_dir(self._store.db_path.parent / "images")
 
     @property
     def state_store(self) -> SqliteStateStoreProvider:
@@ -609,16 +660,18 @@ class SessionManager:
         agent_raw_servers: list[dict[str, Any]] = []
         disabled_names: list[str] = []
 
-        if spec is not None and spec.mcp_servers:
-            agent_raw_servers, disabled_names = _agent_mcp_mapping_to_list(
-                spec.mcp_servers,
-                origin=spec.origin,
-            )
+        if spec is not None:
+            if spec.mcp_servers:
+                agent_raw_servers, disabled_names = _agent_mcp_mapping_to_list(
+                    spec.mcp_servers,
+                    origin=spec.origin,
+                )
         elif self._wire_adapter.engine_id == "v2":
             legacy_spec = load_kiro_agent_spec(
                 active_agent,
                 cwd=cwd,
                 include_home=not self._cli.is_custom_store,
+                user_agents_dir=self._user_agents_dir(),
             )
             agent_raw_servers = list(legacy_spec["mcp_servers"])
             disabled_names = list(legacy_spec["disabled_mcp_servers"])
@@ -660,6 +713,17 @@ class SessionManager:
         return combined, wire_translated, removable
 
     @staticmethod
+    def _reset_custom_agent_fields(target_state: dict[str, Any]) -> None:
+        """Clear all custom-agent prompt, tool, permission, and model switch fields."""
+        target_state["agentPrompt"] = None
+        target_state["agentTools"] = None
+        target_state["agentExcludedTools"] = []
+        target_state["agentAllowedTools"] = []
+        target_state["agentPermissions"] = None
+        target_state["agentReadOnly"] = False
+        target_state["switchedModel"] = None
+
+    @staticmethod
     def _apply_custom_agent_fields(
         target_state: dict[str, Any],
         spec: CustomAgentSpec | None,
@@ -667,6 +731,7 @@ class SessionManager:
         allow_model_override: bool,
     ) -> None:
         """Populate session agent prompt/tools/permissions/model fields from `spec`."""
+        SessionManager._reset_custom_agent_fields(target_state)
         if spec is None:
             return
         target_state["agentPrompt"] = spec.prompt or None
@@ -674,7 +739,7 @@ class SessionManager:
         target_state["agentExcludedTools"] = list(spec.excluded_tools)
         target_state["agentAllowedTools"] = list(spec.allowed_tools)
         target_state["agentPermissions"] = copy.deepcopy(spec.permissions)
-        target_state["agentReadOnly"] = bool(spec.tools) and all(
+        target_state["agentReadOnly"] = spec.tools is not None and all(
             t in _READ_ONLY_TOOL_NAMES for t in spec.tools
         )
         candidate_model = (
@@ -717,16 +782,11 @@ class SessionManager:
                     names.append(name)
         return names
 
-    async def probe_session_mcp_servers(
+    def _resolve_session_probe_declarations(
         self,
-        session_id: str,
-        server_filter: str | None = None,
-    ) -> list[McpServerStatus]:
-        """Probe the effective MCP server roster for `session_id` via `McpCatalogProber`."""
-        session = self._store.get_session(session_id)
-        if session is None:
-            return []
-
+        session: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Build the ordered MCP server declarations to probe for `session`."""
         cwd = str(session.get("cwd") or "")
         registry = self.get_custom_agent_registry(
             cwd=cwd,
@@ -742,13 +802,10 @@ class SessionManager:
             else []
         )
         agent_entries: list[dict[str, Any]] = []
-        disabled_by_agent: set[str] = set()
         if spec is not None and spec.mcp_servers:
             for srv_name, srv_cfg in spec.mcp_servers.items():
                 if not isinstance(srv_name, str) or not isinstance(srv_cfg, Mapping):
                     continue
-                if srv_cfg.get("disabled") is True:
-                    disabled_by_agent.add(srv_name)
                 entry = {"name": srv_name, **dict(srv_cfg)}
                 entry.setdefault(
                     "_meta",
@@ -770,8 +827,31 @@ class SessionManager:
                 merged_declarations = [
                     dict(s) for s in fallback if isinstance(s, dict) and s.get("name")
                 ]
-        _ = disabled_by_agent
+        return merged_declarations
 
+    def get_session_probe_server_names(self, session_id: str) -> list[str]:
+        """Return ordered MCP server names in the full probe roster for `session_id`."""
+        session = self._store.get_session(session_id)
+        if session is None:
+            return []
+        return [
+            str(s.get("name") or "").strip()
+            for s in self._resolve_session_probe_declarations(session)
+            if str(s.get("name") or "").strip()
+        ]
+
+    async def probe_session_mcp_servers(
+        self,
+        session_id: str,
+        server_filter: str | None = None,
+    ) -> list[McpServerStatus]:
+        """Probe the effective MCP server roster for `session_id` via `McpCatalogProber`."""
+        session = self._store.get_session(session_id)
+        if session is None:
+            return []
+
+        cwd = str(session.get("cwd") or "")
+        merged_declarations = self._resolve_session_probe_declarations(session)
         if server_filter:
             merged_declarations = [
                 s for s in merged_declarations if str(s.get("name") or "") == server_filter
@@ -779,7 +859,11 @@ class SessionManager:
         if not merged_declarations:
             return []
 
-        session_env = _extract_session_mcp_env(session, state_db_path=self._store.db_path)
+        session_env = _extract_session_mcp_env(
+            session,
+            session_id=session_id,
+            state_db_path=self._store.db_path,
+        )
         return await self._mcp_prober.probe_servers(
             merged_declarations,
             session_env=session_env,
@@ -974,16 +1058,11 @@ class SessionManager:
             custom_agents=session.get("custom_agents") or [],
         )
 
-        if mode_id in VALID_MODE_IDS:
+        spec = registry.get(mode_id)
+        if spec is None and mode_id in VALID_MODE_IDS:
             session["mode"] = mode_id
             session["agent"] = None
-            session["switchedModel"] = None
-            session["agentPrompt"] = None
-            session["agentTools"] = None
-            session["agentExcludedTools"] = []
-            session["agentAllowedTools"] = []
-            session["agentPermissions"] = None
-            session["agentReadOnly"] = False
+            self._reset_custom_agent_fields(session)
             raw_wire = session.get("wire_mcp_servers", [])
             combined, _, removable = self._merge_and_sync_session_mcp(
                 session_id=session_id,
@@ -1005,7 +1084,7 @@ class SessionManager:
             raise ValueError(f"Mode '{mode_id}' not found")
 
         session["agent"] = mode_id
-        spec = registry.get(mode_id)
+        self._reset_custom_agent_fields(session)
         raw_wire = session.get("wire_mcp_servers", [])
         combined, _, removable = self._merge_and_sync_session_mcp(
             session_id=session_id,
@@ -1018,7 +1097,7 @@ class SessionManager:
         session["mcp_servers"] = combined
 
         model_pinned = bool(session.get("modelPinnedByUser", False))
-        if spec is not None and (self._wire_adapter.engine_id == "v3" or spec.origin != "project"):
+        if spec is not None:
             self._apply_custom_agent_fields(
                 session,
                 spec,
@@ -1029,21 +1108,15 @@ class SessionManager:
                 mode_id,
                 cwd=cwd,
                 include_home=not self._cli.is_custom_store,
+                user_agents_dir=self._user_agents_dir(),
             )
             session["agentPrompt"] = legacy_spec.get("prompt")
             session["agentTools"] = legacy_spec.get("tools")
-            session["agentExcludedTools"] = list(spec.excluded_tools) if spec else []
-            session["agentAllowedTools"] = list(spec.allowed_tools) if spec else []
-            session["agentPermissions"] = copy.deepcopy(spec.permissions) if spec else None
             session["agentReadOnly"] = bool(legacy_spec.get("read_only"))
             pinned_model = legacy_spec.get("model")
             if isinstance(pinned_model, str) and pinned_model and not model_pinned:
                 session["model"] = pinned_model
                 session["switchedModel"] = pinned_model
-            else:
-                session["switchedModel"] = None
-        else:
-            session["switchedModel"] = None
 
         self._store.upsert_session(session)
         if combined or removable:
@@ -1199,104 +1272,120 @@ class SessionManager:
         on_subagent_list: Callable[[list[dict[str, Any]]], Awaitable[None]] | None = None,
     ) -> dict[str, Any]:
         """Execute a streaming turn (`session/prompt`) via the `agy` CLI subprocess."""
-        if self.consume_cancellation(session_id):
-            return {"stopReason": "cancelled"}
+        self._require_session(session_id)
+        lock = self._turn_locks.setdefault(session_id, anyio.Lock())
+        async with lock:
+            if self.consume_cancellation(session_id):
+                return {"stopReason": "cancelled"}
 
-        session = self._store.get_session(session_id) or {}
-        cwd = str(session.get("cwd", ""))
-        model = str(session.get("model", DEFAULT_MODEL_ID))
-        mode = str(session.get("mode", "auto"))
-        if session.get("agentReadOnly"):
-            mode = "read-only"
-        elif os.environ.get("GOOSE_MODE") == "approve":
-            mode = "approve"
-        effort = str(session.get("reasoning_effort", DEFAULT_REASONING_EFFORT))
-        agy_conv_id = session.get("agyConversationId")
-        conversation_id = str(agy_conv_id) if agy_conv_id else None
-        compacted_summary = session.get("compactedSummary")
-        reinjected_prompt = bool(session.get("reinjectAgentPrompt"))
+            session = self._require_session(session_id)
+            cwd = str(session.get("cwd", ""))
+            model = str(session.get("model", DEFAULT_MODEL_ID))
+            agent_read_only = bool(session.get("agentReadOnly"))
+            mode = str(session.get("mode", "auto"))
+            if agent_read_only:
+                mode = "read-only"
+            elif os.environ.get("GOOSE_MODE") == "approve":
+                mode = "approve"
+            skip_permissions = mode == "auto" and not agent_read_only
+            effort = str(session.get("reasoning_effort", DEFAULT_REASONING_EFFORT))
+            agy_conv_id = session.get("agyConversationId")
+            conversation_id = str(agy_conv_id) if agy_conv_id else None
+            compacted_summary = session.get("compactedSummary")
+            reinjected_prompt = bool(session.get("reinjectAgentPrompt"))
 
-        formatted_prompt, temp_images = _format_prompt_blocks(prompt_blocks)
-        consumed_compacted_summary = False
-        if (
-            conversation_id is None
-            and isinstance(compacted_summary, str)
-            and compacted_summary.strip()
-        ):
-            formatted_prompt = (
-                f"[Compacted Session Summary]\n{compacted_summary.strip()}\n\n{formatted_prompt}"
-            ).strip()
-            consumed_compacted_summary = True
-        formatted_prompt = _apply_session_prompt_directives(
-            formatted_prompt,
-            session,
-            is_new_conversation=conversation_id is None,
-        )
-        session_env = _extract_session_mcp_env(session, state_db_path=self._store.db_path)
-
-        outcome = None
-        try:
-            with self.turn_cancel_scope(session_id) as scope:
-                outcome = await self._cli.stream_prompt(
-                    cwd=cwd,
-                    prompt=formatted_prompt,
-                    session_id=session_id,
-                    conversation_id=conversation_id,
-                    model=model,
-                    mode=mode,
-                    effort=effort,
-                    env=session_env,
-                    on_thought=on_thought,
-                    on_text=on_text,
-                    on_tool_call=on_tool_call,
-                    on_tool_update=on_tool_update,
-                    on_usage=on_usage,
-                    on_steer_consumed=on_steer_consumed,
-                    on_subagent_list=on_subagent_list,
-                )
-        finally:
-            for img_path in temp_images:
-                with contextlib.suppress(OSError):
-                    img_path.unlink(missing_ok=True)
-
-        if (
-            scope.cancel_called
-            or self.consume_cancellation(session_id)
-            or outcome is None
-            or outcome.stop_reason == "cancelled"
-        ):
-            return {"stopReason": "cancelled"}
-
-        ctx_tokens = int(outcome.usage.get("context_tokens", 0))
-        if session and (
-            outcome.conversation_id
-            or outcome.resolved_model
-            or ctx_tokens > 0
-            or consumed_compacted_summary
-            or reinjected_prompt
-        ):
-            if outcome.conversation_id:
-                session["agyConversationId"] = outcome.conversation_id
-            if consumed_compacted_summary:
-                session["compactedSummary"] = None
-            if reinjected_prompt:
-                session["reinjectAgentPrompt"] = False
+            formatted_prompt, temp_images = _format_prompt_blocks(
+                prompt_blocks,
+                cwd=cwd,
+                image_dir=self._private_images_dir(),
+            )
+            consumed_compacted_summary = False
             if (
-                outcome.resolved_model
-                and not session.get("modelPinnedByUser")
-                and session.get("model") in {DEFAULT_MODEL_ID, "auto", ""}
+                conversation_id is None
+                and isinstance(compacted_summary, str)
+                and compacted_summary.strip()
             ):
-                session["model"] = outcome.resolved_model
-            if ctx_tokens > 0:
-                session["contextTokens"] = ctx_tokens
-            self._store.upsert_session(session)
+                summary_clean = compacted_summary.strip()
+                formatted_prompt = (
+                    f"[Compacted Session Summary]\n{summary_clean}\n\n{formatted_prompt}"
+                ).strip()
+                consumed_compacted_summary = True
+            formatted_prompt = _apply_session_prompt_directives(
+                formatted_prompt,
+                session,
+                is_new_conversation=conversation_id is None,
+            )
+            session_env = _extract_session_mcp_env(
+                session,
+                session_id=session_id,
+                state_db_path=self._store.db_path,
+            )
 
-        return {
-            "stopReason": outcome.stop_reason,
-            "response": outcome.response,
-            "usage": outcome.usage,
-            "conversationId": outcome.conversation_id,
-        }
+            outcome = None
+            try:
+                with self.turn_cancel_scope(session_id) as scope:
+                    outcome = await self._cli.stream_prompt(
+                        cwd=cwd,
+                        prompt=formatted_prompt,
+                        session_id=session_id,
+                        conversation_id=conversation_id,
+                        model=model,
+                        mode=mode,
+                        effort=effort,
+                        skip_permissions=skip_permissions,
+                        env=session_env,
+                        on_thought=on_thought,
+                        on_text=on_text,
+                        on_tool_call=on_tool_call,
+                        on_tool_update=on_tool_update,
+                        on_usage=on_usage,
+                        on_steer_consumed=on_steer_consumed,
+                        on_subagent_list=on_subagent_list,
+                    )
+            finally:
+                for img_path in temp_images:
+                    with contextlib.suppress(OSError):
+                        img_path.unlink(missing_ok=True)
+
+            if (
+                scope.cancel_called
+                or self.consume_cancellation(session_id)
+                or outcome is None
+                or outcome.stop_reason == "cancelled"
+            ):
+                return {"stopReason": "cancelled"}
+
+            ctx_tokens = int(outcome.usage.get("context_tokens", 0))
+            latest = self._store.get_session(session_id)
+            if latest is not None and (
+                outcome.conversation_id
+                or outcome.resolved_model
+                or ctx_tokens > 0
+                or consumed_compacted_summary
+                or reinjected_prompt
+            ):
+                if outcome.conversation_id:
+                    latest["agyConversationId"] = outcome.conversation_id
+                if consumed_compacted_summary:
+                    latest["compactedSummary"] = None
+                if reinjected_prompt:
+                    latest["reinjectAgentPrompt"] = False
+                if (
+                    outcome.resolved_model
+                    and not latest.get("modelPinnedByUser")
+                    and latest.get("model") in {DEFAULT_MODEL_ID, "auto", ""}
+                ):
+                    latest["model"] = outcome.resolved_model
+                if ctx_tokens > 0:
+                    latest["contextTokens"] = ctx_tokens
+                self._store.upsert_session(latest)
+
+            return {
+                "stopReason": outcome.stop_reason,
+                "response": outcome.response,
+                "usage": outcome.usage,
+                "conversationId": outcome.conversation_id,
+            }
 
     def is_cancelled(self, session_id: str) -> bool:
         """Return whether `session_id` has a pending cancellation in SQLite."""
@@ -1352,12 +1441,30 @@ class SessionManager:
         if not self._cli.is_turn_active(session_id):
             return False
 
+        session = self._store.get_session(session_id)
+        cwd = str(session.get("cwd") or "") if session is not None else None
+        img_dir = self._private_images_dir()
+
         if message is not None:
-            formatted_prompt, temp_files = _format_steer_message(message)
+            formatted_prompt, temp_files = _format_steer_message(
+                message,
+                cwd=cwd,
+                image_dir=img_dir,
+            )
             raw_message = message
         else:
-            formatted_prompt, temp_files = _format_prompt_blocks(prompt_blocks or [])
+            formatted_prompt, temp_files = _format_prompt_blocks(
+                prompt_blocks or [],
+                cwd=cwd,
+                image_dir=img_dir,
+            )
             raw_message = formatted_prompt
+
+        if not formatted_prompt or not formatted_prompt.strip():
+            for img_path in temp_files:
+                with contextlib.suppress(OSError):
+                    img_path.unlink(missing_ok=True)
+            return False
 
         queued = await self._cli.steer_session(
             session_id,
@@ -1409,14 +1516,39 @@ class SessionManager:
     ) -> dict[str, Any]:
         """Close and clean up an active session (`session/close`, `terminate`, `delete`)."""
         await self._cli.cancel_session(session_id)
+        self._cli.discard_cancelled(session_id)
         scope = self._active_cancel_scopes.pop(session_id, None) or self._cancel_scopes.pop(
             session_id, None
         )
         if scope is not None:
             scope.cancel()
+        self._mcp_status_cache.pop(session_id, None)
         self._store.set_kv(f"cancelled:{session_id}", False)
         if delete_persisted:
+            target = self._store.get_session(session_id)
+            target_mcp_names: list[str] = []
+            if target is not None:
+                for key in ("mcp_servers", "wire_mcp_servers"):
+                    for srv in target.get(key) or []:
+                        if isinstance(srv, dict):
+                            sname = str(srv.get("name") or "").strip()
+                            if sname and sname not in target_mcp_names:
+                                target_mcp_names.append(sname)
+            other_names = {
+                str(srv.get("name") or "").strip()
+                for other in self._store.list_sessions()
+                if str(other.get("sessionId") or "") != session_id
+                for srv in [
+                    *(other.get("mcp_servers") or []),
+                    *(other.get("wire_mcp_servers") or []),
+                ]
+                if isinstance(srv, dict) and str(srv.get("name") or "").strip()
+            }
+            removable = [name for name in target_mcp_names if name not in other_names]
             self._store.delete_session(session_id)
+            self._turn_locks.pop(session_id, None)
+            if removable:
+                self._cli.sync_mcp_servers([], remove_servers=removable, session_id=session_id)
         else:
             session = self._store.get_session(session_id)
             if session is not None and session.get("cancelled", False):
