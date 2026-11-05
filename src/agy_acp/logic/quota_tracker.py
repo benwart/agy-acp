@@ -2,11 +2,35 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime, tzinfo
 from typing import Any
 
 from agy_acp.providers.quota_provider import QuotaProvider
 from agy_acp.providers.state_store import SqliteStateStoreProvider
+
+RATE_LIMIT_MESSAGE = "Quota limit reached for one or more rolling windows."
+
+
+@dataclass(frozen=True)
+class TurnTelemetry:
+    """Engine-neutral per-turn token, context window, credit, and rate-limit snapshot."""
+
+    session_id: str
+    model_id: str
+    input_tokens: int
+    output_tokens: int
+    cached_read_tokens: int
+    thinking_tokens: int
+    context_tokens: int
+    context_window: int
+    context_usage_pct: float
+    delta_credits: float
+    metering_usage: list[dict[str, Any]]
+    metadata_params: dict[str, Any]
+    usage_update_notification: dict[str, Any]
+    rate_limit_message: str | None = None
+    rate_limit_params: dict[str, Any] | None = None
 
 
 def _parse_reset_datetime(reset_time: str) -> datetime | None:
@@ -387,7 +411,7 @@ class QuotaTracker:
             },
         }
 
-    async def build_kirocrew_wire_updates(
+    async def build_turn_telemetry(
         self,
         *,
         session_id: str,
@@ -397,8 +421,8 @@ class QuotaTracker:
         cached_read_tokens: int = 0,
         thinking_tokens: int = 0,
         context_tokens: int | None = None,
-    ) -> list[dict[str, Any]]:
-        """Build `usage_update` and `_kiro.dev/metadata` notifications for KiroCrew."""
+    ) -> TurnTelemetry:
+        """Record turn tokens and return structured engine-neutral `TurnTelemetry`."""
         self.record_token_usage(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
@@ -429,63 +453,110 @@ class QuotaTracker:
         effective_credits = float(kiro_credits["effective_credits"])
         prev_credits = self._last_session_effective_credits.get(session_id)
         self._last_session_effective_credits[session_id] = effective_credits
-        turn_credits = (
+        delta_credits = (
             round(prev_credits - effective_credits, 4)
             if prev_credits is not None and prev_credits > effective_credits
             else 0.0
         )
-
-        notifications: list[dict[str, Any]] = [
-            usage_notification,
+        metering_usage: list[dict[str, Any]] = [
             {
-                "jsonrpc": "2.0",
-                "method": "_kiro.dev/metadata",
-                "params": {
-                    "sessionId": session_id,
-                    "contextUsagePercentage": context_usage_pct,
-                    "contextWindowSize": self.CONTEXT_WINDOW_SIZE,
-                    "meteringUsage": [
-                        {
-                            "unit": "credit",
-                            "unitPlural": "credits",
-                            "value": turn_credits,
-                        }
-                    ],
-                    "credits": effective_credits,
-                    "quotaCredits": kiro_credits["quota_credits"],
-                    "creditsCapacity": kiro_credits["credit_capacity"],
-                    "creditsBottleneckWindow": kiro_credits["bottleneck_window"],
-                    "creditsResetTime": kiro_credits["reset_time"],
-                    "g1OverageCredits": g1_overage,
-                    "modelId": model_id,
-                    "_meta": {
-                        "quota": {
-                            "five_hour": five_hour,
-                            "seven_day": seven_day,
-                            "kiro_credits": kiro_credits,
-                        }
-                    },
-                },
-            },
+                "unit": "credit",
+                "unitPlural": "credits",
+                "value": delta_credits,
+            }
         ]
+        metadata_params: dict[str, Any] = {
+            "sessionId": session_id,
+            "contextUsagePercentage": context_usage_pct,
+            "contextWindowSize": self.CONTEXT_WINDOW_SIZE,
+            "meteringUsage": metering_usage,
+            "credits": effective_credits,
+            "quotaCredits": kiro_credits["quota_credits"],
+            "creditsCapacity": kiro_credits["credit_capacity"],
+            "creditsBottleneckWindow": kiro_credits["bottleneck_window"],
+            "creditsResetTime": kiro_credits["reset_time"],
+            "g1OverageCredits": g1_overage,
+            "modelId": model_id,
+            "_meta": {
+                "quota": {
+                    "five_hour": five_hour,
+                    "seven_day": seven_day,
+                    "kiro_credits": kiro_credits,
+                }
+            },
+        }
 
         all_buckets = [*five_hour["buckets"], *seven_day["buckets"]]
         exhausted = [bucket for bucket in all_buckets if float(bucket["remaining_fraction"]) <= 0.0]
+        rate_limit_message: str | None = None
+        rate_limit_params: dict[str, Any] | None = None
         if exhausted:
+            rate_limit_message = RATE_LIMIT_MESSAGE
+            rate_limit_params = {
+                "sessionId": session_id,
+                "modelId": model_id,
+                "message": rate_limit_message,
+                "exhaustedBuckets": exhausted,
+                "resetTime": exhausted[0]["reset_time"],
+            }
+
+        return TurnTelemetry(
+            session_id=session_id,
+            model_id=model_id,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_read_tokens=cached_read_tokens,
+            thinking_tokens=thinking_tokens,
+            context_tokens=active_context_tokens,
+            context_window=self.CONTEXT_WINDOW_SIZE,
+            context_usage_pct=context_usage_pct,
+            delta_credits=delta_credits,
+            metering_usage=metering_usage,
+            metadata_params=metadata_params,
+            usage_update_notification=usage_notification,
+            rate_limit_message=rate_limit_message,
+            rate_limit_params=rate_limit_params,
+        )
+
+    compute_turn_telemetry = build_turn_telemetry
+
+    async def build_kirocrew_wire_updates(
+        self,
+        *,
+        session_id: str,
+        model_id: str,
+        input_tokens: int,
+        output_tokens: int,
+        cached_read_tokens: int = 0,
+        thinking_tokens: int = 0,
+        context_tokens: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Build `usage_update` and `_kiro.dev/metadata` notifications for KiroCrew."""
+        telemetry = await self.build_turn_telemetry(
+            session_id=session_id,
+            model_id=model_id,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_read_tokens=cached_read_tokens,
+            thinking_tokens=thinking_tokens,
+            context_tokens=context_tokens,
+        )
+        notifications: list[dict[str, Any]] = [
+            telemetry.usage_update_notification,
+            {
+                "jsonrpc": "2.0",
+                "method": "_kiro.dev/metadata",
+                "params": telemetry.metadata_params,
+            },
+        ]
+        if telemetry.rate_limit_params is not None:
             notifications.append(
                 {
                     "jsonrpc": "2.0",
                     "method": "_kiro.dev/error/rate_limit",
-                    "params": {
-                        "sessionId": session_id,
-                        "modelId": model_id,
-                        "message": "Quota limit reached for one or more rolling windows.",
-                        "exhaustedBuckets": exhausted,
-                        "resetTime": exhausted[0]["reset_time"],
-                    },
+                    "params": telemetry.rate_limit_params,
                 }
             )
-
         return notifications
 
     async def format_slash_command_response(

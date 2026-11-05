@@ -7,14 +7,29 @@ import json
 import sys
 import traceback
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any, Literal
 
 import anyio
+from cyclopts import Parameter
 
 from agy_acp.logic.acp_dispatcher import AcpDispatcher
 from agy_acp.logic.auth_manager import AuthManager, ensure_kiro_identity_store
 from agy_acp.logic.session_manager import SessionManager
 from agy_acp.providers.acp_logger import log_acp_event, snapshot_relevant_env
+
+AGENT_ENGINE_HELP = "Agent engine wire protocol (v2, v3)."
+_V2_ENGINE_ALIASES: frozenset[str] = frozenset({"", "default", "v2", "kiro"})
+_V3_ENGINE_ALIASES: frozenset[str] = frozenset({"v3", "kas"})
+
+
+def normalize_agent_engine(agent_engine: str | None) -> Literal["v2", "v3"]:
+    """Normalize `--agent-engine` flag values into canonical `'v2'` or `'v3'`."""
+    cleaned = (agent_engine or "").strip().lower()
+    if cleaned in _V2_ENGINE_ALIASES:
+        return "v2"
+    if cleaned in _V3_ENGINE_ALIASES:
+        return "v3"
+    raise ValueError(f"Unsupported --agent-engine {agent_engine!r}. Expected 'v2' or 'v3'.")
 
 
 async def default(
@@ -23,7 +38,7 @@ async def default(
     agent: str | None = None,
     model: str | None = None,
     with_builtin: str | None = None,
-    agent_engine: str | None = None,
+    agent_engine: Annotated[str | None, Parameter(help=AGENT_ENGINE_HELP)] = None,
     auth_method: str | None = None,
     auth_file: Path | None = None,
     save_dir: Path | None = None,
@@ -36,6 +51,12 @@ async def default(
     **extra_kwargs: Any,
 ) -> int:
     """Start the Agent Client Protocol (ACP) JSON-RPC 2.0 server over stdio."""
+    try:
+        normalized_engine = normalize_agent_engine(agent_engine)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(2)
+
     if save_dir is None:
         ensure_kiro_identity_store()
     log_acp_event(
@@ -50,6 +71,7 @@ async def default(
             "model": model,
             "with_builtin": with_builtin,
             "agent_engine": agent_engine,
+            "normalized_agent_engine": normalized_engine,
             "auth_method": auth_method,
             "auth_file": str(auth_file) if auth_file else None,
             "save_dir": str(save_dir) if save_dir else None,
