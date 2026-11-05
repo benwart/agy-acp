@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     context_tokens INTEGER NOT NULL DEFAULT 0,
     title TEXT,
     mcp_servers_json TEXT NOT NULL DEFAULT '[]',
+    custom_agents_json TEXT NOT NULL DEFAULT '[]',
     meta_json TEXT NOT NULL DEFAULT '{}',
     auth_config_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL,
@@ -32,6 +33,20 @@ CREATE TABLE IF NOT EXISTS sessions (
 
 CREATE INDEX IF NOT EXISTS idx_sessions_cwd ON sessions(cwd);
 CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS session_turns (
+    session_id TEXT NOT NULL,
+    turn_idx INTEGER NOT NULL,
+    user_message_id TEXT NOT NULL,
+    prompt_blocks_json TEXT NOT NULL DEFAULT '[]',
+    assistant_text TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (session_id, turn_idx),
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_turns_session_idx
+    ON session_turns(session_id, turn_idx ASC);
 
 CREATE TABLE IF NOT EXISTS steps (
     session_id TEXT NOT NULL,
@@ -111,6 +126,10 @@ class SqliteStateStoreProvider:
                 conn.execute(
                     "ALTER TABLE sessions ADD COLUMN context_tokens INTEGER NOT NULL DEFAULT 0"
                 )
+            with contextlib.suppress(sqlite3.OperationalError):
+                conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN custom_agents_json TEXT NOT NULL DEFAULT '[]'"
+                )
 
     @contextlib.contextmanager
     def _connect(self) -> Generator[sqlite3.Connection]:
@@ -136,6 +155,11 @@ class SqliteStateStoreProvider:
         raw_wire = auth_cfg.get("_wire_mcp_servers")
         wire_mcp_servers = raw_wire if isinstance(raw_wire, list) else list(mcp_servers)
         row_keys = row.keys()
+        custom_agents: list[dict[str, Any]] = (
+            json.loads(row["custom_agents_json"] or "[]")
+            if "custom_agents_json" in row_keys
+            else []
+        )
         return {
             "sessionId": str(row["session_id"]),
             "agyConversationId": row["agy_conversation_id"],
@@ -155,6 +179,7 @@ class SqliteStateStoreProvider:
             "title": row["title"],
             "mcp_servers": mcp_servers,
             "wire_mcp_servers": wire_mcp_servers,
+            "custom_agents": custom_agents,
             "meta": json.loads(row["meta_json"] or "{}"),
             "auth_config": auth_cfg,
             "createdAt": str(row["created_at"]),
@@ -177,6 +202,12 @@ class SqliteStateStoreProvider:
         context_tokens = int(state.get("contextTokens", existing.get("contextTokens", 0)))
         title = state.get("title", existing.get("title"))
         mcp_servers = state.get("mcp_servers", existing.get("mcp_servers", []))
+        if "custom_agents" in state:
+            custom_agents = state["custom_agents"]
+        elif "customAgents" in state:
+            custom_agents = state["customAgents"]
+        else:
+            custom_agents = existing.get("custom_agents", [])
         meta = state.get("meta", existing.get("meta", {}))
         auth_config = dict(state.get("auth_config", existing.get("auth_config", {})))
         if "agent" in state:
@@ -218,9 +249,9 @@ class SqliteStateStoreProvider:
                 """
                 INSERT INTO sessions (
                     session_id, agy_conversation_id, cwd, mode, model, reasoning_effort,
-                    cancelled, last_step_idx, context_tokens, title, mcp_servers_json, meta_json,
-                    auth_config_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    cancelled, last_step_idx, context_tokens, title, mcp_servers_json,
+                    custom_agents_json, meta_json, auth_config_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id) DO UPDATE SET
                     agy_conversation_id = excluded.agy_conversation_id,
                     cwd = excluded.cwd,
@@ -232,6 +263,7 @@ class SqliteStateStoreProvider:
                     context_tokens = excluded.context_tokens,
                     title = excluded.title,
                     mcp_servers_json = excluded.mcp_servers_json,
+                    custom_agents_json = excluded.custom_agents_json,
                     meta_json = excluded.meta_json,
                     auth_config_json = excluded.auth_config_json,
                     updated_at = excluded.updated_at
@@ -248,6 +280,7 @@ class SqliteStateStoreProvider:
                     context_tokens,
                     title,
                     json.dumps(mcp_servers),
+                    json.dumps(custom_agents),
                     json.dumps(meta),
                     json.dumps(auth_config),
                     created_at,
@@ -284,13 +317,85 @@ class SqliteStateStoreProvider:
         return [self._row_to_session(row) for row in rows]
 
     def delete_session(self, session_id: str) -> bool:
-        """Delete `session_id` (and cascading steps) from SQLite. Returns True if a row existed."""
+        """Delete `session_id` (and cascading steps/turns) from SQLite. Returns True if existed."""
         with self._connect() as conn:
             cur = conn.execute(
                 "DELETE FROM sessions WHERE session_id = ?",
                 (session_id,),
             )
             return cur.rowcount > 0
+
+    def append_session_turn(
+        self,
+        *,
+        session_id: str,
+        user_message_id: str,
+        prompt_blocks: list[dict[str, Any]],
+        assistant_text: str,
+        turn_idx: int | None = None,
+    ) -> int:
+        """Append or upsert a completed turn in `session_turns` for `session/load` replay."""
+        now = datetime.now(UTC).isoformat()
+        blocks_json = json.dumps(prompt_blocks)
+        with self._connect() as conn:
+            if turn_idx is None:
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(turn_idx), -1) + 1 AS next_idx "
+                    "FROM session_turns WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                resolved_idx = int(row["next_idx"]) if row is not None else 0
+            else:
+                resolved_idx = int(turn_idx)
+            conn.execute(
+                """
+                INSERT INTO session_turns (
+                    session_id, turn_idx, user_message_id, prompt_blocks_json,
+                    assistant_text, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id, turn_idx) DO UPDATE SET
+                    user_message_id = excluded.user_message_id,
+                    prompt_blocks_json = excluded.prompt_blocks_json,
+                    assistant_text = excluded.assistant_text,
+                    created_at = excluded.created_at
+                """,
+                (session_id, resolved_idx, user_message_id, blocks_json, assistant_text, now),
+            )
+        return resolved_idx
+
+    def get_session_turns(self, session_id: str) -> list[dict[str, Any]]:
+        """Return persisted turns for `session_id` ordered by `turn_idx ASC`."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT session_id, turn_idx, user_message_id, prompt_blocks_json,
+                       assistant_text, created_at
+                FROM session_turns
+                WHERE session_id = ?
+                ORDER BY turn_idx ASC
+                """,
+                (session_id,),
+            ).fetchall()
+        return [
+            {
+                "session_id": str(row["session_id"]),
+                "turn_idx": int(row["turn_idx"]),
+                "user_message_id": str(row["user_message_id"]),
+                "prompt_blocks": json.loads(row["prompt_blocks_json"] or "[]"),
+                "assistant_text": str(row["assistant_text"]),
+                "created_at": str(row["created_at"]),
+            }
+            for row in rows
+        ]
+
+    def clear_session_turns(self, session_id: str) -> int:
+        """Delete all `session_turns` rows for `session_id` without removing the session."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM session_turns WHERE session_id = ?",
+                (session_id,),
+            )
+            return cur.rowcount
 
     def upsert_step(
         self,

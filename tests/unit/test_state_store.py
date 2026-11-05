@@ -152,3 +152,108 @@ def test_sqlite_token_ledger_persistence_across_instances(tmp_path: Path) -> Non
         "thinking_tokens": 15,
         "total_tokens": 240,
     }
+
+
+def test_sqlite_custom_agents_column_and_legacy_db_migration(tmp_path: Path) -> None:
+    """Verify custom_agents_json persists on new DBs and migrates cleanly on legacy DBs."""
+    import sqlite3
+
+    legacy_db = tmp_path / "legacy.db"
+    conn = sqlite3.connect(str(legacy_db))
+    conn.executescript(
+        """
+        CREATE TABLE sessions (
+            session_id TEXT PRIMARY KEY,
+            agy_conversation_id TEXT,
+            cwd TEXT NOT NULL,
+            mode TEXT NOT NULL DEFAULT 'auto',
+            model TEXT NOT NULL DEFAULT 'gemini-3.7-pro',
+            reasoning_effort TEXT NOT NULL DEFAULT 'medium',
+            cancelled INTEGER NOT NULL DEFAULT 0,
+            last_step_idx INTEGER NOT NULL DEFAULT -1,
+            title TEXT,
+            mcp_servers_json TEXT NOT NULL DEFAULT '[]',
+            meta_json TEXT NOT NULL DEFAULT '{}',
+            auth_config_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        INSERT INTO sessions (
+            session_id, cwd, created_at, updated_at
+        ) VALUES ('legacy-sess', '/legacy', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = SqliteStateStoreProvider(legacy_db)
+    migrated = store.get_session("legacy-sess")
+    assert migrated is not None
+    assert migrated["custom_agents"] == []
+
+    agents = [
+        {"id": "reviewer", "name": "Code Reviewer", "prompt": "Review diffs carefully."},
+    ]
+    updated = store.upsert_session(
+        {
+            "sessionId": "legacy-sess",
+            "custom_agents": agents,
+        }
+    )
+    assert updated["custom_agents"] == agents
+
+    reloaded = SqliteStateStoreProvider(legacy_db).get_session("legacy-sess")
+    assert reloaded is not None
+    assert reloaded["custom_agents"] == agents
+
+
+def test_sqlite_session_turns_lifecycle_and_cascade(tmp_path: Path) -> None:
+    """Verify session_turns append, ordering, clear, reload preservation, and delete cascade."""
+    store = SqliteStateStoreProvider(tmp_path)
+    store.upsert_session({"sessionId": "sess-turns", "cwd": "/ws"})
+
+    idx0 = store.append_session_turn(
+        session_id="sess-turns",
+        user_message_id="msg-1",
+        prompt_blocks=[{"type": "text", "text": "Hello"}],
+        assistant_text="Hi there!",
+    )
+    idx1 = store.append_session_turn(
+        session_id="sess-turns",
+        user_message_id="msg-2",
+        prompt_blocks=[{"type": "text", "text": "Follow up"}],
+        assistant_text="Second reply.",
+    )
+    assert (idx0, idx1) == (0, 1)
+
+    # Non-destructive session metadata update and store reload keep turns intact
+    store.upsert_session({"sessionId": "sess-turns", "mode": "approve"})
+    store_reloaded = SqliteStateStoreProvider(tmp_path)
+    turns = store_reloaded.get_session_turns("sess-turns")
+    assert len(turns) == 2
+    assert turns[0]["turn_idx"] == 0
+    assert turns[0]["user_message_id"] == "msg-1"
+    assert turns[0]["prompt_blocks"] == [{"type": "text", "text": "Hello"}]
+    assert turns[0]["assistant_text"] == "Hi there!"
+    assert turns[1]["turn_idx"] == 1
+    assert turns[1]["user_message_id"] == "msg-2"
+    assert turns[1]["assistant_text"] == "Second reply."
+
+    # Explicit clear removes turns without deleting the session
+    removed = store_reloaded.clear_session_turns("sess-turns")
+    assert removed == 2
+    assert store_reloaded.get_session_turns("sess-turns") == []
+    assert store_reloaded.get_session("sess-turns") is not None
+
+    # Appending again restarts at turn_idx 0, and delete_session cascades
+    assert (
+        store_reloaded.append_session_turn(
+            session_id="sess-turns",
+            user_message_id="msg-3",
+            prompt_blocks=[{"type": "text", "text": "After compact"}],
+            assistant_text="Fresh start.",
+        )
+        == 0
+    )
+    assert store_reloaded.delete_session("sess-turns") is True
+    assert store_reloaded.get_session_turns("sess-turns") == []
