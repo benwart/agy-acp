@@ -584,3 +584,112 @@ async def test_slash_command_renders_local_reset_time_and_countdown() -> None:
     assert "2026-10-24 5:34 AM PDT (in 7h 12m)" in md
     assert "2026-10-24T07:52:04Z" not in md
     assert "2026-10-24T12:34:28Z" not in md
+
+
+async def test_turn_telemetry_dataclass_delta_credits_and_rate_limit() -> None:
+    """Verify frozen TurnTelemetry encapsulates context, credit deltas, metadata, and rate limit."""
+    from dataclasses import FrozenInstanceError
+
+    import pytest
+
+    from agy_acp.logic.quota_tracker import TurnTelemetry
+
+    fractions = [0.95, 0.85, 0.0]
+
+    class _DynamicQuotaProvider(QuotaProvider):
+        def __init__(self) -> None:
+            super().__init__(cli_provider=_StubAgyCliProvider())
+            self._idx = 0
+
+        async def fetch_quota_groups(self) -> list[dict[str, Any]]:
+            frac = fractions[min(self._idx, len(fractions) - 1)]
+            return [
+                {
+                    "group": "Gemini Models",
+                    "buckets": [
+                        {
+                            "id": "gemini-5h",
+                            "name": "Five Hour Limit Remaining",
+                            "window": "5h",
+                            "remaining_fraction": frac,
+                            "reset_time": "2026-10-24T07:52:04Z",
+                        },
+                        {
+                            "id": "gemini-weekly",
+                            "name": "Weekly Limit Remaining",
+                            "window": "weekly",
+                            "remaining_fraction": 0.50,
+                            "reset_time": "2026-10-27T12:00:00Z",
+                        },
+                    ],
+                }
+            ]
+
+        async def fetch_credits(self) -> dict[str, Any]:
+            return {"remaining_credits": 0, "upgrade_uri": "https://one.google.com/ai"}
+
+    dyn_provider = _DynamicQuotaProvider()
+    tracker = QuotaTracker(provider=dyn_provider)
+
+    # Turn 1: baseline effective_credits = 190.0 -> delta_credits = 0.0
+    t1 = await tracker.build_turn_telemetry(
+        session_id="sess-telemetry-1",
+        model_id="gemini-3.1-pro-high",
+        input_tokens=1_200,
+        output_tokens=300,
+        cached_read_tokens=500,
+        thinking_tokens=100,
+        context_tokens=25_000,
+    )
+    assert isinstance(t1, TurnTelemetry)
+    with pytest.raises(FrozenInstanceError):
+        t1.delta_credits = 99.0  # ty: ignore[invalid-assignment]
+
+    assert t1.session_id == "sess-telemetry-1"
+    assert t1.model_id == "gemini-3.1-pro-high"
+    assert t1.input_tokens == 1_200
+    assert t1.output_tokens == 300
+    assert t1.cached_read_tokens == 500
+    assert t1.thinking_tokens == 100
+    assert t1.context_tokens == 25_000
+    assert t1.context_window == QuotaTracker.CONTEXT_WINDOW_SIZE
+    assert t1.context_usage_pct == 2.5
+    assert t1.delta_credits == 0.0
+    assert t1.metering_usage == [{"unit": "credit", "unitPlural": "credits", "value": 0.0}]
+    assert t1.metadata_params["sessionId"] == "sess-telemetry-1"
+    assert t1.metadata_params["contextUsagePercentage"] == 2.5
+    assert t1.metadata_params["credits"] == 190.0
+    assert t1.usage_update_notification["params"]["update"]["used"] == 25_000
+    assert t1.rate_limit_message is None
+    assert t1.rate_limit_params is None
+
+    # Turn 2: remaining_fraction drops 0.95 -> 0.85 (190.0 -> 170.0) -> delta_credits = 20.0
+    dyn_provider._idx = 1
+    t2 = await tracker.build_turn_telemetry(
+        session_id="sess-telemetry-1",
+        model_id="gemini-3.1-pro-high",
+        input_tokens=800,
+        output_tokens=200,
+        context_tokens=30_000,
+    )
+    assert t2.delta_credits == 20.0
+    assert t2.metering_usage == [{"unit": "credit", "unitPlural": "credits", "value": 20.0}]
+    assert t2.metadata_params["meteringUsage"] == t2.metering_usage
+    assert t2.context_usage_pct == 3.0
+    assert t2.rate_limit_message is None
+
+    # Turn 3: remaining_fraction drops to 0.0 -> rate_limit_message & rate_limit_params populated
+    dyn_provider._idx = 2
+    t3 = await tracker.build_turn_telemetry(
+        session_id="sess-telemetry-1",
+        model_id="gemini-3.1-pro-high",
+        input_tokens=500,
+        output_tokens=100,
+    )
+    assert t3.context_tokens == 600
+    assert t3.delta_credits == 170.0
+    assert t3.rate_limit_message == "Quota limit reached for one or more rolling windows."
+    assert t3.rate_limit_params is not None
+    assert t3.rate_limit_params["message"] == t3.rate_limit_message
+    assert t3.rate_limit_params["resetTime"] == "2026-10-24T07:52:04Z"
+    assert len(t3.rate_limit_params["exhaustedBuckets"]) == 1
