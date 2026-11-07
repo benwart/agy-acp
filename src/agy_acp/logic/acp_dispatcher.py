@@ -453,6 +453,7 @@ class AcpDispatcher:
             contextvars.ContextVar(f"agy_acp_post_notifs_{id(self)}", default=None)
         )
         self._mcp_status_cache: dict[str, dict[str, McpServerStatus]] = {}
+        self._client_opens_external_url: bool = False
 
     @property
     def wire_adapter(self) -> EngineWireAdapter:
@@ -1137,6 +1138,18 @@ class AcpDispatcher:
         if stop_reason == "cancelled" or self._session_manager.consume_cancellation(session_id):
             return self._cancelled_prompt_response(message_id)
 
+        fallback_from = str(turn_result.get("fallbackFromModel") or "")
+        resolved_to = str(turn_result.get("resolvedModel") or "")
+        if fallback_from and resolved_to and fallback_from != resolved_to:
+            for fb_frame in self._wire_adapter.build_model_fallback_notifications(
+                session_id,
+                from_model=fallback_from,
+                to_model=resolved_to,
+                trigger="availability",
+                scope="session",
+            ):
+                await self._emit_notification(fb_frame)
+
         assistant_text = str(turn_result.get("response") or "".join(collected_chunks))
         if self._session_manager.state_store.get_session(session_id) is not None:
             self._session_manager.state_store.append_session_turn(
@@ -1614,18 +1627,31 @@ class AcpDispatcher:
         """Handle `_kiro/mcp/resetServer` by re-probing target server and emitting full roster."""
         session_id = _require_non_empty_str(params, "sessionId")
         server_name = _require_non_empty_str(params, "serverName")
+        raw_start_oauth = params.get("startOAuth")
         if session_id is None or server_name is None:
+            return _jsonrpc_error(message_id, -32602, "Invalid params")
+        if raw_start_oauth is not None and not isinstance(raw_start_oauth, bool):
             return _jsonrpc_error(message_id, -32602, "Invalid params")
         try:
             self._session_manager.get_session(session_id)
         except KeyError as exc:
             return _jsonrpc_error(message_id, -32002, str(exc))
 
+        clean_server_name = server_name.strip()
         await self._emit_or_queue_mcp_readiness(
             session_id,
             post_response=False,
-            server_filter=server_name.strip(),
+            server_filter=clean_server_name,
         )
+        if (
+            raw_start_oauth is True
+            and self._client_opens_external_url
+            and self._client_rpc_caller is not None
+        ):
+            target_status = self._mcp_status_cache.get(session_id, {}).get(clean_server_name)
+            auth_url = target_status.auth_url if target_status is not None else None
+            if isinstance(auth_url, str) and auth_url.startswith(("http://", "https://")):
+                await self._client_rpc_caller("_kiro/openExternalUrl", {"url": auth_url})
         return {
             "jsonrpc": "2.0",
             "id": message_id,
@@ -1933,6 +1959,14 @@ class AcpDispatcher:
                     -32602,
                     "Invalid params: 'protocolVersion' must be an integer >= 1",
                 )
+        raw_client_caps = params.get("clientCapabilities")
+        if isinstance(raw_client_caps, Mapping):
+            raw_client_meta = raw_client_caps.get("_meta")
+            if isinstance(raw_client_meta, Mapping):
+                raw_client_kiro = raw_client_meta.get("kiro")
+                if isinstance(raw_client_kiro, Mapping):
+                    self._client_opens_external_url = raw_client_kiro.get("openExternalUrl") is True
+
         init_res = self._wire_adapter.build_initialize_result(
             version=KIRO_CLI_COMPAT_VERSION,
             name="agy-acp",

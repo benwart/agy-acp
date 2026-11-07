@@ -588,3 +588,106 @@ def test_normalize_agy_tool_event_mappings() -> None:
     assert via_adapter.is_mcp is True
     assert via_adapter.mcp_server == "corp_auth"
     assert via_adapter.mcp_tool == "verify_token"
+
+
+def test_model_fallback_notifications_v2_and_v3() -> None:
+    """Verify KAS v3 session_info_update and V2 _kiro.dev/session/update model_fallback frames."""
+    v2 = V2KiroWireAdapter()
+    v3 = V3KasWireAdapter()
+
+    v3_session = v3.build_model_fallback_notifications(
+        "sess-1",
+        from_model="claude-retired-1",
+        to_model="gemini-4-argon-medium",
+        trigger="availability",
+        scope="session",
+    )
+    assert v3_session == [
+        {
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "sess-1",
+                "update": {
+                    "sessionUpdate": "session_info_update",
+                    "_meta": {
+                        "kiro": {
+                            "kind": "model_fallback",
+                            "from": "claude-retired-1",
+                            "to": "gemini-4-argon-medium",
+                            "trigger": "availability",
+                            "scope": "session",
+                        }
+                    },
+                },
+            },
+        }
+    ]
+
+    v3_decline = v3.build_model_fallback_notifications(
+        "sess-1",
+        from_model="claude-retired-1",
+        to_model=None,
+        trigger="refusal",
+        scope="turn",
+        reason="noServedTarget",
+    )
+    assert v3_decline[0]["params"]["update"]["_meta"]["kiro"] == {
+        "kind": "model_fallback",
+        "from": "claude-retired-1",
+        "to": None,
+        "trigger": "refusal",
+        "scope": "turn",
+        "reason": "noServedTarget",
+    }
+
+    v2_session = v2.build_model_fallback_notifications(
+        "sess-1",
+        from_model="claude-retired-1",
+        to_model="gemini-4-argon-medium",
+        trigger="availability",
+        scope="session",
+    )
+    assert v2_session == [
+        {
+            "jsonrpc": "2.0",
+            "method": "_kiro.dev/session/update",
+            "params": {
+                "sessionId": "sess-1",
+                "update": {
+                    "sessionUpdate": "model_fallback",
+                    "from": "claude-retired-1",
+                    "to": "gemini-4-argon-medium",
+                    "cause": "unavailable",
+                    "source": "backend",
+                    "promoted": False,
+                },
+            },
+        },
+        {
+            "jsonrpc": "2.0",
+            "method": "_kiro.dev/session/update",
+            "params": {
+                "sessionId": "sess-1",
+                "update": {
+                    "sessionUpdate": "model_fallback",
+                    "from": "claude-retired-1",
+                    "to": "gemini-4-argon-medium",
+                    "cause": "unavailable",
+                    "source": "backend",
+                    "promoted": True,
+                },
+            },
+        },
+    ]
+
+    v2_turn = v2.build_model_fallback_notifications(
+        "sess-1",
+        from_model="claude-retired-1",
+        to_model="gemini-4-argon-medium",
+        trigger="refusal",
+        scope="turn",
+    )
+    assert len(v2_turn) == 1
+    assert v2_turn[0]["params"]["update"]["cause"] == "refused"
+    assert v2_turn[0]["params"]["update"]["promoted"] is False

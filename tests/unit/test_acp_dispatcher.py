@@ -2424,3 +2424,278 @@ async def test_wave5b_jsonrpc_input_validation_and_concurrent_post_notifications
         sid_local, post_frames = captured[req_id]
         assert [f["method"] for f in post_frames] == ["_kiro/mcp/status", "_kiro/tools/didChange"]
         assert all(f["params"]["sessionId"] == sid_local for f in post_frames)
+
+
+async def test_kas_mcp_reset_server_start_oauth_and_model_fallback_notifications(
+    tmp_path: Path,
+) -> None:
+    """Verify KAS 0.12.0 _kiro/mcp/resetServer startOAuth -> _kiro/openExternalUrl & fallback."""
+    from agy_acp.logic.wire import McpServerStatus, V2KiroWireAdapter, V3KasWireAdapter
+
+    emitted_v3: list[dict[str, Any]] = []
+    outbound_rpcs: list[tuple[str, dict[str, Any]]] = []
+
+    async def _sink_v3(msg: dict[str, Any]) -> None:
+        emitted_v3.append(msg)
+
+    async def _rpc_caller(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        outbound_rpcs.append((method, dict(params)))
+        return {"success": True}
+
+    class _FallbackAndOAuthStubCli(_StubAgyCliProvider):
+        async def stream_prompt(self, **kwargs: Any) -> PromptOutcome:
+            requested_model = str(kwargs.get("model") or "")
+            on_text = kwargs.get("on_text")
+            if on_text is not None:
+                await on_text("Fallback answer.")
+            if requested_model == "retired-model-v1":
+                return PromptOutcome(
+                    conversation_id="conv-fb-kas",
+                    stop_reason="end_turn",
+                    response="Fallback answer.",
+                    usage={"input_tokens": 8, "output_tokens": 4, "context_tokens": 200},
+                    resolved_model="gemini-3.8-flash",
+                    fallback_from_model="retired-model-v1",
+                )
+            return PromptOutcome(
+                conversation_id="conv-normal",
+                stop_reason="end_turn",
+                response="Fallback answer.",
+                usage={"input_tokens": 8, "output_tokens": 4, "context_tokens": 200},
+                resolved_model=requested_model,
+            )
+
+    adapter_v3 = V3KasWireAdapter()
+    cli_v3 = _FallbackAndOAuthStubCli(save_dir=tmp_path / "v3")
+    cli_v3.state_store.save_models(
+        [
+            {"modelId": "retired-model-v1", "name": "Retired v1", "description": "Old"},
+            {"modelId": "gemini-3.8-flash", "name": "Gemini 3.8 Flash", "description": "Fast"},
+        ]
+    )
+
+    class _OAuthProbeSessionManager(SessionManager):
+        async def probe_session_mcp_servers(
+            self,
+            session_id: str,
+            server_filter: str | None = None,
+        ) -> list[McpServerStatus]:
+            _ = (session_id, server_filter)
+            return [
+                McpServerStatus(
+                    name="oauth-srv",
+                    display_name="OAuth Server",
+                    status="authRequired",
+                    auth_url="https://auth.example.com/oauth/authorize?client=1",
+                    failed_authorization=True,
+                )
+            ]
+
+        def get_session_probe_server_names(self, session_id: str) -> list[str]:
+            _ = session_id
+            return ["oauth-srv"]
+
+    mgr_v3 = _OAuthProbeSessionManager(
+        save_dir=tmp_path / "v3",
+        cli_provider=cli_v3,
+        wire_adapter=adapter_v3,
+    )
+
+    dispatcher_v3 = AcpDispatcher(
+        notification_sink=_sink_v3,
+        client_rpc_caller=_rpc_caller,
+        session_manager=mgr_v3,
+        quota_tracker=QuotaTracker(
+            provider=QuotaProvider(cli_provider=cli_v3),
+            state_store=cli_v3.state_store,
+        ),
+        wire_adapter=adapter_v3,
+    )
+
+    init_resp = await dispatcher_v3.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": 1,
+                    "clientCapabilities": {"_meta": {"kiro": {"openExternalUrl": True}}},
+                },
+            }
+        )
+    )
+    assert init_resp is not None and "result" in init_resp
+
+    new_resp = await dispatcher_v3.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/new",
+                "params": {
+                    "cwd": str(tmp_path),
+                    "mcpServers": [{"name": "oauth-srv", "url": "https://mcp.example.com/sse"}],
+                },
+            }
+        )
+    )
+    assert new_resp is not None
+    sid = new_resp["result"]["sessionId"]
+    dispatcher_v3.pop_post_response_notifications()
+    emitted_v3.clear()
+
+    # Non-boolean startOAuth -> -32602
+    bad_reset = await dispatcher_v3.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "_kiro/mcp/resetServer",
+                "params": {"sessionId": sid, "serverName": "oauth-srv", "startOAuth": "true"},
+            }
+        )
+    )
+    assert bad_reset is not None and bad_reset["error"]["code"] == -32602
+
+    # startOAuth=False -> re-probes without calling _kiro/openExternalUrl
+    reattempt_resp = await dispatcher_v3.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "_kiro/mcp/resetServer",
+                "params": {"sessionId": sid, "serverName": "oauth-srv", "startOAuth": False},
+            }
+        )
+    )
+    assert reattempt_resp == {"jsonrpc": "2.0", "id": 4, "result": {}}
+    assert outbound_rpcs == []
+
+    # startOAuth=True -> calls _kiro/openExternalUrl before returning resetServer response
+    signin_resp = await dispatcher_v3.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "_kiro/mcp/resetServer",
+                "params": {"sessionId": sid, "serverName": "oauth-srv", "startOAuth": True},
+            }
+        )
+    )
+    assert signin_resp == {"jsonrpc": "2.0", "id": 5, "result": {}}
+    assert outbound_rpcs == [
+        ("_kiro/openExternalUrl", {"url": "https://auth.example.com/oauth/authorize?client=1"})
+    ]
+
+    # Pin retired model and run session/prompt -> emits KAS model_fallback & promotes session model
+    await dispatcher_v3.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "session/set_model",
+                "params": {"sessionId": sid, "modelId": "retired-model-v1"},
+            }
+        )
+    )
+    emitted_v3.clear()
+    prompt_resp = await dispatcher_v3.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": sid,
+                    "prompt": [{"type": "text", "text": "Hello"}],
+                },
+            }
+        )
+    )
+    assert prompt_resp is not None and prompt_resp["result"]["stopReason"] == "end_turn"
+    assert mgr_v3.get_session(sid)["model"] == "gemini-3.8-flash"
+    fb_v3 = [
+        n["params"]["update"]["_meta"]["kiro"]
+        for n in emitted_v3
+        if n.get("method") == "session/update"
+        and n["params"]["update"].get("sessionUpdate") == "session_info_update"
+        and n["params"]["update"].get("_meta", {}).get("kiro", {}).get("kind") == "model_fallback"
+    ]
+    assert fb_v3 == [
+        {
+            "kind": "model_fallback",
+            "from": "retired-model-v1",
+            "to": "gemini-3.8-flash",
+            "trigger": "availability",
+            "scope": "session",
+        }
+    ]
+
+    # V2 engine also emits _kiro.dev/session/update model_fallback (hop + promoted)
+    emitted_v2: list[dict[str, Any]] = []
+
+    async def _sink_v2(msg: dict[str, Any]) -> None:
+        emitted_v2.append(msg)
+
+    adapter_v2 = V2KiroWireAdapter()
+    cli_v2 = _FallbackAndOAuthStubCli(save_dir=tmp_path / "v2")
+    cli_v2.state_store.save_models(
+        [
+            {"modelId": "retired-model-v1", "name": "Retired v1", "description": "Old"},
+            {"modelId": "gemini-3.8-flash", "name": "Gemini 3.8 Flash", "description": "Fast"},
+        ]
+    )
+    mgr_v2 = SessionManager(save_dir=tmp_path / "v2", cli_provider=cli_v2, wire_adapter=adapter_v2)
+    dispatcher_v2 = AcpDispatcher(
+        notification_sink=_sink_v2,
+        session_manager=mgr_v2,
+        quota_tracker=QuotaTracker(
+            provider=QuotaProvider(cli_provider=cli_v2),
+            state_store=cli_v2.state_store,
+        ),
+        wire_adapter=adapter_v2,
+    )
+    new_v2 = await dispatcher_v2.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "session/new",
+                "params": {"cwd": str(tmp_path), "mcpServers": []},
+            }
+        )
+    )
+    assert new_v2 is not None
+    sid_v2 = new_v2["result"]["sessionId"]
+    await dispatcher_v2.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "session/set_model",
+                "params": {"sessionId": sid_v2, "modelId": "retired-model-v1"},
+            }
+        )
+    )
+    emitted_v2.clear()
+    await dispatcher_v2.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 12,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": sid_v2,
+                    "prompt": [{"type": "text", "text": "Hello"}],
+                },
+            }
+        )
+    )
+    fb_v2 = [
+        n["params"]["update"]
+        for n in emitted_v2
+        if n.get("method") == "_kiro.dev/session/update"
+        and n["params"]["update"].get("sessionUpdate") == "model_fallback"
+    ]
+    assert [u["promoted"] for u in fb_v2] == [False, True]

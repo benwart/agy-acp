@@ -103,6 +103,53 @@ def test_build_agy_args_maps_modes_effort_and_flags() -> None:
     )
     assert args_ro[args_ro.index("--mode") + 1] == "plan"
     assert "--dangerously-skip-permissions" not in args_ro
+    assert "--disable-slash-commands" in args_ro
+
+    args_ro_slash = build_agy_args(
+        cwd="/workspace",
+        prompt_arg="/plan refactor auth",
+        mode="read-only",
+    )
+    assert "--disable-slash-commands" not in args_ro_slash
+
+
+def test_build_agy_args_and_resolve_model_for_effort_avoid_conflicting_effort_flags() -> None:
+    """Verify effort-suffixed agy models resolve sibling variants or omit conflicting --effort."""
+    from agy_acp.providers.agy_cli_provider import resolve_model_for_effort
+
+    cached_models = [
+        {"modelId": "gemini-4-argon-medium", "name": "Gemini 4 Argon (Medium)"},
+        {"modelId": "gemini-4-argon-low", "name": "Gemini 4 Argon (Low)"},
+        {"modelId": "gpt-oss-120b-medium", "name": "GPT-OSS 120B (Medium)"},
+    ]
+    assert (
+        resolve_model_for_effort("gemini-4-argon-medium", "low", cached_models)
+        == "gemini-4-argon-low"
+    )
+    assert (
+        resolve_model_for_effort("gpt-oss-120b-medium", "low", cached_models)
+        == "gpt-oss-120b-medium"
+    )
+    assert resolve_model_for_effort("gemini-3.7-pro", "high", cached_models) == "gemini-3.7-pro"
+
+    args_conflict = build_agy_args(
+        cwd="/workspace",
+        prompt_arg="Summarize",
+        model="gpt-oss-120b-medium",
+        mode="auto",
+        effort="low",
+    )
+    assert args_conflict[args_conflict.index("--model") + 1] == "gpt-oss-120b-medium"
+    assert "--effort" not in args_conflict
+
+    args_matching = build_agy_args(
+        cwd="/workspace",
+        prompt_arg="Summarize",
+        model="gemini-4-argon-low",
+        mode="auto",
+        effort="low",
+    )
+    assert args_matching[args_matching.index("--effort") + 1] == "low"
 
 
 async def test_discover_models_parses_tab_separated_and_caches(tmp_path: Path) -> None:
@@ -1617,3 +1664,45 @@ async def test_security_remediations_wave5b_provider(
     await anyio.sleep(0.05)
     with pytest.raises(ProcessLookupError):
         os.kill(bg_pid, 0)
+
+
+async def test_stream_prompt_records_fallback_from_model_and_new_resolved_model(
+    tmp_path: Path,
+) -> None:
+    """Verify invalid-model retry records fallback_from_model and captures retry's init.model."""
+    fake_agy = _write_executable(
+        tmp_path / "agy-fallback",
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "args = sys.argv[1:]\n"
+        "model = args[args.index('--model') + 1] if '--model' in args else ''\n"
+        "if model == 'retired-model-v1':\n"
+        "    print(json.dumps({\n"
+        "        'event': 'result',\n"
+        "        'result': {'status': 'ERROR', 'error': 'invalid model: retired-model-v1'},\n"
+        "    }), flush=True)\n"
+        "    sys.exit(1)\n"
+        "print(json.dumps({\n"
+        "    'event': 'init',\n"
+        "    'init': {'conversation_id': 'conv-fb-1', 'model': 'gemini-4-argon-medium'},\n"
+        "}), flush=True)\n"
+        "print(json.dumps({\n"
+        "    'event': 'result',\n"
+        "    'result': {\n"
+        "        'conversation_id': 'conv-fb-1',\n"
+        "        'status': 'SUCCESS',\n"
+        "        'response': 'Recovered response',\n"
+        "    },\n"
+        "}), flush=True)\n",
+    )
+    provider = AgyCliProvider(bin_path=fake_agy, save_dir=tmp_path / "state")
+    outcome = await provider.stream_prompt(
+        cwd=str(tmp_path),
+        prompt="hello",
+        model="retired-model-v1",
+        session_id="sess-fb",
+    )
+    assert outcome.stop_reason == "end_turn"
+    assert outcome.response == "Recovered response"
+    assert outcome.fallback_from_model == "retired-model-v1"
+    assert outcome.resolved_model == "gemini-4-argon-medium"

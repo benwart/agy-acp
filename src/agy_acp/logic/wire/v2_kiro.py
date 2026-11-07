@@ -11,6 +11,8 @@ from agy_acp.logic.wire.base import (
     CompactionPhase,
     EngineWireAdapter,
     McpServerStatus,
+    ModelFallbackScope,
+    ModelFallbackTrigger,
     NormalizedToolEvent,
     SteeringPhase,
     WireTurnTelemetry,
@@ -417,3 +419,52 @@ class V2KiroWireAdapter(EngineWireAdapter):
                 },
             }
         ]
+
+    def build_model_fallback_notifications(
+        self,
+        session_id: str,
+        *,
+        from_model: str,
+        to_model: str | None,
+        trigger: ModelFallbackTrigger = "availability",
+        scope: ModelFallbackScope = "session",
+        reason: str = "",
+    ) -> list[dict[str, Any]]:
+        _ = reason
+        cause = "unavailable" if trigger == "availability" else "refused"
+        frames: list[dict[str, Any]] = [
+            {
+                "jsonrpc": "2.0",
+                "method": "_kiro.dev/session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "model_fallback",
+                        "from": from_model,
+                        "to": to_model,
+                        "cause": cause,
+                        "source": "backend",
+                        "promoted": False,
+                    },
+                },
+            }
+        ]
+        if scope == "session" and to_model is not None:
+            frames.append(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "_kiro.dev/session/update",
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "model_fallback",
+                            "from": from_model,
+                            "to": to_model,
+                            "cause": cause,
+                            "source": "backend",
+                            "promoted": True,
+                        },
+                    },
+                }
+            )
+        return frames

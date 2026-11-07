@@ -12,7 +12,7 @@ import signal
 import sys
 import threading
 import uuid
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -162,6 +162,7 @@ class PromptOutcome:
     usage: dict[str, int]
     raw_result: dict[str, Any] = field(default_factory=dict)
     resolved_model: str = ""
+    fallback_from_model: str = ""
 
 
 @dataclass(frozen=True)
@@ -268,6 +269,40 @@ def prepare_prompt_arg(
     return instruction, file_path
 
 
+def _split_model_effort_suffix(model: str | None) -> tuple[str, str] | None:
+    """Return `(base_family, effort_suffix)` if `model` ends in a recognized `-<effort>` suffix."""
+    if not model:
+        return None
+    cleaned = model.strip()
+    base, sep, suffix = cleaned.rpartition("-")
+    if sep and base and suffix.lower() in VALID_EFFORTS:
+        return base, suffix.lower()
+    return None
+
+
+def resolve_model_for_effort(
+    model: str | None,
+    effort: str | None,
+    available_models: Sequence[Mapping[str, Any]] = (),
+) -> str | None:
+    """Switch an effort-suffixed `agy` model ID to its matching `-<effort>` sibling when cached."""
+    if not model or not effort:
+        return model
+    normalized_effort = effort.strip().lower()
+    if normalized_effort not in VALID_EFFORTS:
+        return model
+    parsed = _split_model_effort_suffix(model)
+    if parsed is None or parsed[1] == normalized_effort:
+        return model
+    candidate_id = f"{parsed[0]}-{normalized_effort}"
+    known_ids = {
+        str(entry.get("modelId") or "").strip()
+        for entry in available_models
+        if isinstance(entry, Mapping) and entry.get("modelId")
+    }
+    return candidate_id if candidate_id in known_ids else model
+
+
 def build_agy_args(
     *,
     cwd: str,
@@ -291,10 +326,15 @@ def build_agy_args(
 
     cli_mode = _MODE_TO_AGY_CLI.get(mode, "auto")
     args.extend(["--mode", cli_mode])
+    if cli_mode == "plan" and not prompt_arg.lstrip().startswith("/"):
+        args.append("--disable-slash-commands")
 
     if effort:
         normalized_effort = effort.strip().lower()
-        if normalized_effort in VALID_EFFORTS:
+        model_effort = _split_model_effort_suffix(model)
+        if normalized_effort in VALID_EFFORTS and (
+            model_effort is None or model_effort[1] == normalized_effort
+        ):
             args.extend(["--effort", normalized_effort])
 
     effective_skip = skip_permissions if skip_permissions is not None else (mode == "auto")
@@ -1616,6 +1656,7 @@ class AgyCliProvider:
 
         resolved_conv_id = conversation_id or ""
         resolved_model = model or ""
+        fallback_from_model = ""
         current_prompt = prompt
         current_model = model
         collected_texts: list[str] = []
@@ -2054,6 +2095,9 @@ class AgyCliProvider:
                         rejected_model=current_model,
                         error=err_msg,
                     )
+                    if not fallback_from_model:
+                        fallback_from_model = current_model
+                    resolved_model = ""
                     current_model = None
                     continue
 
@@ -2140,4 +2184,5 @@ class AgyCliProvider:
             usage=usage,
             raw_result=final_result_obj,
             resolved_model=resolved_model,
+            fallback_from_model=fallback_from_model,
         )

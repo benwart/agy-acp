@@ -13,6 +13,8 @@ ToolCallKind = Literal["execute", "read", "edit", "delete", "search", "fetch", "
 McpConnectionState = Literal["connecting", "connected", "failed", "disabled", "authRequired"]
 SteeringPhase = Literal["queued", "consumed", "injected", "discarded", "cleared"]
 CompactionPhase = Literal["started", "completed", "failed"]
+ModelFallbackTrigger = Literal["availability", "refusal"]
+ModelFallbackScope = Literal["turn", "session"]
 
 DEFAULT_BASE_MODES: tuple[dict[str, str], ...] = (
     {
@@ -547,3 +549,16 @@ class EngineWireAdapter(ABC):
         subagents: Sequence[Mapping[str, Any]],
     ) -> list[dict[str, Any]]:
         """Build native child subagent roster/progress notifications."""
+
+    @abstractmethod
+    def build_model_fallback_notifications(
+        self,
+        session_id: str,
+        *,
+        from_model: str,
+        to_model: str | None,
+        trigger: ModelFallbackTrigger = "availability",
+        scope: ModelFallbackScope = "session",
+        reason: str = "",
+    ) -> list[dict[str, Any]]:
+        """Build engine-initiated model fallback notifications."""

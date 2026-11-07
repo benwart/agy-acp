@@ -25,6 +25,7 @@ from agy_acp.providers.agy_cli_provider import (
     ToolCallEvent,
     _dedupe_mcp_servers,
     load_kiro_agent_spec,
+    resolve_model_for_effort,
     translate_mcp_server,
 )
 from agy_acp.providers.state_store import SqliteStateStoreProvider
@@ -1169,7 +1170,8 @@ class SessionManager:
             compact_prompt = f"{compact_prompt}\n\nAdditional instructions: {instructions.strip()}"
 
         cwd = str(session.get("cwd", ""))
-        model = str(session.get("model", DEFAULT_MODEL_ID))
+        raw_model = str(session.get("model", DEFAULT_MODEL_ID))
+        model = resolve_model_for_effort(raw_model, "low", self._store.load_models()) or raw_model
         try:
             outcome = await self._cli.stream_prompt(
                 cwd=cwd,
@@ -1247,6 +1249,14 @@ class SessionManager:
                     f"Unsupported effort level '{value}' (expected one of: {supported})"
                 )
             session["reasoning_effort"] = value
+            current_model = str(session.get("model", DEFAULT_MODEL_ID))
+            resolved_sibling = resolve_model_for_effort(
+                current_model,
+                value,
+                self._store.load_models(),
+            )
+            if resolved_sibling:
+                session["model"] = resolved_sibling
         else:
             raise ValueError(f"Config option '{config_id}' not found")
         updated = self._store.upsert_session(session)
@@ -1356,10 +1366,19 @@ class SessionManager:
                 return {"stopReason": "cancelled"}
 
             ctx_tokens = int(outcome.usage.get("context_tokens", 0))
+            fallback_from = outcome.fallback_from_model
+            effective_resolved_model = outcome.resolved_model
+            if fallback_from and not effective_resolved_model:
+                cached_models = self._store.load_models() or []
+                effective_resolved_model = self._wire_adapter.resolve_concrete_model(
+                    cached_models,
+                    "",
+                )
+
             latest = self._store.get_session(session_id)
             if latest is not None and (
                 outcome.conversation_id
-                or outcome.resolved_model
+                or effective_resolved_model
                 or ctx_tokens > 0
                 or consumed_compacted_summary
                 or reinjected_prompt
@@ -1371,21 +1390,35 @@ class SessionManager:
                 if reinjected_prompt:
                     latest["reinjectAgentPrompt"] = False
                 if (
-                    outcome.resolved_model
+                    fallback_from
+                    and effective_resolved_model
+                    and fallback_from != effective_resolved_model
+                ):
+                    latest["model"] = effective_resolved_model
+                elif (
+                    effective_resolved_model
                     and not latest.get("modelPinnedByUser")
                     and latest.get("model") in {DEFAULT_MODEL_ID, "auto", ""}
                 ):
-                    latest["model"] = outcome.resolved_model
+                    latest["model"] = effective_resolved_model
                 if ctx_tokens > 0:
                     latest["contextTokens"] = ctx_tokens
                 self._store.upsert_session(latest)
 
-            return {
+            turn_payload: dict[str, Any] = {
                 "stopReason": outcome.stop_reason,
                 "response": outcome.response,
                 "usage": outcome.usage,
                 "conversationId": outcome.conversation_id,
             }
+            if (
+                fallback_from
+                and effective_resolved_model
+                and fallback_from != effective_resolved_model
+            ):
+                turn_payload["fallbackFromModel"] = fallback_from
+                turn_payload["resolvedModel"] = effective_resolved_model
+            return turn_payload
 
     def is_cancelled(self, session_id: str) -> bool:
         """Return whether `session_id` has a pending cancellation in SQLite."""

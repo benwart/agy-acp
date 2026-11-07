@@ -11,6 +11,8 @@ from agy_acp.logic.wire.base import (
     CompactionPhase,
     EngineWireAdapter,
     McpServerStatus,
+    ModelFallbackScope,
+    ModelFallbackTrigger,
     NormalizedToolEvent,
     SteeringPhase,
     WireTurnTelemetry,
@@ -589,3 +591,36 @@ class V3KasWireAdapter(EngineWireAdapter):
                 }
             )
         return frames
+
+    def build_model_fallback_notifications(
+        self,
+        session_id: str,
+        *,
+        from_model: str,
+        to_model: str | None,
+        trigger: ModelFallbackTrigger = "availability",
+        scope: ModelFallbackScope = "session",
+        reason: str = "",
+    ) -> list[dict[str, Any]]:
+        kiro_meta: dict[str, Any] = {
+            "kind": "model_fallback",
+            "from": from_model,
+            "to": to_model,
+            "trigger": trigger,
+            "scope": scope,
+        }
+        if reason:
+            kiro_meta["reason"] = reason
+        return [
+            {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "session_info_update",
+                        "_meta": {"kiro": kiro_meta},
+                    },
+                },
+            }
+        ]

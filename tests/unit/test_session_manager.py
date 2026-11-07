@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import anyio
 import pytest
@@ -703,7 +704,6 @@ async def test_concurrent_sessions_mcp_shim_isolation_and_prober(tmp_path: Path)
 async def test_wave5b_session_manager_security_and_lifecycle(tmp_path: Path) -> None:
     """Verify Wave 5B SessionManager fixes: tools=[], unshadowing, locks, mid-turn, delete MCP."""
     import json
-    from typing import Any
 
     from agy_acp.logic.wire import V3KasWireAdapter
     from agy_acp.providers.agy_cli_provider import AgyCliProvider, PromptOutcome
@@ -851,3 +851,49 @@ async def test_wave5b_session_manager_security_and_lifecycle(tmp_path: Path) -> 
     mcp_cfg = json.loads((tmp_path / "mcp_config.json").read_text(encoding="utf-8"))
     assert "exclusive-s1" not in mcp_cfg["mcpServers"]
     assert "shared-srv" in mcp_cfg["mcpServers"]
+
+
+async def test_effort_option_and_compact_sync_effort_suffixed_models(tmp_path: Path) -> None:
+    """Verify effortLevel updates and compaction resolve sibling effort-suffixed models."""
+    from agy_acp.providers.agy_cli_provider import AgyCliProvider, PromptOutcome
+
+    seen_calls: list[tuple[str | None, str | None]] = []
+
+    class _RecordingCli(AgyCliProvider):
+        async def stream_prompt(self, **kwargs: Any) -> PromptOutcome:
+            seen_calls.append((kwargs.get("model"), kwargs.get("effort")))
+            return PromptOutcome(
+                conversation_id="conv-eff",
+                stop_reason="end_turn",
+                response="Compacted ok.",
+                usage={"input_tokens": 10, "output_tokens": 5},
+            )
+
+    cli = _RecordingCli(save_dir=tmp_path)
+    cli.state_store.save_models(
+        [
+            {"modelId": "gemini-4-argon-medium", "name": "Gemini 4 Argon (Medium)"},
+            {"modelId": "gemini-4-argon-high", "name": "Gemini 4 Argon (High)"},
+            {"modelId": "gemini-4-argon-low", "name": "Gemini 4 Argon (Low)"},
+        ]
+    )
+    mgr = SessionManager(cli_provider=cli)
+    created = await mgr.create_session(cwd=str(tmp_path))
+    sid = created["sessionId"]
+    assert mgr.get_session(sid)["model"] == "gemini-4-argon-medium"
+
+    cfg_res = await mgr.set_config_option(
+        session_id=sid,
+        config_id="effortLevel",
+        value="high",
+    )
+    assert mgr.get_session(sid)["model"] == "gemini-4-argon-high"
+    model_opt = next(opt for opt in cfg_res["configOptions"] if opt["id"] == "model")
+    assert model_opt["currentValue"] == "gemini-4-argon-high"
+
+    await mgr.prompt(session_id=sid, prompt_blocks=[{"type": "text", "text": "hello"}])
+    await mgr.compact_session(session_id=sid)
+    assert seen_calls == [
+        ("gemini-4-argon-high", "high"),
+        ("gemini-4-argon-low", "low"),
+    ]
