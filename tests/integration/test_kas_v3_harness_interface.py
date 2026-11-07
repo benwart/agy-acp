@@ -1636,3 +1636,98 @@ async def test_kas_v3_close_load_prompt_resumes_cleanly_with_end_turn(
         and not n["params"]["update"].get("_meta", {}).get("kiro", {}).get("replay")
     ]
     assert "".join(live_agent_chunks) == "WAVE6_ACK: Resumed turn after reload"
+
+
+async def test_kas_v3_carousel_prompt_and_session_load_render_markdown_images(
+    acp_harness_factory: HarnessFactory,
+    tmp_path: Path,
+) -> None:
+    """KAS v3 stdio: carousel blocks unwrap in both live turns and session/load replay."""
+    carousel_bin = tmp_path / "carousel-agy"
+    carousel_bin.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "args = sys.argv[1:]\n"
+        "if args and args[0] == 'models':\n"
+        "    print('gemini-3.7-pro\\tGemini 3.7 Pro')\n"
+        "    sys.exit(0)\n"
+        "chunks = [\n"
+        "    'Summary:\\n\\n```',\n"
+        "    '`carousel\\n![Shot A](/Users/benwart/.gemini/antigravity-cli/brain/id/a.png)\\n',\n"
+        "    '<!-- slide -->\\n![Shot B]'\n"
+        "    '(file:///Users/benwart/.gemini/antigravity-cli/brain/id/b.png)\\n````\\n',\n"
+        "]\n"
+        "init_ev = {'event': 'init', 'init': {'conversation_id': 'conv-car-e2e'}}\n"
+        "print(json.dumps(init_ev), flush=True)\n"
+        "for d in chunks:\n"
+        "    step = {\n"
+        "        'step_index': 1,\n"
+        "        'step_type': 'planner_response',\n"
+        "        'status': 'RUNNING',\n"
+        "        'text_delta': d,\n"
+        "    }\n"
+        "    print(json.dumps({'event': 'step_update', 'step_update': step}), flush=True)\n"
+        "print(json.dumps({\n"
+        "    'event': 'result',\n"
+        "    'result': {\n"
+        "        'conversation_id': 'conv-car-e2e',\n"
+        "        'status': 'SUCCESS',\n"
+        "        'response': ''.join(chunks),\n"
+        "        'usage': {'input_tokens': 10, 'output_tokens': 14, 'total_tokens': 24},\n"
+        "    },\n"
+        "}), flush=True)\n",
+        encoding="utf-8",
+    )
+    carousel_bin.chmod(0o755)
+
+    harness = await acp_harness_factory.spawn(
+        args=["acp", "--agent-engine", "v3", "--save-dir", str(tmp_path / "store")],
+        env={"AGY_BIN": str(carousel_bin), "PYTHONPATH": SRC_ROOT},
+    )
+    await harness.send_request("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
+    new_resp = await harness.send_request(
+        "session/new",
+        {"cwd": str(tmp_path), "mcpServers": []},
+    )
+    sid = new_resp["result"]["sessionId"]
+    await _read_next_notifications(harness, count=2)
+    harness.notifications.clear()
+
+    prompt_resp = await harness.send_request(
+        "session/prompt",
+        {"sessionId": sid, "prompt": [{"type": "text", "text": "show gallery"}]},
+        timeout=5.0,
+    )
+    assert prompt_resp["result"]["stopReason"] == "end_turn"
+
+    expected = (
+        "Summary:\n\n"
+        "![Shot A](/Users/benwart/.gemini/antigravity-cli/brain/id/a.png)\n\n"
+        "![Shot B](/Users/benwart/.gemini/antigravity-cli/brain/id/b.png)\n"
+    )
+    live_chunks = [
+        n["params"]["update"]["content"]["text"]
+        for n in harness.notifications
+        if n.get("method") == "session/update"
+        and n["params"]["update"].get("sessionUpdate") == "agent_message_chunk"
+    ]
+    assert "".join(live_chunks) == expected
+
+    await harness.send_request("session/close", {"sessionId": sid})
+    harness.notifications.clear()
+
+    load_resp = await harness.send_request(
+        "session/load",
+        {"sessionId": sid, "cwd": str(tmp_path), "mcpServers": []},
+        timeout=5.0,
+    )
+    assert load_resp["result"]["sessionId"] == sid
+
+    replay_chunks = [
+        n["params"]["update"]["content"]["text"]
+        for n in harness.notifications
+        if n.get("method") == "session/update"
+        and n["params"]["update"].get("sessionUpdate") == "agent_message_chunk"
+        and n["params"]["update"].get("_meta", {}).get("kiro", {}).get("replay") is True
+    ]
+    assert replay_chunks == [expected]

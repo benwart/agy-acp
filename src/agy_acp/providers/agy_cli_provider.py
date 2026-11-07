@@ -21,6 +21,7 @@ import anyio
 import anyio.abc
 from anyio.streams.text import TextReceiveStream
 
+from agy_acp.logic.carousel_normalizer import CarouselStreamNormalizer
 from agy_acp.logic.custom_agents import (
     CustomAgentSecurityError,
     resolve_contained_prompt_file,
@@ -1763,6 +1764,30 @@ class AgyCliProvider:
                 plain_stdout_lines: list[str] = []
                 stderr_chunks: list[str] = []
                 run_result_obj: dict[str, Any] = {}
+                carousel_normalizer = CarouselStreamNormalizer()
+
+                async def _emit_normalized_text(
+                    raw_chunk: str,
+                    *,
+                    _norm: CarouselStreamNormalizer = carousel_normalizer,
+                ) -> None:
+                    piece = _norm.feed(raw_chunk)
+                    if piece:
+                        collected_texts.append(piece)
+                        if on_text is not None:
+                            await on_text(piece)
+
+                async def _flush_normalized_text(
+                    *,
+                    boundary_only: bool = False,
+                    emit_callback: bool = True,
+                    _norm: CarouselStreamNormalizer = carousel_normalizer,
+                ) -> None:
+                    piece = _norm.flush_prose_before_boundary() if boundary_only else _norm.flush()
+                    if piece:
+                        collected_texts.append(piece)
+                        if emit_callback and on_text is not None:
+                            await on_text(piece)
 
                 async def _handle_step_update(
                     step: dict[str, Any],
@@ -1858,6 +1883,7 @@ class AgyCliProvider:
                         ) or (isinstance(tool_info, dict) and bool(tool_info.get("call_error")))
 
                         if step_idx not in _active_tools:
+                            await _flush_normalized_text(boundary_only=True)
                             tc_id = f"tc_{uuid.uuid4().hex[:12]}"
                             effective_input = raw_args or (
                                 {"command": _run_prompt} if cls.acp_kind == "execute" else {}
@@ -1968,18 +1994,14 @@ class AgyCliProvider:
                     text_full = step.get("text") or step.get("response") or step.get("content")
                     if isinstance(text_delta, str) and text_delta:
                         streamed_any_text = True
-                        collected_texts.append(text_delta)
-                        if on_text is not None:
-                            await on_text(text_delta)
+                        await _emit_normalized_text(text_delta)
                     elif isinstance(text_full, str) and text_full and not is_tool_step:
                         prev_len = _emitted_texts.get(step_idx, 0)
                         if len(text_full) > prev_len:
                             delta = text_full[prev_len:]
                             _emitted_texts[step_idx] = len(text_full)
                             streamed_any_text = True
-                            collected_texts.append(delta)
-                            if on_text is not None:
-                                await on_text(delta)
+                            await _emit_normalized_text(delta)
 
                 async def _consume_stdout(
                     proc: anyio.abc.Process,
@@ -2057,9 +2079,7 @@ class AgyCliProvider:
                                     and not streamed_any_text
                                 ):
                                     streamed_any_text = True
-                                    collected_texts.append(resp_text)
-                                    if on_text is not None:
-                                        await on_text(resp_text)
+                                    await _emit_normalized_text(resp_text)
 
                     trailing = buffer.strip()
                     if trailing:
@@ -2137,6 +2157,7 @@ class AgyCliProvider:
                 )
                 self._cancelled_sessions.discard(sid)
                 if was_cancelled:
+                    await _flush_normalized_text(emit_callback=False)
                     if on_subagent_list is not None:
                         cancelled_snap = subagent_tracker.finalize_turn(cancelled=True)
                         if cancelled_snap is not None:
@@ -2170,9 +2191,9 @@ class AgyCliProvider:
 
                 if not streamed_any_text and plain_stdout_lines:
                     fallback_text = "\n".join(plain_stdout_lines)
-                    collected_texts.append(fallback_text)
-                    if on_text is not None:
-                        await on_text(fallback_text)
+                    await _emit_normalized_text(fallback_text)
+
+                await _flush_normalized_text()
 
                 if self._steer_queues.get(sid):
                     if on_tool_update is not None:

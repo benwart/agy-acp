@@ -15,6 +15,10 @@ import anyio
 
 from agy_acp import KIRO_CLI_COMPAT_VERSION, __version__
 from agy_acp.logic.auth_manager import AuthManager
+from agy_acp.logic.carousel_normalizer import (
+    CarouselStreamNormalizer,
+    normalize_carousel_markdown,
+)
 from agy_acp.logic.custom_agents import (
     CustomAgentSpec,
     PermissionDecision,
@@ -1029,16 +1033,24 @@ class AcpDispatcher:
                 )
             return frame
 
+        carousel_normalizer = CarouselStreamNormalizer()
+
+        async def _emit_message_piece(piece: str) -> None:
+            if not piece:
+                return
+            collected_chunks.append(piece)
+            frame = self._wire_adapter.build_agent_message_chunk(session_id, piece)
+            await self._emit_notification(_maybe_attach_ttft(frame, piece))
+
         async def _on_thought(chunk: str) -> None:
             frame = self._wire_adapter.build_agent_thought_chunk(session_id, chunk)
             await self._emit_notification(_maybe_attach_ttft(frame, chunk))
 
         async def _on_text(chunk: str) -> None:
-            collected_chunks.append(chunk)
-            frame = self._wire_adapter.build_agent_message_chunk(session_id, chunk)
-            await self._emit_notification(_maybe_attach_ttft(frame, chunk))
+            await _emit_message_piece(carousel_normalizer.feed(chunk))
 
         async def _on_tool_call(event: ToolCallEvent) -> bool:
+            await _emit_message_piece(carousel_normalizer.flush_prose_before_boundary())
             if self._wire_adapter.engine_id == "v3":
                 return await self._handle_v3_tool_call(session_id, event)
             return await self._handle_v2_tool_call(session_id, event)
@@ -1107,6 +1119,7 @@ class AcpDispatcher:
                 await self._emit_notification(notif)
 
         async def _on_steer_consumed(raw_content: str) -> None:
+            await _emit_message_piece(carousel_normalizer.flush_prose_before_boundary())
             await self._emit_notification(
                 self._wire_adapter.build_steering_notification(
                     session_id,
@@ -1138,6 +1151,8 @@ class AcpDispatcher:
         if stop_reason == "cancelled" or self._session_manager.consume_cancellation(session_id):
             return self._cancelled_prompt_response(message_id)
 
+        await _emit_message_piece(carousel_normalizer.flush())
+
         fallback_from = str(turn_result.get("fallbackFromModel") or "")
         resolved_to = str(turn_result.get("resolvedModel") or "")
         if fallback_from and resolved_to and fallback_from != resolved_to:
@@ -1151,7 +1166,8 @@ class AcpDispatcher:
                 await self._emit_notification(fb_frame)
 
         turn_error = str(turn_result.get("error") or "").strip()
-        assistant_text = str(turn_result.get("response") or "".join(collected_chunks))
+        raw_assistant_text = str(turn_result.get("response") or "".join(collected_chunks))
+        assistant_text = normalize_carousel_markdown(raw_assistant_text)
         if (not turn_error or assistant_text) and self._session_manager.state_store.get_session(
             session_id
         ) is not None:
@@ -1330,7 +1346,9 @@ class AcpDispatcher:
                     replay=True,
                 )
                 await self._emit_notification(_stamp_replay_meta(frame))
-            assistant_text = str(turn.get("assistant_text") or turn.get("assistantText") or "")
+            assistant_text = normalize_carousel_markdown(
+                str(turn.get("assistant_text") or turn.get("assistantText") or "")
+            )
             if assistant_text:
                 reply_frame = self._wire_adapter.build_agent_message_chunk(
                     session_id,

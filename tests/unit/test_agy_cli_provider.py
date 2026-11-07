@@ -1945,3 +1945,68 @@ async def test_stream_prompt_surfaces_unrecovered_cli_error_exit(tmp_path: Path)
     )
     assert warn_outcome.error == ""
     assert warn_outcome.response == "Fine"
+
+
+async def test_stream_prompt_unwraps_split_carousel_chunks_and_preserves_code_fences(
+    tmp_path: Path,
+) -> None:
+    """Streamed `agy` carousel blocks unwrap into standard GFM images across split deltas."""
+    carousel_agy = _write_executable(
+        tmp_path / "agy-carousel",
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        "chunks = [\n"
+        '    "0` are pushed to `origin/main`.\\n\\n```",\n'
+        '    "`carousel\\n![Synced Scree",\n'
+        '    "n 2](/Users/benwart/.gemini/antigravity-cli/brain/id/screen-2.png)\\n<!-- ",\n'
+        '    "slide -->\\n![Synced Screen 2B]"\n'
+        '    "(file:///Users/benwart/.gemini/antigravity-cli/brain/id/screen-2b.png)"\n'
+        '    "\\n````\\n\\n",\n'
+        '    "```diff\\ndiff --git a/a.py b/a.py\\n+x = 1\\n```\\n",\n'
+        "]\n"
+        "init_ev = {'event': 'init', 'init': {'conversation_id': 'conv-car-1'}}\n"
+        "print(json.dumps(init_ev), flush=True)\n"
+        "for delta in chunks:\n"
+        "    print(json.dumps({\n"
+        "        'event': 'step_update',\n"
+        "        'step_update': {\n"
+        "            'step_index': 1,\n"
+        "            'step_type': 'planner_response',\n"
+        "            'status': 'RUNNING',\n"
+        "            'text_delta': delta,\n"
+        "        },\n"
+        "    }), flush=True)\n"
+        "print(json.dumps({\n"
+        "    'event': 'result',\n"
+        "    'result': {\n"
+        "        'conversation_id': 'conv-car-1',\n"
+        "        'status': 'SUCCESS',\n"
+        "        'response': ''.join(chunks),\n"
+        "        'usage': {'input_tokens': 10, 'output_tokens': 20, 'total_tokens': 30},\n"
+        "    },\n"
+        "}), flush=True)\n",
+    )
+    provider = AgyCliProvider(bin_path=carousel_agy, save_dir=tmp_path / "state")
+    streamed: list[str] = []
+
+    async def _on_text(chunk: str) -> None:
+        streamed.append(chunk)
+
+    outcome = await provider.stream_prompt(
+        cwd=str(tmp_path),
+        prompt="show screenshots",
+        session_id="sess-carousel-1",
+        on_text=_on_text,
+    )
+    expected = (
+        "0` are pushed to `origin/main`.\n\n"
+        "![Synced Screen 2](/Users/benwart/.gemini/antigravity-cli/brain/id/screen-2.png)\n\n"
+        "![Synced Screen 2B](/Users/benwart/.gemini/antigravity-cli/brain/id/screen-2b.png)\n\n"
+        "```diff\n"
+        "diff --git a/a.py b/a.py\n"
+        "+x = 1\n"
+        "```\n"
+    )
+    assert "".join(streamed) == expected
+    assert outcome.response == expected
+    assert all(chunk != "" for chunk in streamed)

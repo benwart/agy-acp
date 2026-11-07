@@ -2900,3 +2900,185 @@ async def test_session_prompt_returns_jsonrpc_error_on_unrecovered_cli_error(
         and n["params"]["update"].get("sessionUpdate") == "usage_update"
     ]
     assert len(usage_updates) == 1
+
+
+async def test_session_prompt_normalizes_carousel_stream_and_stamps_ttft_on_first_slide(
+    tmp_path: Path,
+) -> None:
+    """Split carousel stream emits unwrapped image chunks, preserves TTFT, and saves clean turn."""
+    from agy_acp.logic.wire import V3KasWireAdapter
+    from agy_acp.providers.agy_cli_provider import AgyCliProvider, PromptOutcome
+
+    raw_chunks = [
+        "````carousel\n",
+        "![Slide 1](/Users/benwart/.gemini/antigravity-cli/brain/id/s1.png)\n<!-- slide -->\n",
+        "![Slide 2](file:///Users/benwart/.gemini/antigravity-cli/brain/id/s2.png)\n````",
+    ]
+
+    class _CarouselStubCli(AgyCliProvider):
+        async def stream_prompt(self, **kwargs: Any) -> PromptOutcome:
+            on_text = kwargs.get("on_text")
+            if on_text is not None:
+                for chunk in raw_chunks:
+                    await on_text(chunk)
+            return PromptOutcome(
+                conversation_id="conv-carousel-v3",
+                stop_reason="end_turn",
+                response="".join(raw_chunks),
+                usage={"input_tokens": 8, "output_tokens": 16, "total_tokens": 24},
+            )
+
+    emitted: list[dict[str, Any]] = []
+
+    async def _sink(msg: dict[str, Any]) -> None:
+        emitted.append(msg)
+
+    adapter = V3KasWireAdapter()
+    cli = _CarouselStubCli(save_dir=tmp_path)
+    mgr = SessionManager(save_dir=tmp_path, cli_provider=cli, wire_adapter=adapter)
+    dispatcher = AcpDispatcher(
+        notification_sink=_sink,
+        session_manager=mgr,
+        quota_tracker=QuotaTracker(
+            provider=QuotaProvider(cli_provider=cli),
+            state_store=cli.state_store,
+        ),
+        wire_adapter=adapter,
+    )
+    new_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "session/new",
+                "params": {"cwd": str(tmp_path), "mcpServers": []},
+            }
+        )
+    )
+    assert new_resp is not None
+    sid = new_resp["result"]["sessionId"]
+    emitted.clear()
+
+    prompt_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": sid,
+                    "prompt": [{"type": "text", "text": "render carousel"}],
+                    "_meta": {"kiro": {"ttft": True}},
+                },
+            }
+        )
+    )
+    assert prompt_resp is not None
+    assert prompt_resp["result"]["stopReason"] == "end_turn"
+
+    msg_updates = [
+        n["params"]["update"]
+        for n in emitted
+        if n.get("method") == "session/update"
+        and n["params"]["update"].get("sessionUpdate") == "agent_message_chunk"
+    ]
+    assert len(msg_updates) >= 1
+    assert all(u["content"]["text"] != "" for u in msg_updates)
+    assert "ttft" in msg_updates[0].get("_meta", {}).get("kiro", {})
+
+    expected = (
+        "![Slide 1](/Users/benwart/.gemini/antigravity-cli/brain/id/s1.png)\n\n"
+        "![Slide 2](/Users/benwart/.gemini/antigravity-cli/brain/id/s2.png)\n"
+    )
+    assert "".join(u["content"]["text"] for u in msg_updates) == expected
+    saved_turns = mgr.state_store.get_session_turns(sid)
+    assert len(saved_turns) == 1
+    assert saved_turns[0]["assistant_text"] == expected
+
+
+async def test_session_load_replays_legacy_persisted_carousel_turns_as_normalized_markdown(
+    tmp_path: Path,
+) -> None:
+    """Legacy turns in SQLite containing raw ````carousel fences unwrap during session/load."""
+    from agy_acp.logic.wire import V3KasWireAdapter
+
+    emitted: list[dict[str, Any]] = []
+
+    async def _sink(msg: dict[str, Any]) -> None:
+        emitted.append(msg)
+
+    adapter = V3KasWireAdapter()
+    cli = _StubAgyCliProvider(save_dir=tmp_path)
+    mgr = SessionManager(save_dir=tmp_path, cli_provider=cli, wire_adapter=adapter)
+    dispatcher = AcpDispatcher(
+        notification_sink=_sink,
+        session_manager=mgr,
+        quota_tracker=QuotaTracker(
+            provider=QuotaProvider(cli_provider=cli),
+            state_store=cli.state_store,
+        ),
+        wire_adapter=adapter,
+    )
+    new_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "session/new",
+                "params": {"cwd": str(tmp_path), "mcpServers": []},
+            }
+        )
+    )
+    assert new_resp is not None
+    sid = new_resp["result"]["sessionId"]
+
+    legacy_carousel = (
+        "````carousel\n"
+        "![Legacy 1](/Users/benwart/.gemini/antigravity-cli/brain/ee2ecabe/screen-2.png)\n"
+        "<!-- slide -->\n"
+        "![Legacy 2](file:///Users/benwart/.gemini/antigravity-cli/brain/ee2ecabe/screen-2b.png)\n"
+        "````\n"
+    )
+    mgr.state_store.append_session_turn(
+        session_id=sid,
+        user_message_id="msg_legacy_1",
+        prompt_blocks=[{"type": "text", "text": "show old turn"}],
+        assistant_text=legacy_carousel,
+    )
+
+    await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "session/close",
+                "params": {"sessionId": sid},
+            }
+        )
+    )
+    emitted.clear()
+
+    load_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 12,
+                "method": "session/load",
+                "params": {"sessionId": sid, "cwd": str(tmp_path), "mcpServers": []},
+            }
+        )
+    )
+    assert load_resp is not None
+    assert load_resp["result"]["sessionId"] == sid
+
+    replay_replies = [
+        n["params"]["update"]["content"]["text"]
+        for n in emitted
+        if n.get("method") == "session/update"
+        and n["params"]["update"].get("sessionUpdate") == "agent_message_chunk"
+        and n["params"]["update"].get("_meta", {}).get("kiro", {}).get("replay") is True
+    ]
+    assert replay_replies == [
+        "![Legacy 1](/Users/benwart/.gemini/antigravity-cli/brain/ee2ecabe/screen-2.png)\n\n"
+        "![Legacy 2](/Users/benwart/.gemini/antigravity-cli/brain/ee2ecabe/screen-2b.png)\n"
+    ]
