@@ -897,3 +897,46 @@ async def test_effort_option_and_compact_sync_effort_suffixed_models(tmp_path: P
         ("gemini-4-argon-high", "high"),
         ("gemini-4-argon-low", "low"),
     ]
+
+
+async def test_compact_session_and_prompt_propagate_outcome_error(tmp_path: Path) -> None:
+    """Verify SessionManager propagates PromptOutcome.error for prompt() and compact_session()."""
+    from agy_acp.providers.agy_cli_provider import AgyCliProvider, PromptOutcome
+
+    fail_next = False
+
+    class _ErrStubCli(AgyCliProvider):
+        async def stream_prompt(self, **_kwargs: Any) -> PromptOutcome:
+            if fail_next:
+                return PromptOutcome(
+                    conversation_id="conv-keep-1",
+                    stop_reason="end_turn",
+                    response="",
+                    usage={"input_tokens": 4, "output_tokens": 0, "total_tokens": 4},
+                    error="You have exhausted your capacity on this model.",
+                )
+            return PromptOutcome(
+                conversation_id="conv-keep-1",
+                stop_reason="end_turn",
+                response="Initial reply.",
+                usage={"input_tokens": 5, "output_tokens": 3, "context_tokens": 120},
+            )
+
+    cli = _ErrStubCli(save_dir=tmp_path)
+    mgr = SessionManager(save_dir=tmp_path, cli_provider=cli)
+    created = await mgr.create_session(cwd=str(tmp_path))
+    sid = created["sessionId"]
+
+    ok_res = await mgr.prompt(session_id=sid, prompt_blocks=[{"type": "text", "text": "hi"}])
+    assert "error" not in ok_res
+    assert mgr.get_session(sid)["agyConversationId"] == "conv-keep-1"
+
+    fail_next = True
+    err_res = await mgr.prompt(session_id=sid, prompt_blocks=[{"type": "text", "text": "again"}])
+    assert err_res["error"] == "You have exhausted your capacity on this model."
+    assert mgr.get_session(sid)["agyConversationId"] == "conv-keep-1"
+
+    compact_res = await mgr.compact_session(session_id=sid)
+    assert compact_res["status"] == "failed"
+    assert compact_res["summary"] == "You have exhausted your capacity on this model."
+    assert mgr.get_session(sid)["agyConversationId"] == "conv-keep-1"

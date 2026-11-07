@@ -1886,3 +1886,62 @@ async def test_stream_prompt_caps_tool_denial_recovery_at_one_retry_with_fallbac
     assert outcome.stop_reason == "end_turn"
     assert "delete_file" in outcome.response
     assert "".join(streamed) == outcome.response
+
+
+async def test_stream_prompt_surfaces_unrecovered_cli_error_exit(tmp_path: Path) -> None:
+    """Verify unrecovered agy ERROR result or crash exit populates PromptOutcome.error."""
+    err_agy = _write_executable(
+        tmp_path / "agy-err",
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "args = sys.argv[1:]\n"
+        "prompt = args[args.index('-p') + 1] if '-p' in args else ''\n"
+        "if 'CRASH_STDERR' in prompt:\n"
+        "    sys.stderr.write('fatal: connection reset by peer\\n')\n"
+        "    sys.exit(3)\n"
+        "if 'WARN_OK' in prompt:\n"
+        "    sys.stderr.write('warning: benign notice\\n')\n"
+        "    print(json.dumps({\n"
+        "        'event': 'result',\n"
+        "        'result': {'conversation_id': 'c-ok', 'status': 'SUCCESS', 'response': 'Fine'},\n"
+        "    }), flush=True)\n"
+        "    sys.exit(0)\n"
+        "print(json.dumps({\n"
+        "    'event': 'init',\n"
+        "    'init': {'conversation_id': 'conv-err-1'},\n"
+        "}), flush=True)\n"
+        "print(json.dumps({\n"
+        "    'event': 'result',\n"
+        "    'result': {\n"
+        "        'conversation_id': 'conv-err-1',\n"
+        "        'status': 'ERROR',\n"
+        "        'error': 'read ECONNRESET',\n"
+        "    },\n"
+        "}), flush=True)\n"
+        "sys.exit(3)\n",
+    )
+    provider = AgyCliProvider(bin_path=err_agy, save_dir=tmp_path / "state")
+
+    err_outcome = await provider.stream_prompt(
+        cwd=str(tmp_path),
+        prompt="trigger reset",
+        session_id="sess-err-1",
+    )
+    assert err_outcome.conversation_id == "conv-err-1"
+    assert err_outcome.error == "read ECONNRESET"
+    assert err_outcome.response == ""
+
+    crash_outcome = await provider.stream_prompt(
+        cwd=str(tmp_path),
+        prompt="CRASH_STDERR",
+        session_id="sess-err-2",
+    )
+    assert crash_outcome.error == "fatal: connection reset by peer"
+
+    warn_outcome = await provider.stream_prompt(
+        cwd=str(tmp_path),
+        prompt="WARN_OK",
+        session_id="sess-warn-ok",
+    )
+    assert warn_outcome.error == ""
+    assert warn_outcome.response == "Fine"

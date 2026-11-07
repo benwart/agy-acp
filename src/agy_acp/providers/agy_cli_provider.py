@@ -164,6 +164,7 @@ class PromptOutcome:
     raw_result: dict[str, Any] = field(default_factory=dict)
     resolved_model: str = ""
     fallback_from_model: str = ""
+    error: str = ""
 
 
 @dataclass(frozen=True)
@@ -850,6 +851,26 @@ def _build_tool_denial_closing_notice(denied_tools: Sequence[str]) -> str:
     """Build a fallback closing message when a tool-denied turn yielded no assistant text."""
     label = _format_denied_tools_label(denied_tools)
     return f"Tool `{label}` is not permitted in this session."
+
+
+def _extract_unrecovered_cli_error(
+    final_result_obj: Mapping[str, Any],
+    returncode: int | None,
+    stderr_text: str,
+    *,
+    has_response: bool,
+) -> str:
+    """Return an error message when `agy` exited with an unrecovered error, else `''`."""
+    status = str(final_result_obj.get("status", "")).upper()
+    if status == "ERROR":
+        return (
+            str(final_result_obj.get("error") or "").strip()
+            or stderr_text
+            or f"agy exited with status {returncode or 1}"
+        )
+    if returncode not in (0, None) and not has_response and not final_result_obj:
+        return stderr_text or f"agy exited with status {returncode}"
+    return ""
 
 
 def _normalize_tool_arguments(
@@ -1700,6 +1721,7 @@ class AgyCliProvider:
         current_model = model
         collected_texts: list[str] = []
         final_result_obj: dict[str, Any] = {}
+        outcome_error = ""
         last_step_context_tokens: int = 0
         usage: dict[str, int] = {
             "input_tokens": 0,
@@ -2193,6 +2215,13 @@ class AgyCliProvider:
                         collected_texts.append(closing_notice)
                         if on_text is not None:
                             await on_text(closing_notice)
+                else:
+                    outcome_error = _extract_unrecovered_cli_error(
+                        final_result_obj,
+                        proc.returncode if proc is not None else None,
+                        "".join(stderr_chunks).strip(),
+                        has_response=bool(collected_texts),
+                    )
 
                 break
         finally:
@@ -2245,4 +2274,5 @@ class AgyCliProvider:
             raw_result=final_result_obj,
             resolved_model=resolved_model,
             fallback_from_model=fallback_from_model,
+            error=outcome_error,
         )

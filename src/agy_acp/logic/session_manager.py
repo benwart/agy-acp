@@ -1200,6 +1200,14 @@ class SessionManager:
                 "inputTokens": 1,
                 "outputTokens": 1,
             }
+        if outcome.error:
+            return {
+                "status": "failed",
+                "summary": outcome.error,
+                "contextTokens": prev_tokens,
+                "inputTokens": 1,
+                "outputTokens": 1,
+            }
 
         summary = (outcome.response or "").strip() or "Conversation context compacted."
         compacted_tokens = max(1, len(summary.split()) * 2)
@@ -1418,6 +1426,8 @@ class SessionManager:
             ):
                 turn_payload["fallbackFromModel"] = fallback_from
                 turn_payload["resolvedModel"] = effective_resolved_model
+            if outcome.error:
+                turn_payload["error"] = outcome.error
             return turn_payload
 
     def is_cancelled(self, session_id: str) -> bool:

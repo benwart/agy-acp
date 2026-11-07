@@ -1150,8 +1150,11 @@ class AcpDispatcher:
             ):
                 await self._emit_notification(fb_frame)
 
+        turn_error = str(turn_result.get("error") or "").strip()
         assistant_text = str(turn_result.get("response") or "".join(collected_chunks))
-        if self._session_manager.state_store.get_session(session_id) is not None:
+        if (not turn_error or assistant_text) and self._session_manager.state_store.get_session(
+            session_id
+        ) is not None:
             self._session_manager.state_store.append_session_turn(
                 session_id=session_id,
                 user_message_id=user_message_id,
@@ -1196,6 +1199,9 @@ class AcpDispatcher:
             turn_id=user_message_id,
             context_breakdown=context_breakdown,
         )
+
+        if turn_error:
+            return _jsonrpc_error(message_id, -32603, turn_error)
 
         return {
             "jsonrpc": "2.0",

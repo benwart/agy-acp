@@ -2824,3 +2824,79 @@ async def test_custom_agent_execute_bash_allowlist_permits_manage_task(tmp_path:
     assert prompt_resp["result"]["stopReason"] == "end_turn"
     assert observed_allowed == [True]
     assert permission_requests == []
+
+
+async def test_session_prompt_returns_jsonrpc_error_on_unrecovered_cli_error(
+    tmp_path: Path,
+) -> None:
+    """Unrecovered agy CLI ERROR returns JSON-RPC -32603 after emitting telemetry frames."""
+    from agy_acp.logic.wire import V3KasWireAdapter
+    from agy_acp.providers.agy_cli_provider import AgyCliProvider, PromptOutcome
+
+    class _ConnResetCli(AgyCliProvider):
+        async def stream_prompt(self, **_kwargs: Any) -> PromptOutcome:
+            return PromptOutcome(
+                conversation_id="conv-reset-1",
+                stop_reason="end_turn",
+                response="",
+                usage={"input_tokens": 12, "output_tokens": 0, "total_tokens": 12},
+                error="read ECONNRESET",
+            )
+
+    emitted: list[dict[str, Any]] = []
+
+    async def _sink(msg: dict[str, Any]) -> None:
+        emitted.append(msg)
+
+    adapter = V3KasWireAdapter()
+    cli = _ConnResetCli(save_dir=tmp_path)
+    mgr = SessionManager(save_dir=tmp_path, cli_provider=cli, wire_adapter=adapter)
+    dispatcher = AcpDispatcher(
+        notification_sink=_sink,
+        session_manager=mgr,
+        quota_tracker=QuotaTracker(
+            provider=QuotaProvider(cli_provider=cli),
+            state_store=cli.state_store,
+        ),
+        wire_adapter=adapter,
+    )
+    new_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "session/new",
+                "params": {"cwd": str(tmp_path), "mcpServers": []},
+            }
+        )
+    )
+    assert new_resp is not None
+    sid = new_resp["result"]["sessionId"]
+    emitted.clear()
+
+    prompt_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": sid,
+                    "prompt": [{"type": "text", "text": "run task"}],
+                },
+            }
+        )
+    )
+    assert prompt_resp == {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "error": {"code": -32603, "message": "read ECONNRESET"},
+    }
+    assert mgr.state_store.get_session_turns(sid) == []
+    usage_updates = [
+        n
+        for n in emitted
+        if n.get("method") == "session/update"
+        and n["params"]["update"].get("sessionUpdate") == "usage_update"
+    ]
+    assert len(usage_updates) == 1
