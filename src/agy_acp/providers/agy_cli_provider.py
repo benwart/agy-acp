@@ -854,16 +854,63 @@ def _build_tool_denial_closing_notice(denied_tools: Sequence[str]) -> str:
     return f"Tool `{label}` is not permitted in this session."
 
 
+_ERROR_STEP_TYPES: frozenset[str] = frozenset({"error", "error_message"})
+_PASSIVE_BOOKKEEPING_STEP_TYPES: frozenset[str] = frozenset(
+    {
+        "user_input",
+        "system_message",
+        "system",
+        "checkpoint",
+        "ephemeral_message",
+        "error",
+        "error_message",
+    }
+)
+
+
+@dataclass
+class _RunErrorTracker:
+    """Tracks per-invocation step progression to distinguish sticky vs terminal `agy` errors."""
+
+    last_error_step_idx: int = -1
+    last_completed_step_idx: int = -1
+
+    def record_step(self, step_idx: int, step_type: str, status_raw: str) -> None:
+        lower_type = step_type.strip().lower()
+        if lower_type in _ERROR_STEP_TYPES:
+            self.last_error_step_idx = max(self.last_error_step_idx, step_idx)
+            return
+        if lower_type in _PASSIVE_BOOKKEEPING_STEP_TYPES:
+            return
+        is_completed = any(tok in status_raw for tok in ("DONE", "COMPLETED", "SUCCESS"))
+        is_failed = any(tok in status_raw for tok in ("ERROR", "FAILED", "CANCELED", "CANCELLED"))
+        if is_completed and not is_failed:
+            self.last_completed_step_idx = max(self.last_completed_step_idx, step_idx)
+
+    def has_recovered_from_error(self, *, has_output: bool) -> bool:
+        if self.last_error_step_idx >= 0:
+            return self.last_completed_step_idx > self.last_error_step_idx
+        return self.last_completed_step_idx >= 0 or has_output
+
+
 def _extract_unrecovered_cli_error(
     final_result_obj: Mapping[str, Any],
     returncode: int | None,
     stderr_text: str,
     *,
     has_response: bool,
+    error_tracker: _RunErrorTracker | None = None,
 ) -> str:
     """Return an error message when `agy` exited with an unrecovered error, else `''`."""
     status = str(final_result_obj.get("status", "")).upper()
     if status == "ERROR":
+        has_output = has_response or bool(str(final_result_obj.get("response") or "").strip())
+        if (
+            returncode == 0
+            and error_tracker is not None
+            and error_tracker.has_recovered_from_error(has_output=has_output)
+        ):
+            return ""
         return (
             str(final_result_obj.get("error") or "").strip()
             or stderr_text
@@ -1764,6 +1811,7 @@ class AgyCliProvider:
                 plain_stdout_lines: list[str] = []
                 stderr_chunks: list[str] = []
                 run_result_obj: dict[str, Any] = {}
+                run_error_tracker = _RunErrorTracker()
                 carousel_normalizer = CarouselStreamNormalizer()
 
                 async def _emit_normalized_text(
@@ -1798,12 +1846,14 @@ class AgyCliProvider:
                     _completed_tools: set[int] = completed_tool_steps,
                     _rejected_tools: set[int] = rejected_tool_steps,
                     _rejected_names: list[str] = rejected_tool_names,
+                    _error_tracker: _RunErrorTracker = run_error_tracker,
                     _run_prompt: str = current_prompt,
                 ) -> None:
                     nonlocal streamed_any_text, last_step_context_tokens
                     step_idx = int(step.get("step_index", step.get("idx", 0)))
                     step_type = str(step.get("step_type", step.get("type_name", "")))
                     status_raw = str(step.get("status", step.get("state", "RUNNING"))).upper()
+                    _error_tracker.record_step(step_idx, step_type, status_raw)
 
                     step_usage = step.get("usage")
                     step_ctx = 0
@@ -2242,6 +2292,7 @@ class AgyCliProvider:
                         proc.returncode if proc is not None else None,
                         "".join(stderr_chunks).strip(),
                         has_response=bool(collected_texts),
+                        error_tracker=run_error_tracker,
                     )
 
                 break

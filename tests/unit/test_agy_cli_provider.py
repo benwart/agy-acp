@@ -1947,6 +1947,86 @@ async def test_stream_prompt_surfaces_unrecovered_cli_error_exit(tmp_path: Path)
     assert warn_outcome.response == "Fine"
 
 
+async def test_stream_prompt_ignores_recovered_and_sticky_cli_errors_on_zero_exit(
+    tmp_path: Path,
+) -> None:
+    """Recovered mid-turn error_message and sticky conversation ERROR on rc=0 do not fail turns."""
+    sticky_msg = "The stream was interrupted. Please continue the task you were working on."
+    sticky_agy = _write_executable(
+        tmp_path / "agy-sticky-err",
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "args = sys.argv[1:]\n"
+        "prompt = args[args.index('-p') + 1] if '-p' in args else ''\n"
+        f"sticky = {sticky_msg!r}\n"
+        "cases = {\n"
+        "    'RECOVERED_IN_TURN': (0, [\n"
+        "        {'step_index': 43, 'step_type': 'agent_response', 'state': 'DONE'},\n"
+        "        {'step_index': 44, 'step_type': 'error_message', 'state': 'DONE'},\n"
+        "        {\n"
+        "            'step_index': 45,\n"
+        "            'step_type': 'agent_response',\n"
+        "            'state': 'DONE',\n"
+        "            'text_delta': 'Recovered reply.',\n"
+        "        },\n"
+        "    ]),\n"
+        "    'SUBSEQUENT_POISONED_TURN': (0, [\n"
+        "        {'step_index': 50, 'step_type': 'user_input', 'state': 'DONE'},\n"
+        "        {\n"
+        "            'step_index': 51,\n"
+        "            'step_type': 'agent_response',\n"
+        "            'state': 'DONE',\n"
+        "            'text_delta': 'Clean follow-up.',\n"
+        "        },\n"
+        "    ]),\n"
+        "    'UNRECOVERED_TAIL_ERROR_RC0': (0, [\n"
+        "        {\n"
+        "            'step_index': 60,\n"
+        "            'step_type': 'agent_response',\n"
+        "            'state': 'DONE',\n"
+        "            'text_delta': 'Partial...',\n"
+        "        },\n"
+        "        {'step_index': 61, 'step_type': 'error_message', 'state': 'DONE'},\n"
+        "    ]),\n"
+        "}\n"
+        "rc, steps = cases[prompt]\n"
+        "init_ev = {'event': 'init', 'init': {'conversation_id': 'conv-sticky'}}\n"
+        "print(json.dumps(init_ev), flush=True)\n"
+        "for ev in steps:\n"
+        "    print(json.dumps({'event': 'step_update', 'step_update': ev}), flush=True)\n"
+        "res = {'conversation_id': 'conv-sticky', 'status': 'ERROR', 'error': sticky}\n"
+        "print(json.dumps({'event': 'result', 'result': res}), flush=True)\n"
+        "sys.exit(rc)\n",
+    )
+    provider = AgyCliProvider(bin_path=sticky_agy, save_dir=tmp_path / "state")
+
+    recovered = await provider.stream_prompt(
+        cwd=str(tmp_path),
+        prompt="RECOVERED_IN_TURN",
+        session_id="sess-sticky",
+    )
+    assert recovered.error == ""
+    assert recovered.response == "Recovered reply."
+
+    followup = await provider.stream_prompt(
+        cwd=str(tmp_path),
+        prompt="SUBSEQUENT_POISONED_TURN",
+        session_id="sess-sticky",
+        conversation_id="conv-sticky",
+    )
+    assert followup.error == ""
+    assert followup.response == "Clean follow-up."
+
+    unrecovered = await provider.stream_prompt(
+        cwd=str(tmp_path),
+        prompt="UNRECOVERED_TAIL_ERROR_RC0",
+        session_id="sess-sticky",
+        conversation_id="conv-sticky",
+    )
+    assert unrecovered.error == sticky_msg
+    assert unrecovered.response == "Partial..."
+
+
 async def test_stream_prompt_unwraps_split_carousel_chunks_and_preserves_code_fences(
     tmp_path: Path,
 ) -> None:
