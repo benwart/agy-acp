@@ -5,7 +5,7 @@ from __future__ import annotations
 import io
 import json
 import sys
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -69,17 +69,26 @@ async def run_stdio_server(
             sys.stdout.flush()
 
     readline_fn = stdin_readline or _default_readline
-    write_fn = stdout_write or _default_write_bytes
+
+    async def _write_payloads(payloads: Sequence[dict[str, Any]]) -> None:
+        if not payloads:
+            return
+        frames = [dispatcher.serialize_frame(payload) for payload in payloads]
+        async with write_lock:
+            if stdout_write is not None:
+                for frame in frames:
+                    await stdout_write(frame)
+            else:
+                await _default_write_bytes(b"".join(frames))
+        for payload in payloads:
+            log_acp_event(
+                "stdout.frame",
+                save_dir_or_db=save_dir,
+                payload=payload,
+            )
 
     async def _write_payload(payload: dict[str, Any]) -> None:
-        frame = dispatcher.serialize_frame(payload)
-        log_acp_event(
-            "stdout.frame",
-            save_dir_or_db=save_dir,
-            payload=payload,
-        )
-        async with write_lock:
-            await write_fn(frame)
+        await _write_payloads([payload])
 
     async def _notification_sink(notification: dict[str, Any]) -> None:
         await _write_payload(notification)
@@ -133,10 +142,11 @@ async def run_stdio_server(
         has_id, msg_id, method_name = msg_meta
         try:
             response = await dispatcher.handle_message(raw_line)
+            outgoing: list[dict[str, Any]] = []
             if response is not None:
-                await _write_payload(response)
-            for post_notif in dispatcher.pop_post_response_notifications():
-                await _write_payload(post_notif)
+                outgoing.append(response)
+            outgoing.extend(dispatcher.pop_post_response_notifications())
+            await _write_payloads(outgoing)
         except KeyError as exc:
             log_acp_event(
                 "serve.dispatch_error",

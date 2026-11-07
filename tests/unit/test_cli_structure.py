@@ -277,3 +277,76 @@ async def test_chat_usage_scrape_uses_local_reset_date(
     out = capsys.readouterr().out
     assert "Estimated Usage | resets on 2026-11-03 | Antigravity" in out
     assert "2026-11-03 10:21 PM PST (" in out
+
+
+async def test_run_stdio_server_batches_response_and_post_notifications_atomically(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify KAS v3 session/new response and post-response MCP frames flush in one OS write."""
+    import json
+    import sys
+
+    import anyio
+
+    from agy_acp.commands.serve import run_stdio_server
+    from agy_acp.logic.session_manager import SessionManager
+    from agy_acp.logic.wire import create_wire_adapter
+
+    adapter = create_wire_adapter("v3")
+    mgr = SessionManager(save_dir=tmp_path, wire_adapter=adapter)
+    writes: list[bytes] = []
+    flushes = 0
+    ready_for_eof = anyio.Event()
+    inputs = iter(
+        [
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "session/new",
+                    "params": {"cwd": str(tmp_path), "mcpServers": []},
+                }
+            )
+            + "\n"
+        ]
+    )
+
+    class _FakeBuffer:
+        def write(self, data: bytes) -> int:
+            writes.append(data)
+            return len(data)
+
+        def flush(self) -> None:
+            nonlocal flushes
+            flushes += 1
+            ready_for_eof.set()
+
+    class _FakeStdout:
+        buffer = _FakeBuffer()
+
+    monkeypatch.setattr(sys, "stdout", _FakeStdout())
+
+    async def _readline() -> str:
+        try:
+            return next(inputs)
+        except StopIteration:
+            await ready_for_eof.wait()
+            return ""
+
+    rc = await run_stdio_server(
+        session_manager=mgr,
+        wire_adapter=adapter,
+        save_dir=tmp_path,
+        stdin_readline=_readline,
+    )
+    assert rc == 0
+    assert len(writes) == 1
+    assert flushes == 1
+    lines = [json.loads(line) for line in writes[0].decode("utf-8").splitlines() if line]
+    assert len(lines) == 3
+    assert lines[0]["id"] == 1
+    assert [lines[1]["method"], lines[2]["method"]] == [
+        "_kiro/mcp/status",
+        "_kiro/tools/didChange",
+    ]
