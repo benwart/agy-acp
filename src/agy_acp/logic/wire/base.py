@@ -44,6 +44,8 @@ _AGY_STEP_TOOL_MAP: dict[str, tuple[ToolCallKind, str, str]] = {
     "run_command": ("execute", "run_command", "execute_bash"),
     "command_action": ("execute", "run_command", "execute_bash"),
     "execute_bash": ("execute", "run_command", "execute_bash"),
+    "manage_task": ("execute", "run_command", "execute_bash"),
+    "send_command_input": ("execute", "run_command", "execute_bash"),
     "read_file": ("read", "read_file", "fs_read"),
     "view_file": ("read", "read_file", "fs_read"),
     "list_dir": ("read", "list_directory", "fs_read"),
@@ -145,6 +147,27 @@ def _split_mcp_step_name(
     return None
 
 
+def synthesize_task_command(step_name: str, arguments: Mapping[str, Any]) -> str:
+    """Synthesize a concise command summary for task-management built-ins."""
+    lower = step_name.strip().lower()
+    if lower == "manage_task":
+        action = str(arguments.get("Action") or arguments.get("action") or "").strip()
+        task_id = str(
+            arguments.get("TaskId") or arguments.get("task_id") or arguments.get("taskId") or ""
+        ).strip()
+        return " ".join(part for part in ("manage_task", action, task_id) if part)
+    if lower == "send_command_input":
+        target = str(
+            arguments.get("CommandId")
+            or arguments.get("TaskId")
+            or arguments.get("command_id")
+            or arguments.get("task_id")
+            or ""
+        ).strip()
+        return " ".join(part for part in ("send_command_input", target) if part)
+    return ""
+
+
 def normalize_agy_tool_event(
     *,
     tool_call_id: str,
@@ -207,7 +230,10 @@ def normalize_agy_tool_event(
 
     cmd = ""
     if kas_id == "run_command":
-        cmd = str(args.get("CommandLine") or args.get("command") or "")
+        cmd = str(args.get("CommandLine") or args.get("command") or "") or synthesize_task_command(
+            lower_step,
+            args,
+        )
 
     sub_target = ""
     if kas_id == "invoke_sub_agent":

@@ -1706,3 +1706,183 @@ async def test_stream_prompt_records_fallback_from_model_and_new_resolved_model(
     assert outcome.response == "Recovered response"
     assert outcome.fallback_from_model == "retired-model-v1"
     assert outcome.resolved_model == "gemini-4-argon-medium"
+
+
+def test_classify_and_normalize_manage_task_and_send_command_input() -> None:
+    """Verify manage_task and send_command_input map to execute/run_command/execute_bash."""
+    from agy_acp.providers.agy_cli_provider import (
+        _normalize_tool_arguments,
+        classify_tool_call_step,
+    )
+
+    cls_list = classify_tool_call_step("tool", "manage_task", {"Action": "list"})
+    assert cls_list.kas_builtin_id == "run_command"
+    assert cls_list.v2_tool_name == "execute_bash"
+    assert cls_list.acp_kind == "execute"
+    assert cls_list.command == "manage_task list"
+    assert cls_list.title == "Running `manage_task list`"
+
+    norm_list = _normalize_tool_arguments({"Action": "list"}, tool_name="manage_task")
+    assert norm_list["command"] == "manage_task list"
+
+    cls_status = classify_tool_call_step(
+        "tool",
+        "manage_task",
+        {"Action": "status", "TaskId": "task-42"},
+    )
+    assert cls_status.command == "manage_task status task-42"
+    assert cls_status.title == "Running `manage_task status task-42`"
+
+    cls_input = classify_tool_call_step(
+        "tool",
+        "send_command_input",
+        {"CommandId": "cmd-9", "Input": "yes\n"},
+    )
+    assert cls_input.kas_builtin_id == "run_command"
+    assert cls_input.v2_tool_name == "execute_bash"
+    assert cls_input.acp_kind == "execute"
+    assert cls_input.command == "send_command_input cmd-9"
+    assert (
+        _normalize_tool_arguments(
+            {"CommandId": "cmd-9", "Input": "yes\n"},
+            tool_name="send_command_input",
+        )["command"]
+        == "send_command_input cmd-9"
+    )
+
+
+async def test_stream_prompt_resumes_once_after_tool_denial_for_closing_reply(
+    tmp_path: Path,
+) -> None:
+    """Verify tool denial aborts active run and resumes conversation once for a closing reply."""
+    calls_file = tmp_path / "denial_calls.jsonl"
+    fake_agy = _write_executable(
+        tmp_path / "agy-deny-recover",
+        "#!/usr/bin/env python3\n"
+        "import json, pathlib, sys, time\n"
+        "args = sys.argv[1:]\n"
+        "conv = args[args.index('--conversation') + 1] if '--conversation' in args else ''\n"
+        "prompt = args[args.index('-p') + 1] if '-p' in args else ''\n"
+        f"log_path = pathlib.Path({str(calls_file)!r})\n"
+        "with log_path.open('a', encoding='utf-8') as fh:\n"
+        "    fh.write(json.dumps({'conv': conv, 'prompt': prompt}) + '\\n')\n"
+        "print(json.dumps({\n"
+        "    'event': 'init',\n"
+        "    'init': {'conversation_id': conv or 'conv-deny-1', 'model': 'gemini-3.8-flash'},\n"
+        "}), flush=True)\n"
+        "if not conv:\n"
+        "    print(json.dumps({\n"
+        "        'event': 'step_update',\n"
+        "        'step_update': {\n"
+        "            'step_index': 1,\n"
+        "            'step_type': 'delete_file',\n"
+        "            'status': 'RUNNING',\n"
+        "            'tool_name': 'delete_file',\n"
+        "            'tool_info': {'tool_name': 'delete_file', 'arguments': {'Path': '/tmp/x'}},\n"
+        "        },\n"
+        "    }), flush=True)\n"
+        "    time.sleep(0.5)\n"
+        "    sys.exit(0)\n"
+        "reply = 'Understood, skipping deletion and finishing up.'\n"
+        "print(json.dumps({\n"
+        "    'event': 'step_update',\n"
+        "    'step_update': {\n"
+        "        'step_index': 2,\n"
+        "        'step_type': 'planner_response',\n"
+        "        'status': 'DONE',\n"
+        "        'text_delta': reply,\n"
+        "    },\n"
+        "}), flush=True)\n"
+        "print(json.dumps({\n"
+        "    'event': 'result',\n"
+        "    'result': {'conversation_id': conv, 'status': 'SUCCESS', 'response': reply},\n"
+        "}), flush=True)\n",
+    )
+    provider = AgyCliProvider(bin_path=fake_agy, save_dir=tmp_path / "state")
+    streamed: list[str] = []
+
+    async def _on_text(chunk: str) -> None:
+        streamed.append(chunk)
+
+    async def _deny_all(_ev: ToolCallEvent) -> bool:
+        return False
+
+    outcome = await provider.stream_prompt(
+        cwd=str(tmp_path),
+        prompt="remove temp file",
+        session_id="sess-deny-1",
+        on_text=_on_text,
+        on_tool_call=_deny_all,
+    )
+    assert outcome.stop_reason == "end_turn"
+    assert outcome.conversation_id == "conv-deny-1"
+    assert outcome.response == "Understood, skipping deletion and finishing up."
+    assert "".join(streamed) == "Understood, skipping deletion and finishing up."
+
+    recorded = [
+        json.loads(line)
+        for line in calls_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(recorded) == 2
+    assert recorded[0]["conv"] == ""
+    assert recorded[1]["conv"] == "conv-deny-1"
+    assert "[Tool policy]" in recorded[1]["prompt"]
+    assert "delete_file" in recorded[1]["prompt"]
+
+
+async def test_stream_prompt_caps_tool_denial_recovery_at_one_retry_with_fallback_text(
+    tmp_path: Path,
+) -> None:
+    """Verify repeated tool denial stops after 1 continuation and emits fallback closing text."""
+    calls_file = tmp_path / "denial_loop_calls.jsonl"
+    fake_agy = _write_executable(
+        tmp_path / "agy-deny-loop",
+        "#!/usr/bin/env python3\n"
+        "import json, pathlib, sys, time\n"
+        "args = sys.argv[1:]\n"
+        "conv = args[args.index('--conversation') + 1] if '--conversation' in args else ''\n"
+        f"log_path = pathlib.Path({str(calls_file)!r})\n"
+        "with log_path.open('a', encoding='utf-8') as fh:\n"
+        "    fh.write(json.dumps({'conv': conv}) + '\\n')\n"
+        "print(json.dumps({\n"
+        "    'event': 'init',\n"
+        "    'init': {'conversation_id': conv or 'conv-deny-loop'},\n"
+        "}), flush=True)\n"
+        "print(json.dumps({\n"
+        "    'event': 'step_update',\n"
+        "    'step_update': {\n"
+        "        'step_index': 1,\n"
+        "        'step_type': 'delete_file',\n"
+        "        'status': 'RUNNING',\n"
+        "        'tool_name': 'delete_file',\n"
+        "        'tool_info': {'tool_name': 'delete_file', 'arguments': {'Path': '/tmp/x'}},\n"
+        "    },\n"
+        "}), flush=True)\n"
+        "time.sleep(0.5)\n",
+    )
+    provider = AgyCliProvider(bin_path=fake_agy, save_dir=tmp_path / "state")
+    streamed: list[str] = []
+
+    async def _on_text(chunk: str) -> None:
+        streamed.append(chunk)
+
+    async def _deny_all(_ev: ToolCallEvent) -> bool:
+        return False
+
+    outcome = await provider.stream_prompt(
+        cwd=str(tmp_path),
+        prompt="loop test",
+        session_id="sess-deny-loop",
+        on_text=_on_text,
+        on_tool_call=_deny_all,
+    )
+    recorded = [
+        json.loads(line)
+        for line in calls_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(recorded) == 2
+    assert outcome.stop_reason == "end_turn"
+    assert "delete_file" in outcome.response
+    assert "".join(streamed) == outcome.response

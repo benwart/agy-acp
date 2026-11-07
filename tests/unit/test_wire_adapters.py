@@ -691,3 +691,28 @@ def test_model_fallback_notifications_v2_and_v3() -> None:
     assert len(v2_turn) == 1
     assert v2_turn[0]["params"]["update"]["cause"] == "refused"
     assert v2_turn[0]["params"]["update"]["promoted"] is False
+
+
+def test_normalize_agy_tool_event_maps_manage_task_and_send_command_input() -> None:
+    """Verify normalize_agy_tool_event maps manage_task and send_command_input to execute."""
+    ev_mt = normalize_agy_tool_event(
+        tool_call_id="tc-mt-1",
+        step_name="manage_task",
+        title="",
+        raw_input={"Action": "status", "TaskId": "t1"},
+    )
+    assert ev_mt.kind == "execute"
+    assert ev_mt.kas_tool_id == "run_command"
+    assert ev_mt.kiro_v2_tool_name == "execute_bash"
+    assert ev_mt.command == "manage_task status t1"
+
+    ev_sci = normalize_agy_tool_event(
+        tool_call_id="tc-sci-1",
+        step_name="send_command_input",
+        title="",
+        raw_input={"CommandId": "c1", "Input": "q\n"},
+    )
+    assert ev_sci.kind == "execute"
+    assert ev_sci.kas_tool_id == "run_command"
+    assert ev_sci.kiro_v2_tool_name == "execute_bash"
+    assert ev_sci.command == "send_command_input c1"

@@ -2699,3 +2699,128 @@ async def test_kas_mcp_reset_server_start_oauth_and_model_fallback_notifications
         and n["params"]["update"].get("sessionUpdate") == "model_fallback"
     ]
     assert [u["promoted"] for u in fb_v2] == [False, True]
+
+
+async def test_custom_agent_execute_bash_allowlist_permits_manage_task(tmp_path: Path) -> None:
+    """Custom agent with execute_bash in tools allowlist permits manage_task without policy deny."""
+    from agy_acp.logic.wire import V3KasWireAdapter
+    from agy_acp.providers.agy_cli_provider import (
+        AgyCliProvider,
+        PromptOutcome,
+        ToolCallEvent,
+        _normalize_tool_arguments,
+        classify_tool_call_step,
+    )
+
+    observed_allowed: list[bool] = []
+    permission_requests: list[dict[str, Any]] = []
+
+    class _ManageTaskCli(AgyCliProvider):
+        async def stream_prompt(self, **kwargs: Any) -> PromptOutcome:
+            on_tool_call = kwargs.get("on_tool_call")
+            on_text = kwargs.get("on_text")
+            raw_args = {"Action": "list"}
+            cls = classify_tool_call_step("tool", "manage_task", raw_args)
+            norm_args = _normalize_tool_arguments(raw_args, tool_name="manage_task")
+            ev = ToolCallEvent(
+                tool_call_id="tc_mt_1",
+                title=cls.title,
+                kind=cls.acp_kind,
+                status="in_progress",
+                raw_input=norm_args,
+                kiro_tool_name=cls.v2_tool_name,
+                kiro_tool_id=cls.kiro_tool_id,
+                kas_builtin_id=cls.kas_builtin_id,
+                v2_tool_name=cls.v2_tool_name,
+                acp_kind=cls.acp_kind,
+                command=cls.command,
+            )
+            assert on_tool_call is not None
+            allowed = await on_tool_call(ev)
+            observed_allowed.append(allowed)
+            if on_text is not None:
+                await on_text("Checked tasks.")
+            return PromptOutcome(
+                conversation_id="conv-mt-1",
+                stop_reason="end_turn",
+                response="Checked tasks.",
+                usage={"input_tokens": 5, "output_tokens": 3, "total_tokens": 8},
+            )
+
+    async def _rpc_caller(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        permission_requests.append({"method": method, "params": params})
+        return {"outcome": {"outcome": "selected", "optionId": "allow_once"}}
+
+    emitted: list[dict[str, Any]] = []
+
+    async def _sink(msg: dict[str, Any]) -> None:
+        emitted.append(msg)
+
+    adapter = V3KasWireAdapter()
+    cli = _ManageTaskCli(save_dir=tmp_path)
+    mgr = SessionManager(save_dir=tmp_path, cli_provider=cli, wire_adapter=adapter)
+    dispatcher = AcpDispatcher(
+        notification_sink=_sink,
+        session_manager=mgr,
+        quota_tracker=QuotaTracker(
+            provider=QuotaProvider(cli_provider=cli),
+            state_store=cli.state_store,
+        ),
+        wire_adapter=adapter,
+        client_rpc_caller=_rpc_caller,
+    )
+    new_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "session/new",
+                "params": {
+                    "cwd": str(tmp_path),
+                    "mcpServers": [],
+                    "_meta": {
+                        "kiro": {
+                            "customAgents": [
+                                {
+                                    "id": "kirocrew",
+                                    "name": "KiroCrew",
+                                    "prompt": "Crew agent.",
+                                    "tools": ["execute_bash", "fs_read"],
+                                    "allowedTools": ["execute_bash", "fs_read"],
+                                }
+                            ]
+                        }
+                    },
+                },
+            }
+        )
+    )
+    assert new_resp is not None
+    sid = new_resp["result"]["sessionId"]
+    await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/set_mode",
+                "params": {"sessionId": sid, "modeId": "kirocrew"},
+            }
+        )
+    )
+    prompt_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": sid,
+                    "prompt": [{"type": "text", "text": "check tasks"}],
+                },
+            }
+        )
+    )
+    assert prompt_resp is not None
+    assert prompt_resp["result"]["stopReason"] == "end_turn"
+    assert observed_allowed == [True]
+    assert permission_requests == []

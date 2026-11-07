@@ -26,6 +26,7 @@ from agy_acp.logic.custom_agents import (
     resolve_contained_prompt_file,
     sanitize_project_agent_spec,
 )
+from agy_acp.logic.wire.base import synthesize_task_command
 from agy_acp.providers.acp_logger import log_acp_event
 from agy_acp.providers.state_store import SqliteStateStoreProvider
 
@@ -531,6 +532,7 @@ _EXACT_BUILTIN_TABLE: dict[str, tuple[str, str, str]] = {
     "execute_command": ("run_command", "execute_bash", "execute"),
     "execute_bash": ("run_command", "execute_bash", "execute"),
     "command_execution": ("run_command", "execute_bash", "execute"),
+    "manage_task": ("run_command", "execute_bash", "execute"),
     "send_command_input": ("run_command", "execute_bash", "execute"),
     "read_file": ("read_file", "fs_read", "read"),
     "view_file": ("read_file", "fs_read", "read"),
@@ -781,7 +783,10 @@ def classify_tool_call_step(
     path_val = _extract_first_str(arguments, _PATH_ARGUMENT_KEYS)
     locations = [{"path": path_val}] if path_val else []
     cmd_val = (
-        _extract_first_str(arguments, ("CommandLine", "command", "cmd", "Command"))
+        (
+            _extract_first_str(arguments, ("CommandLine", "command", "cmd", "Command"))
+            or synthesize_task_command(raw_name, arguments)
+        )
         if acp_kind == "execute"
         else ""
     )
@@ -825,6 +830,28 @@ def _resolve_kiro_tool_identity(
     return cls.v2_tool_name, cls.mcp_server, cls.kiro_tool_id
 
 
+def _format_denied_tools_label(denied_tools: Sequence[str]) -> str:
+    """Format unique denied tool identifiers into a compact label."""
+    unique = [name.strip() for name in dict.fromkeys(denied_tools) if name and name.strip()]
+    return ", ".join(unique) if unique else "requested tool"
+
+
+def _build_tool_denial_prompt(denied_tools: Sequence[str]) -> str:
+    """Build a single-shot continuation prompt after a mid-turn tool policy denial."""
+    label = _format_denied_tools_label(denied_tools)
+    return (
+        f"[Tool policy] Tool `{label}` was denied in this session and was not executed. "
+        "Do NOT retry denied tools; continue or provide your closing reply using only "
+        "permitted tools and information already available."
+    )
+
+
+def _build_tool_denial_closing_notice(denied_tools: Sequence[str]) -> str:
+    """Build a fallback closing message when a tool-denied turn yielded no assistant text."""
+    label = _format_denied_tools_label(denied_tools)
+    return f"Tool `{label}` is not permitted in this session."
+
+
 def _normalize_tool_arguments(
     arguments: dict[str, Any],
     *,
@@ -840,7 +867,10 @@ def _normalize_tool_arguments(
 
     normalized = dict(arguments)
     if "command" not in normalized:
-        cmd_val = _extract_first_str(normalized, ("CommandLine", "cmd", "Command"))
+        cmd_val = _extract_first_str(
+            normalized,
+            ("CommandLine", "cmd", "Command"),
+        ) or synthesize_task_command(tool_name, normalized)
         if cmd_val:
             normalized["command"] = cmd_val
     if "path" not in normalized:
@@ -1599,6 +1629,15 @@ class AgyCliProvider:
             return True
         return active
 
+    def _persist_resolved_conversation_id(self, sid: str, conv_id: str) -> None:
+        """Persist `conv_id` onto `sid` in SQLite when the session row exists."""
+        if not conv_id:
+            return
+        persisted = self._store.get_session(sid)
+        if persisted is not None:
+            persisted["agyConversationId"] = conv_id
+            self._store.upsert_session(persisted)
+
     async def stream_prompt(
         self,
         *,
@@ -1672,6 +1711,7 @@ class AgyCliProvider:
         }
         steer_temp_files: list[Path] = []
         active_temp_file: Path | None = None
+        did_denial_recovery = False
         subagent_tracker = _SubagentRosterTracker()
         self._active_turns.add(sid)
         self._turn_conv_ids[sid] = resolved_conv_id
@@ -1696,6 +1736,7 @@ class AgyCliProvider:
                 active_tool_calls: dict[int, ToolCallEvent] = {}
                 completed_tool_steps: set[int] = set()
                 rejected_tool_steps: set[int] = set()
+                rejected_tool_names: list[str] = []
                 streamed_any_text = False
                 plain_stdout_lines: list[str] = []
                 stderr_chunks: list[str] = []
@@ -1709,6 +1750,7 @@ class AgyCliProvider:
                     _active_tools: dict[int, ToolCallEvent] = active_tool_calls,
                     _completed_tools: set[int] = completed_tool_steps,
                     _rejected_tools: set[int] = rejected_tool_steps,
+                    _rejected_names: list[str] = rejected_tool_names,
                     _run_prompt: str = current_prompt,
                 ) -> None:
                     nonlocal streamed_any_text, last_step_context_tokens
@@ -1840,6 +1882,9 @@ class AgyCliProvider:
                                         self._interrupt_process_for_steer(sid)
                             if not allowed:
                                 _rejected_tools.add(step_idx)
+                                _rejected_names.append(
+                                    tool_name or cls.kiro_tool_id or cls.v2_tool_name or cls.title
+                                )
                                 self.abort_active_process(sid)
                                 if on_tool_update is not None:
                                     await on_tool_update(
@@ -2124,15 +2169,30 @@ class AgyCliProvider:
                     steers = self._pop_queued_steers(sid)
                     for s in steers:
                         steer_temp_files.extend(s.temp_files)
-                    if resolved_conv_id:
-                        persisted = self._store.get_session(sid)
-                        if persisted is not None:
-                            persisted["agyConversationId"] = resolved_conv_id
-                            self._store.upsert_session(persisted)
+                    self._persist_resolved_conversation_id(sid, resolved_conv_id)
                     if on_steer_consumed is not None:
                         await on_steer_consumed("\n".join(s.raw_message for s in steers))
                     current_prompt = "\n\n".join(s.prompt for s in steers if s.prompt)
                     continue
+
+                if rejected_tool_steps:
+                    if not did_denial_recovery and resolved_conv_id:
+                        did_denial_recovery = True
+                        self._persist_resolved_conversation_id(sid, resolved_conv_id)
+                        current_prompt = _build_tool_denial_prompt(rejected_tool_names)
+                        log_acp_event(
+                            "agy.tool_denial_recovery",
+                            save_dir_or_db=self._store.db_path,
+                            session_id=sid,
+                            conversation_id=resolved_conv_id,
+                            denied_tools=list(dict.fromkeys(rejected_tool_names)),
+                        )
+                        continue
+                    if not collected_texts:
+                        closing_notice = _build_tool_denial_closing_notice(rejected_tool_names)
+                        collected_texts.append(closing_notice)
+                        if on_text is not None:
+                            await on_text(closing_notice)
 
                 break
         finally:
