@@ -14,17 +14,17 @@ from agy_acp.commands.docs import build as docs_build_cmd
 
 def test_cli_scaffold_help_and_version(capsys: pytest.CaptureFixture[str]) -> None:
     """Verify Cyclopts scaffold registers subcommands, group docstrings, and version."""
-    assert __version__ == "1.3.0"
+    assert __version__ == "1.3.1"
     app(["--version"], result_action="return_value")
     version_out = capsys.readouterr().out.strip()
-    assert "1.3.0 kiro-cli 2.28.0" in version_out
+    assert "1.3.1 kiro-cli 2.33.1" in version_out
     last_token = version_out.split()[-1]
     major, minor, patch = (int(part) for part in last_token.split(".")[:3])
-    assert (major, minor, patch) >= (2, 28, 0)
+    assert (major, minor, patch) >= (2, 33, 1)
 
     app(["--help"], result_action="return_value")
     root_help = capsys.readouterr().out
-    for group_name in ("acp", "auth", "quota", "docs", "serve"):
+    for group_name in ("acp", "auth", "quota", "docs", "serve", "update"):
         assert group_name in root_help
 
     app(["quota", "--help"], result_action="return_value")
@@ -32,6 +32,31 @@ def test_cli_scaffold_help_and_version(capsys: pytest.CaptureFixture[str]) -> No
     assert "Inspect token, credit, 5-hour, and 7-day rolling quota usage." in quota_help
     assert "five-hour" in quota_help
     assert "seven-day" in quota_help
+
+
+def test_update_command_refreshes_wrapper_mtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify `kiro-cli update` compatibility command exits 0 and bumps wrapper mtime."""
+    import os
+    import sys
+
+    from agy_acp.cli import main
+
+    fake_bin = tmp_path / "agy-acp"
+    fake_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+    os.utime(fake_bin, (1_700_000_000, 1_700_000_000))
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", [str(fake_bin), "update"])
+
+    rc = main(["update"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "1.3.1" in out
+    assert "2.33.1" in out
+    assert fake_bin.stat().st_mtime > 1_700_000_000
 
 
 def test_agent_engine_help_satisfies_kirocrew_kas_floor_probe(
