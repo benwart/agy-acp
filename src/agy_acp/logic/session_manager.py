@@ -205,6 +205,32 @@ def _extract_wire_custom_agents(meta: dict[str, Any] | None) -> list[dict[str, A
     return [copy.deepcopy(entry) for entry in raw_agents if isinstance(entry, dict)]
 
 
+def _format_remaining_turns_summary(turns: Sequence[Mapping[str, Any]]) -> str | None:
+    """Format persisted `session_turns` into a compacted conversation summary for replay/fork."""
+    if not turns:
+        return None
+    formatted_turns: list[str] = []
+    for turn in turns:
+        blocks = turn.get("prompt_blocks")
+        user_parts: list[str] = []
+        if isinstance(blocks, list):
+            for block in blocks:
+                if isinstance(block, Mapping) and block.get("type") == "text":
+                    text = str(block.get("text") or "").strip()
+                    if text:
+                        user_parts.append(text)
+        user_text = "\n".join(user_parts).strip()
+        assistant_text = str(turn.get("assistant_text") or "").strip()
+        lines: list[str] = []
+        if user_text:
+            lines.append(f"User: {user_text}")
+        if assistant_text:
+            lines.append(f"Assistant: {assistant_text}")
+        if lines:
+            formatted_turns.append("\n".join(lines))
+    return "\n\n".join(formatted_turns) if formatted_turns else None
+
+
 AVAILABLE_MODES: list[dict[str, str]] = [
     {"id": "auto", "name": "Auto"},
     {"id": "approve", "name": "Approve"},
@@ -1034,6 +1060,138 @@ class SessionManager:
         cached_models = self._store.load_models() or None
         return self._build_descriptor(restored_state, available_models=cached_models)
 
+    async def fork_session(
+        self,
+        source_session_id: str = "",
+        *,
+        cwd: str | None = None,
+        mcp_servers: list[dict[str, Any]] | None = None,
+        meta: dict[str, Any] | None = None,
+        message_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Fork an existing ACP session (`session/fork`) into a new session ID."""
+        await anyio.sleep(0)
+        source = self._require_session(source_session_id)
+
+        effective_cwd = (
+            cwd if (isinstance(cwd, str) and cwd.strip()) else str(source.get("cwd") or "")
+        )
+        effective_wire_mcp = (
+            copy.deepcopy(mcp_servers)
+            if mcp_servers is not None
+            else copy.deepcopy(source.get("wire_mcp_servers", source.get("mcp_servers", [])))
+        )
+        wire_custom_agents = _extract_wire_custom_agents(meta)
+        effective_custom_agents = (
+            wire_custom_agents
+            if wire_custom_agents is not None
+            else copy.deepcopy(source.get("custom_agents", []))
+        )
+        effective_meta = (
+            copy.deepcopy(meta) if meta is not None else copy.deepcopy(source.get("meta", {}))
+        )
+
+        model = str(source.get("model", self._default_model or DEFAULT_MODEL_ID))
+        mode = str(source.get("mode", "auto"))
+        agent = source.get("agent") or self._default_agent
+        reasoning_effort = str(source.get("reasoning_effort", DEFAULT_REASONING_EFFORT))
+        auth_cfg: dict[str, Any] = copy.deepcopy(source.get("auth_config") or {})
+        if agent:
+            auth_cfg["kiro_agent"] = str(agent)
+        if self._wire_adapter.engine_id == "v3":
+            auth_cfg["_engine_id"] = "v3"
+
+        new_sid = await self._cli.start_or_resume_agent(
+            session_id=None,
+            cwd=effective_cwd,
+            mcp_servers=effective_wire_mcp,
+            model=model,
+            mode=mode,
+            reasoning_effort=reasoning_effort,
+            auth_config=auth_cfg or None,
+        )
+        registry = self.get_custom_agent_registry(
+            cwd=effective_cwd,
+            custom_agents=effective_custom_agents,
+        )
+        combined_mcp, _, removable = self._merge_and_sync_session_mcp(
+            session_id=new_sid,
+            cwd=effective_cwd,
+            raw_wire_mcp=effective_wire_mcp,
+            active_agent=str(agent) if agent else None,
+            registry=registry,
+        )
+
+        source_turns = self._store.get_session_turns(source_session_id)
+        turns_to_copy = list(source_turns)
+        if message_id:
+            matched_idx = next(
+                (
+                    idx
+                    for idx, turn in enumerate(source_turns)
+                    if str(turn.get("user_message_id") or "") == message_id
+                ),
+                None,
+            )
+            if matched_idx is not None:
+                turns_to_copy = source_turns[: matched_idx + 1]
+
+        copied: list[dict[str, Any]] = []
+        for idx, turn in enumerate(turns_to_copy):
+            self._store.append_session_turn(
+                session_id=new_sid,
+                user_message_id=str(turn.get("user_message_id") or ""),
+                prompt_blocks=copy.deepcopy(turn.get("prompt_blocks") or []),
+                assistant_text=str(turn.get("assistant_text") or ""),
+                turn_idx=idx,
+            )
+            copied.append(turn)
+
+        compacted_summary = (
+            _format_remaining_turns_summary(copied)
+            if copied
+            else source.get("compactedSummary")
+        )
+        reinject_agent_prompt = True if copied else bool(source.get("reinjectAgentPrompt", False))
+
+        draft_state: dict[str, Any] = {
+            **copy.deepcopy(source),
+            "sessionId": new_sid,
+            "agyConversationId": None,
+            "cwd": effective_cwd,
+            "mcp_servers": combined_mcp,
+            "wire_mcp_servers": effective_wire_mcp,
+            "custom_agents": effective_custom_agents,
+            "meta": effective_meta,
+            "auth_config": auth_cfg,
+            "mode": mode,
+            "agent": agent,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "cancelled": False,
+            "contextPaths": copy.deepcopy(source.get("contextPaths", [])),
+            "knowledgeEntries": copy.deepcopy(source.get("knowledgeEntries", [])),
+            "compactedSummary": compacted_summary,
+            "reinjectAgentPrompt": reinject_agent_prompt,
+        }
+        if agent and wire_custom_agents is not None:
+            self._apply_custom_agent_fields(
+                draft_state,
+                registry.get(str(agent)),
+                allow_model_override=not bool(source.get("modelPinnedByUser", False)),
+            )
+
+        forked_state = self._store.upsert_session(draft_state)
+        if combined_mcp or removable:
+            self._cli.sync_mcp_servers(
+                combined_mcp,
+                remove_servers=removable,
+                session_id=new_sid,
+            )
+        _write_dsh_gate_marker_if_configured()
+        cached_models = self._store.load_models() or None
+        return self._build_descriptor(forked_state, available_models=cached_models)
+
     def _is_valid_agent_mode(
         self,
         mode_id: str,
@@ -1317,6 +1475,16 @@ class SessionManager:
                 cwd=cwd,
                 image_dir=self._private_images_dir(),
             )
+            context_paths = session.get("contextPaths")
+            if isinstance(context_paths, list) and context_paths:
+                clean_paths = [str(p).strip() for p in context_paths if str(p).strip()]
+                if clean_paths:
+                    paths_block = (
+                        "<session_context_paths>\n"
+                        + "\n".join(clean_paths)
+                        + "\n</session_context_paths>"
+                    )
+                    formatted_prompt = f"{paths_block}\n\n{formatted_prompt}".strip()
             consumed_compacted_summary = False
             if (
                 conversation_id is None
@@ -1520,6 +1688,249 @@ class SessionManager:
                 with contextlib.suppress(OSError):
                     img_path.unlink(missing_ok=True)
         return queued
+
+    def clear_session_steers(self, session_id: str) -> list[str]:
+        """Clear and return queued mid-turn steers for `session_id`."""
+        return self._cli.clear_steers(session_id)
+
+    def handle_session_context(
+        self,
+        session_id: str,
+        *,
+        subcommand: str = "",
+        path: str | None = None,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Handle `_kiro/session/context` (`add`, `remove`, `clear`) on `contextPaths`."""
+        _ = force
+        state = self._require_session(session_id)
+        context_paths = [
+            str(p).strip() for p in (state.get("contextPaths") or []) if str(p).strip()
+        ]
+        sub = (subcommand or "").strip().lower()
+        clean_path = path.strip() if isinstance(path, str) else ""
+
+        if sub == "add":
+            if not clean_path:
+                return {"success": False, "message": "Path is required to add context."}
+            if clean_path not in context_paths:
+                context_paths.append(clean_path)
+            state["contextPaths"] = context_paths
+            self._store.upsert_session(state)
+            return {"success": True, "message": f"Added context path: {clean_path}"}
+
+        if sub == "remove":
+            if not clean_path:
+                return {"success": False, "message": "Path is required to remove context."}
+            if clean_path not in context_paths:
+                return {"success": False, "message": f"Context path not found: {clean_path}"}
+            context_paths = [p for p in context_paths if p != clean_path]
+            state["contextPaths"] = context_paths
+            self._store.upsert_session(state)
+            return {"success": True, "message": f"Removed context path: {clean_path}"}
+
+        if sub == "clear":
+            state["contextPaths"] = []
+            self._store.upsert_session(state)
+            return {"success": True, "message": "Cleared all session context paths."}
+
+        return {"success": False, "message": f"Unsupported context subcommand: {subcommand}"}
+
+    def handle_knowledge(
+        self,
+        session_id: str,
+        params: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Handle `_kiro/knowledge` (`show`, `add`, `remove`, `update`, `clear`, `cancel`)."""
+        state = self._require_session(session_id)
+        merged: dict[str, Any] = {
+            **(dict(params) if isinstance(params, Mapping) else {}),
+            **kwargs,
+        }
+        sub = str(
+            merged.get("subcommand") or merged.get("action") or merged.get("command") or "show"
+        ).strip().lower()
+        entries: list[dict[str, Any]] = [
+            dict(e) for e in (state.get("knowledgeEntries") or []) if isinstance(e, dict)
+        ]
+
+        if sub == "show":
+            normalized = [
+                {
+                    "name": str(
+                        e.get("name") or Path(str(e.get("path") or "")).name or "knowledge"
+                    ),
+                    "path": str(e.get("path") or ""),
+                    "item_count": int(e.get("item_count", 1)),
+                }
+                for e in entries
+            ]
+            return {"success": True, "entries": normalized}
+
+        if sub == "add":
+            raw_path = merged.get("path")
+            raw_name = merged.get("name")
+            path_str = str(raw_path).strip() if isinstance(raw_path, str) else ""
+            name_str = str(raw_name).strip() if isinstance(raw_name, str) else ""
+            if not path_str:
+                return {"success": False, "message": "Path is required to add knowledge entry."}
+            if not name_str:
+                name_str = Path(path_str).name or path_str
+            if merged.get("item_count") is not None:
+                item_count = int(merged["item_count"])
+            else:
+                target_p = Path(path_str)
+                if target_p.is_dir():
+                    with contextlib.suppress(OSError):
+                        item_count = max(1, sum(1 for f in target_p.rglob("*") if f.is_file()))
+                    if "item_count" not in locals():
+                        item_count = 1
+                else:
+                    item_count = 1
+            new_entry = {"name": name_str, "path": path_str, "item_count": item_count}
+            replaced = False
+            for idx, existing in enumerate(entries):
+                if existing.get("name") == name_str or existing.get("path") == path_str:
+                    entries[idx] = new_entry
+                    replaced = True
+                    break
+            if not replaced:
+                entries.append(new_entry)
+            state["knowledgeEntries"] = entries
+            self._store.upsert_session(state)
+            return {"success": True, "message": f"Added knowledge entry '{name_str}'."}
+
+        if sub == "remove":
+            target = str(
+                merged.get("name") or merged.get("path") or merged.get("id") or ""
+            ).strip()
+            if not target:
+                return {
+                    "success": False,
+                    "message": "Name or path is required to remove knowledge entry.",
+                }
+            remaining = [
+                e for e in entries if e.get("name") != target and e.get("path") != target
+            ]
+            if len(remaining) == len(entries):
+                return {"success": False, "message": f"Knowledge entry not found: {target}"}
+            state["knowledgeEntries"] = remaining
+            self._store.upsert_session(state)
+            return {"success": True, "message": f"Removed knowledge entry '{target}'."}
+
+        if sub == "update":
+            target = str(
+                merged.get("name") or merged.get("path") or merged.get("id") or ""
+            ).strip()
+            if not target:
+                if entries:
+                    return {"success": True, "message": "Updated knowledge entries."}
+                return {
+                    "success": False,
+                    "message": "Name or path is required to update knowledge entry.",
+                }
+            for idx, existing in enumerate(entries):
+                if existing.get("name") == target or existing.get("path") == target:
+                    updated_name = (
+                        str(merged["name"]).strip()
+                        if isinstance(merged.get("name"), str) and str(merged["name"]).strip()
+                        else str(existing.get("name") or target)
+                    )
+                    updated_path = (
+                        str(merged["path"]).strip()
+                        if isinstance(merged.get("path"), str) and str(merged["path"]).strip()
+                        else str(existing.get("path") or "")
+                    )
+                    updated_count = int(merged.get("item_count", existing.get("item_count", 1)))
+                    entries[idx] = {
+                        "name": updated_name,
+                        "path": updated_path,
+                        "item_count": updated_count,
+                    }
+                    state["knowledgeEntries"] = entries
+                    self._store.upsert_session(state)
+                    return {
+                        "success": True,
+                        "message": f"Updated knowledge entry '{updated_name}'.",
+                    }
+            return {"success": False, "message": f"Knowledge entry not found: {target}"}
+
+        if sub == "clear":
+            state["knowledgeEntries"] = []
+            self._store.upsert_session(state)
+            return {"success": True, "message": "Cleared all knowledge entries."}
+
+        if sub == "cancel":
+            return {"success": True, "message": "Cancelled knowledge indexing operation."}
+
+        return {"success": False, "message": f"Unsupported knowledge subcommand: {sub}"}
+
+    def handle_code_intelligence(
+        self,
+        session_id: str,
+        *,
+        subcommand: str = "status",
+    ) -> dict[str, Any]:
+        """Handle `_kiro/codeIntelligence` (`init`, `status`)."""
+        state = self._require_session(session_id)
+        meta = dict(state.get("meta") or {})
+        sub = (subcommand or "").strip().lower()
+
+        if sub == "init":
+            meta["codeIntelligenceInitialized"] = True
+            state["meta"] = meta
+            self._store.upsert_session(state)
+            return {"success": True, "message": "Code intelligence initialized."}
+
+        if sub == "status":
+            cwd_str = str(state.get("cwd") or "").strip()
+            languages: list[str] = []
+            if cwd_str:
+                cwd_path = Path(cwd_str)
+                if (cwd_path / "pyproject.toml").exists():
+                    languages.append("python")
+                if (cwd_path / "tsconfig.json").exists() or (cwd_path / "package.json").exists():
+                    languages.append("typescript")
+                if (cwd_path / "Cargo.toml").exists():
+                    languages.append("rust")
+            if not languages:
+                languages = ["python"]
+            initialized = bool(meta.get("codeIntelligenceInitialized", False))
+            return {
+                "success": True,
+                "status": {
+                    "initialized": initialized,
+                    "languages": languages,
+                    "lspServers": [{"name": lang, "status": "ready"} for lang in languages],
+                },
+            }
+
+        return {
+            "success": False,
+            "message": f"Unsupported codeIntelligence subcommand: {subcommand}",
+        }
+
+    def revert_checkpoint_by_message_id(
+        self,
+        session_id: str,
+        *,
+        message_id: str,
+    ) -> dict[str, Any]:
+        """Handle `_kiro/checkpoint/revertMultiple` by truncating turns from `message_id`."""
+        state = self._require_session(session_id)
+        clean_msg_id = (message_id or "").strip()
+        if not clean_msg_id:
+            raise ValueError("messageId must be a non-empty string")
+        self._store.revert_turns_from_message_id(session_id, clean_msg_id)
+        remaining_turns = self._store.get_session_turns(session_id)
+        state["compactedSummary"] = _format_remaining_turns_summary(remaining_turns)
+        state["agyConversationId"] = None
+        state["reinjectAgentPrompt"] = True
+        self._store.upsert_session(state)
+        return {"success": True}
+
+    prompt_session = prompt
 
     async def cancel(self, *, session_id: str) -> bool:
         """Cancel an in-flight prompt turn (`session/cancel`) and persist in SQLite."""

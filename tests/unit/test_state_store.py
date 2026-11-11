@@ -257,3 +257,56 @@ def test_sqlite_session_turns_lifecycle_and_cascade(tmp_path: Path) -> None:
     )
     assert store_reloaded.delete_session("sess-turns") is True
     assert store_reloaded.get_session_turns("sess-turns") == []
+
+
+def test_sqlite_context_paths_knowledge_entries_and_revert_turns_from_message_id(
+    tmp_path: Path,
+) -> None:
+    """Verify contextPaths, knowledgeEntries persistence and revert_turns_from_message_id."""
+    store = SqliteStateStoreProvider(tmp_path)
+    store.upsert_session(
+        {
+            "sessionId": "sess-0121",
+            "cwd": "/ws",
+            "contextPaths": ["/ws/a.py", "/ws/b.py"],
+            "knowledgeEntries": [
+                {"name": "Arch", "path": "/ws/docs/arch.md", "item_count": 1},
+            ],
+        }
+    )
+
+    reloaded = SqliteStateStoreProvider(tmp_path).get_session("sess-0121")
+    assert reloaded is not None
+    assert reloaded["contextPaths"] == ["/ws/a.py", "/ws/b.py"]
+    assert reloaded["knowledgeEntries"] == [
+        {"name": "Arch", "path": "/ws/docs/arch.md", "item_count": 1}
+    ]
+
+    store.append_session_turn(
+        session_id="sess-0121",
+        user_message_id="m-0",
+        prompt_blocks=[{"type": "text", "text": "t0"}],
+        assistant_text="a0",
+    )
+    store.append_session_turn(
+        session_id="sess-0121",
+        user_message_id="m-1",
+        prompt_blocks=[{"type": "text", "text": "t1"}],
+        assistant_text="a1",
+    )
+    store.append_session_turn(
+        session_id="sess-0121",
+        user_message_id="m-2",
+        prompt_blocks=[{"type": "text", "text": "t2"}],
+        assistant_text="a2",
+    )
+
+    assert store.revert_turns_from_message_id("sess-0121", "missing-id") == 0
+    assert len(store.get_session_turns("sess-0121")) == 3
+
+    reverted = store.revert_turns_from_message_id("sess-0121", "m-1")
+    assert reverted == 2
+    remaining = store.get_session_turns("sess-0121")
+    assert len(remaining) == 1
+    assert remaining[0]["user_message_id"] == "m-0"
+

@@ -419,8 +419,14 @@ async def test_kas_v3_initialize_mcp_catalog_custom_agent_and_mandate_injection(
         "_kiro/session/compact",
         "_kiro/session/delete",
         "_kiro/mcp/resetServer",
+        "_kiro/session/context",
+        "_kiro/knowledge",
+        "_kiro/codeIntelligence",
+        "_kiro/checkpoint/revertMultiple",
     }
-    assert kiro_caps["checkpoints"] is False
+    assert kiro_caps["checkpoints"] is True
+    assert kiro_caps["mcpServerOAuth"] is True
+    assert kiro_caps["mcpRegistryPointers"] is True
 
     new_resp = await harness.send_request(
         "session/new",

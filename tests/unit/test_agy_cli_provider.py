@@ -2174,3 +2174,29 @@ async def test_stream_prompt_delivers_oversized_prompt_via_stream_json_stdin_wit
         "history_entry": f"consolidated:{len(large_consolidation_prompt)}",
         "lessons": [],
     }
+
+
+async def test_clear_steers_pops_queued_steers_and_unlinks_temp_files(tmp_path: Path) -> None:
+    """Verify clear_steers pops queued steers, deletes temp files, and returns raw messages."""
+    provider = AgyCliProvider(save_dir=tmp_path / "state")
+    provider._active_turns.add("sess-steer-clear")
+
+    tf = tmp_path / "steer-img.png"
+    tf.write_bytes(b"fake-png")
+    assert await provider.steer_session(
+        "sess-steer-clear",
+        raw_message="First raw",
+        prompt="First steer",
+        temp_files=[tf],
+    )
+    assert await provider.steer_session(
+        "sess-steer-clear",
+        raw_message="Second raw",
+        prompt="Second steer",
+    )
+
+    dropped = provider.clear_steers("sess-steer-clear")
+    assert dropped == ["First raw", "Second raw"]
+    assert not tf.exists()
+    assert provider.clear_steers("sess-steer-clear") == []
+

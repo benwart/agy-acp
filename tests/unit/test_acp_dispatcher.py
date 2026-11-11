@@ -1251,8 +1251,14 @@ async def test_kas_v3_initialize_session_new_set_mode_load_replay_and_reset_serv
         "_kiro/session/compact",
         "_kiro/session/delete",
         "_kiro/mcp/resetServer",
+        "_kiro/session/context",
+        "_kiro/knowledge",
+        "_kiro/codeIntelligence",
+        "_kiro/checkpoint/revertMultiple",
     ]
-    assert kiro_caps["checkpoints"] is False
+    assert kiro_caps["checkpoints"] is True
+    assert kiro_caps["mcpServerOAuth"] is True
+    assert kiro_caps["mcpRegistryPointers"] is True
 
     new_resp = await dispatcher.handle_message(
         json.dumps(
@@ -3234,3 +3240,220 @@ async def test_kirocrew_lite_consolidation_with_oversized_prompt_succeeds_withou
     parsed = json.loads("".join(chunks))
     assert parsed["history_entry"].startswith("ok:")
     assert parsed["lessons"] == []
+
+
+async def test_acp_dispatcher_0121_fork_steer_clear_kas_rpcs_and_trailing_compact(
+    tmp_path: Path,
+) -> None:
+    """Verify 0.12.1 RPC handlers: fork, steer/clear, KAS RPCs, and trailing /compact."""
+    from agy_acp.logic.wire import V2KiroWireAdapter, V3KasWireAdapter
+
+    # Trailing /compact extraction after sentence punctuation
+    assert AcpDispatcher._extract_compact_command("Done with task. /compact") == (
+        True,
+        "Done with task.",
+    )
+    assert AcpDispatcher._extract_compact_command("Can we wrap up? /compact") == (
+        True,
+        "Can we wrap up?",
+    )
+    assert AcpDispatcher._extract_compact_command("Check /Users/foo/compact path") == (False, "")
+
+    emitted: list[dict[str, Any]] = []
+
+    async def _sink(msg: dict[str, Any]) -> None:
+        emitted.append(msg)
+
+    adapter = V3KasWireAdapter()
+    cli = _StubAgyCliProvider(save_dir=tmp_path)
+    mgr = SessionManager(save_dir=tmp_path, cli_provider=cli, wire_adapter=adapter)
+    dispatcher = AcpDispatcher(
+        notification_sink=_sink,
+        session_manager=mgr,
+        quota_tracker=QuotaTracker(
+            provider=QuotaProvider(cli_provider=cli),
+            state_store=cli.state_store,
+        ),
+        wire_adapter=adapter,
+    )
+    assert dispatcher._wire is adapter
+
+    new_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 200,
+                "method": "session/new",
+                "params": {"cwd": str(tmp_path), "mcpServers": []},
+            }
+        )
+    )
+    assert new_resp is not None
+    sid = new_resp["result"]["sessionId"]
+    dispatcher.pop_post_response_notifications()
+
+    # Run 2 turns so session has history
+    for idx in (1, 2):
+        await dispatcher.handle_message(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 200 + idx,
+                    "method": "session/prompt",
+                    "params": {
+                        "sessionId": sid,
+                        "prompt": [{"type": "text", "text": f"Prompt {idx}"}],
+                    },
+                }
+            )
+        )
+        dispatcher.pop_post_response_notifications()
+
+    turns_before = mgr.state_store.get_session_turns(sid)
+    assert len(turns_before) == 2
+    first_msg_id = turns_before[0]["user_message_id"]
+    second_msg_id = turns_before[1]["user_message_id"]
+
+    # 1. _session/steer/clear on v3 emits steering_cleared
+    cli._active_turns.add(sid)
+    await mgr.steer(session_id=sid, message="Drop me 1")
+    await mgr.steer(session_id=sid, message="Drop me 2")
+    emitted.clear()
+
+    clear_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 210,
+                "method": "_session/steer/clear",
+                "params": {"sessionId": sid},
+            }
+        )
+    )
+    assert clear_resp is not None
+    assert clear_resp["result"] == {"cleared": True}
+    steer_updates = [
+        n["params"]["update"]
+        for n in emitted
+        if n.get("method") == "session/update"
+        and n["params"]["update"].get("sessionUpdate") == "session_info_update"
+    ]
+    assert len(steer_updates) == 1
+    assert steer_updates[0]["_meta"]["kiro"]["kind"] == "steering_cleared"
+    assert steer_updates[0]["_meta"]["kiro"]["content"] == "Drop me 1\nDrop me 2"
+    cli._active_turns.discard(sid)
+
+    # Also verify v2 emits steering_cleared
+    emitted_v2: list[dict[str, Any]] = []
+
+    async def _sink_v2(msg: dict[str, Any]) -> None:
+        emitted_v2.append(msg)
+
+    disp_v2 = AcpDispatcher(
+        notification_sink=_sink_v2,
+        session_manager=mgr,
+        quota_tracker=QuotaTracker(
+            provider=QuotaProvider(cli_provider=cli),
+            state_store=cli.state_store,
+        ),
+        wire_adapter=V2KiroWireAdapter(),
+    )
+    cli._active_turns.add(sid)
+    await mgr.steer(session_id=sid, message="Drop v2")
+    await disp_v2.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 211,
+                "method": "_session/steer/clear",
+                "params": {"sessionId": sid},
+            }
+        )
+    )
+    assert emitted_v2[0]["params"]["update"]["sessionUpdate"] == "steering_cleared"
+    cli._active_turns.discard(sid)
+
+    # 2. session/fork via _meta.jetbrains.air.fork.messageId
+    fork_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 212,
+                "method": "session/fork",
+                "params": {
+                    "sessionId": sid,
+                    "_meta": {"jetbrains": {"air": {"fork": {"messageId": first_msg_id}}}},
+                },
+            }
+        )
+    )
+    assert fork_resp is not None
+    fork_sid = fork_resp["result"]["sessionId"]
+    assert fork_sid != sid
+    assert len(mgr.state_store.get_session_turns(fork_sid)) == 1
+    post_fork = dispatcher.pop_post_response_notifications()
+    assert [n["method"] for n in post_fork] == ["_kiro/mcp/status", "_kiro/tools/didChange"]
+
+    # 3. _kiro/session/context
+    ctx_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 213,
+                "method": "_kiro/session/context",
+                "params": {"sessionId": sid, "subcommand": "add", "path": "a.py"},
+            }
+        )
+    )
+    assert ctx_resp is not None
+    assert ctx_resp["result"]["success"] is True
+
+    # 4. _kiro/knowledge
+    know_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 214,
+                "method": "_kiro/knowledge",
+                "params": {
+                    "sessionId": sid,
+                    "subcommand": "add",
+                    "name": "Doc",
+                    "path": "/tmp/doc.md",
+                },
+            }
+        )
+    )
+    assert know_resp is not None
+    assert know_resp["result"]["success"] is True
+
+    # 5. _kiro/codeIntelligence
+    ci_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 215,
+                "method": "_kiro/codeIntelligence",
+                "params": {"sessionId": sid, "subcommand": "status"},
+            }
+        )
+    )
+    assert ci_resp is not None
+    assert ci_resp["result"]["success"] is True
+    assert "languages" in ci_resp["result"]["status"]
+
+    # 6. _kiro/checkpoint/revertMultiple
+    rev_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 216,
+                "method": "_kiro/checkpoint/revertMultiple",
+                "params": {"sessionId": sid, "messageId": second_msg_id},
+            }
+        )
+    )
+    assert rev_resp is not None
+    assert rev_resp["result"] == {"success": True}
+    assert len(mgr.state_store.get_session_turns(sid)) == 1
+
