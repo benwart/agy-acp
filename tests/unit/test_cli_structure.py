@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from agy_acp import __version__
+from agy_acp import KIRO_CLI_COMPAT_VERSION, __version__
 from agy_acp.cli import app
 from agy_acp.commands.acp import serve as acp_serve_cmd
 from agy_acp.commands.docs import build as docs_build_cmd
@@ -15,12 +15,13 @@ from agy_acp.commands.docs import build as docs_build_cmd
 def test_cli_scaffold_help_and_version(capsys: pytest.CaptureFixture[str]) -> None:
     """Verify Cyclopts scaffold registers subcommands, group docstrings, and version."""
     assert __version__ == "1.3.1"
+    assert KIRO_CLI_COMPAT_VERSION == "2.35.2"
     app(["--version"], result_action="return_value")
     version_out = capsys.readouterr().out.strip()
-    assert "1.3.1 kiro-cli 2.33.1" in version_out
+    assert "1.3.1 kiro-cli 2.35.2" in version_out
     last_token = version_out.split()[-1]
     major, minor, patch = (int(part) for part in last_token.split(".")[:3])
-    assert (major, minor, patch) >= (2, 33, 1)
+    assert (major, minor, patch) >= (2, 35, 2)
 
     app(["--help"], result_action="return_value")
     root_help = capsys.readouterr().out
@@ -55,7 +56,7 @@ def test_update_command_refreshes_wrapper_mtime(
     assert rc == 0
     out = capsys.readouterr().out
     assert "1.3.1" in out
-    assert "2.33.1" in out
+    assert "2.35.2" in out
     assert fake_bin.stat().st_mtime > 1_700_000_000
 
 

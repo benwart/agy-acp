@@ -54,8 +54,14 @@ def test_initialize_result_protocol_version_and_kas_capabilities() -> None:
             "_kiro/session/compact",
             "_kiro/session/delete",
             "_kiro/mcp/resetServer",
+            "_kiro/session/context",
+            "_kiro/knowledge",
+            "_kiro/codeIntelligence",
+            "_kiro/checkpoint/revertMultiple",
         ],
-        "checkpoints": False,
+        "checkpoints": True,
+        "mcpServerOAuth": True,
+        "mcpRegistryPointers": True,
     }
 
 
@@ -465,10 +471,40 @@ def test_turn_start_ttft_telemetry_steering_compaction_and_subagents() -> None:
 
     # Steering
     assert (
+        v2.build_steering_notification("sess-1", "queued", "Wait")["params"]["update"][
+            "sessionUpdate"
+        ]
+        == "steering_queued"
+    )
+    assert (
         v2.build_steering_notification("sess-1", "consumed", "Focus on tests")["params"]["update"][
             "sessionUpdate"
         ]
         == "steering_consumed"
+    )
+    assert (
+        v2.build_steering_notification("sess-1", "injected", "Focus on tests")["params"]["update"][
+            "sessionUpdate"
+        ]
+        == "steering_consumed"
+    )
+    assert (
+        v2.build_steering_notification("sess-1", "discarded", "Dropped")["params"]["update"][
+            "sessionUpdate"
+        ]
+        == "steering_cleared"
+    )
+    assert (
+        v2.build_steering_notification("sess-1", "cleared", "Cleared")["params"]["update"][
+            "sessionUpdate"
+        ]
+        == "steering_cleared"
+    )
+    assert (
+        v2.build_steering_notification("sess-1", "unexpected", "Fallback")[  # type: ignore[arg-type]
+            "params"
+        ]["update"]["sessionUpdate"]
+        == "steering_cleared"
     )
     assert v3.build_steering_notification("sess-1", "consumed", "Focus on tests")["params"][
         "update"

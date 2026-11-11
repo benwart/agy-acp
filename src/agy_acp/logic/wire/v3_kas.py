@@ -22,6 +22,10 @@ KAS_EXTENSION_METHODS: tuple[str, ...] = (
     "_kiro/session/compact",
     "_kiro/session/delete",
     "_kiro/mcp/resetServer",
+    "_kiro/session/context",
+    "_kiro/knowledge",
+    "_kiro/codeIntelligence",
+    "_kiro/checkpoint/revertMultiple",
 )
 
 
@@ -41,12 +45,13 @@ class V3KasWireAdapter(EngineWireAdapter):
         return ("low", "medium", "high", "xhigh", "max")
 
     def _augment_initialize_capabilities(self, capabilities: dict[str, Any]) -> None:
-        capabilities["_meta"] = {
-            "kiro": {
-                "extensionMethods": list(KAS_EXTENSION_METHODS),
-                "checkpoints": False,
-            }
+        kiro_meta: dict[str, Any] = {
+            "extensionMethods": list(KAS_EXTENSION_METHODS),
+            "checkpoints": True,
+            "mcpServerOAuth": True,
+            "mcpRegistryPointers": True,
         }
+        capabilities["_meta"] = {"kiro": kiro_meta}
 
     def build_available_modes(
         self,

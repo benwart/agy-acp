@@ -366,8 +366,8 @@ class V2KiroWireAdapter(EngineWireAdapter):
             "queued": "steering_queued",
             "consumed": "steering_consumed",
             "injected": "steering_consumed",
-            "discarded": "steering_discarded",
-            "cleared": "steering_discarded",
+            "discarded": "steering_cleared",
+            "cleared": "steering_cleared",
         }
         return {
             "jsonrpc": "2.0",
@@ -375,7 +375,7 @@ class V2KiroWireAdapter(EngineWireAdapter):
             "params": {
                 "sessionId": session_id,
                 "update": {
-                    "sessionUpdate": phase_map.get(phase, "steering_queued"),
+                    "sessionUpdate": phase_map.get(phase, "steering_cleared"),
                     "content": content,
                 },
             },

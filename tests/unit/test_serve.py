@@ -165,7 +165,21 @@ async def test_serve_non_dict_frames_unhashable_rpc_responses_and_exception_cont
 
     invalid_req_errors = [f for f in written_frames if f.get("error", {}).get("code") == -32600]
     assert len(invalid_req_errors) == 4
-    assert any(f.get("id") == 1 and "result" in f for f in written_frames)
+    init_frame = next(f for f in written_frames if f.get("id") == 1 and "result" in f)
+    assert init_frame["result"]["agentCapabilities"]["_meta"]["kiro"] == {
+        "extensionMethods": [
+            "_kiro/session/compact",
+            "_kiro/session/delete",
+            "_kiro/mcp/resetServer",
+            "_kiro/session/context",
+            "_kiro/knowledge",
+            "_kiro/codeIntelligence",
+            "_kiro/checkpoint/revertMultiple",
+        ],
+        "checkpoints": True,
+        "mcpServerOAuth": True,
+        "mcpRegistryPointers": True,
+    }
     new_frame = next(f for f in written_frames if f.get("id") == 2)
     sid = new_frame["result"]["sessionId"]
 
