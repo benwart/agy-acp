@@ -14,9 +14,10 @@ import pytest
 from agy_acp.providers.agy_cli_provider import (
     MAX_INLINE_PROMPT_BYTES,
     AgyCliProvider,
+    PromptDelivery,
     ToolCallEvent,
     build_agy_args,
-    prepare_prompt_arg,
+    prepare_prompt_delivery,
     resolve_agy_binary,
 )
 
@@ -41,24 +42,21 @@ def test_resolve_agy_binary_precedence(tmp_path: Path, monkeypatch: pytest.Monke
     assert resolved.endswith("agy")
 
 
-def test_prepare_prompt_arg_inline_and_offload(tmp_path: Path) -> None:
-    """Verify prompts <= 64 KiB stay inline and prompts > 64 KiB offload to a 0600 temp file."""
+def test_prepare_prompt_delivery_inline_and_stream_json_stdin(tmp_path: Path) -> None:
+    """Verify prompts <= 64 KiB stay inline and prompts > 64 KiB deliver via stream-json stdin."""
     short_prompt = "Explain how ACP works."
-    arg, temp_file = prepare_prompt_arg(short_prompt, session_id="sess-12345678", temp_dir=tmp_path)
-    assert arg == short_prompt
-    assert temp_file is None
+    short_delivery = prepare_prompt_delivery(short_prompt)
+    assert short_delivery == PromptDelivery(prompt_arg=short_prompt)
 
     large_prompt = "A" * (MAX_INLINE_PROMPT_BYTES + 128)
-    arg_large, temp_large = prepare_prompt_arg(
-        large_prompt,
-        session_id="sess-12345678",
-        temp_dir=tmp_path,
-    )
-    assert temp_large is not None
-    assert temp_large.is_file()
-    assert (temp_large.stat().st_mode & 0o777) == 0o600
-    assert temp_large.read_text(encoding="utf-8") == large_prompt
-    assert f"Please read the prompt and context in {temp_large} using view_file" in arg_large
+    large_delivery = prepare_prompt_delivery(large_prompt)
+    assert large_delivery.prompt_arg == ""
+    assert large_delivery.input_format == "stream-json"
+    assert large_delivery.stdin_payload is not None
+    assert large_delivery.stdin_payload.endswith(b"\n")
+    decoded = json.loads(large_delivery.stdin_payload.decode("utf-8"))
+    assert decoded == {"event": "user", "message": {"content": large_prompt}}
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_build_agy_args_maps_modes_effort_and_flags() -> None:
@@ -111,6 +109,16 @@ def test_build_agy_args_maps_modes_effort_and_flags() -> None:
         mode="read-only",
     )
     assert "--disable-slash-commands" not in args_ro_slash
+
+    args_stdin = build_agy_args(
+        cwd="/workspace",
+        prompt_arg="",
+        mode="read-only",
+        input_format="stream-json",
+    )
+    assert "--input-format" in args_stdin
+    assert args_stdin[args_stdin.index("--input-format") + 1] == "stream-json"
+    assert args_stdin[-2:] == ["-p", ""]
 
 
 def test_build_agy_args_and_resolve_model_for_effort_avoid_conflicting_effort_flags() -> None:
@@ -1579,14 +1587,13 @@ async def test_security_remediations_wave5b_provider(
     assert "mcp_session_mux" in " ".join(parsed_mcp["mcpServers"]["my_org_db"]["args"])
     assert (mcp_cfg_path.stat().st_mode & 0o777) == 0o600
 
-    # 4. MEDIUM-04: Private 0o700 prompt spill dir and random filename
+    # 4. MEDIUM-04: Oversized prompts stream via stdin NDJSON without touching disk
     big_prompt = "X" * (MAX_INLINE_PROMPT_BYTES + 64)
-    _, spilled = prepare_prompt_arg(big_prompt, session_id="sess-spill")
-    assert spilled is not None
-    assert spilled.parent == fake_home / ".config" / "agy-acp" / "tmp"
-    assert (spilled.parent.stat().st_mode & 0o777) == 0o700
-    assert (spilled.stat().st_mode & 0o777) == 0o600
-    spilled.unlink()
+    delivery = prepare_prompt_delivery(big_prompt)
+    assert delivery.prompt_arg == ""
+    assert delivery.input_format == "stream-json"
+    assert delivery.stdin_payload is not None
+    assert not (fake_home / ".config" / "agy-acp" / "tmp").exists()
 
     # 5. MEDIUM-03, HIGH-04 (AGY_ACP_SESSION_ID), & LOW-02 (PGID + SIGKILL escalation)
     child_pid_file = tmp_path / "bg_child.pid"
@@ -2090,3 +2097,80 @@ async def test_stream_prompt_unwraps_split_carousel_chunks_and_preserves_code_fe
     assert "".join(streamed) == expected
     assert outcome.response == expected
     assert all(chunk != "" for chunk in streamed)
+
+
+async def test_stream_prompt_delivers_oversized_prompt_via_stream_json_stdin_without_tools(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify >64 KiB prompts stream over stdin NDJSON without temp files or read_file tools."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    stdin_agy = _write_executable(
+        tmp_path / "agy-stdin-consolidate",
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "args = sys.argv[1:]\n"
+        "assert '--input-format' in args, f'missing --input-format: {args}'\n"
+        "assert args[args.index('--input-format') + 1] == 'stream-json'\n"
+        "assert args[args.index('-p') + 1] == ''\n"
+        "raw_stdin = sys.stdin.read()\n"
+        "lines = [ln for ln in raw_stdin.splitlines() if ln.strip()]\n"
+        "assert len(lines) == 1, f'expected 1 NDJSON line, got {len(lines)}'\n"
+        "frame = json.loads(lines[0])\n"
+        "assert frame.get('event') == 'user'\n"
+        "content = frame['message']['content']\n"
+        "reply = json.dumps({'history_entry': f'consolidated:{len(content)}', 'lessons': []})\n"
+        "init_ev = {'event': 'init', 'init': {'conversation_id': 'conv-cons-1'}}\n"
+        "print(json.dumps(init_ev), flush=True)\n"
+        "print(json.dumps({\n"
+        "    'event': 'step_update',\n"
+        "    'step_update': {\n"
+        "        'step_index': 1,\n"
+        "        'step_type': 'agent_response',\n"
+        "        'state': 'DONE',\n"
+        "        'text_delta': reply,\n"
+        "    },\n"
+        "}), flush=True)\n"
+        "print(json.dumps({\n"
+        "    'event': 'result',\n"
+        "    'result': {\n"
+        "        'conversation_id': 'conv-cons-1',\n"
+        "        'status': 'SUCCESS',\n"
+        "        'response': reply,\n"
+        "        'usage': {'input_tokens': 20000, 'output_tokens': 25, 'total_tokens': 20025},\n"
+        "    },\n"
+        "}), flush=True)\n",
+    )
+
+    provider = AgyCliProvider(bin_path=stdin_agy, save_dir=tmp_path / "state")
+    large_consolidation_prompt = "You are a memory consolidation agent.\n" + (
+        "Message line\n" * 7000
+    )
+    assert len(large_consolidation_prompt.encode("utf-8")) > MAX_INLINE_PROMPT_BYTES
+
+    tool_calls_seen: list[ToolCallEvent] = []
+
+    async def _reject_all_tools(ev: ToolCallEvent) -> bool:
+        tool_calls_seen.append(ev)
+        return False
+
+    outcome = await provider.stream_prompt(
+        cwd=str(tmp_path),
+        prompt=large_consolidation_prompt,
+        session_id="sess-consolidate",
+        mode="read-only",
+        skip_permissions=False,
+        on_tool_call=_reject_all_tools,
+    )
+
+    assert outcome.error == ""
+    assert tool_calls_seen == []
+    assert not (fake_home / ".config" / "agy-acp" / "tmp").exists()
+    parsed = json.loads(outcome.response)
+    assert parsed == {
+        "history_entry": f"consolidated:{len(large_consolidation_prompt)}",
+        "lessons": [],
+    }

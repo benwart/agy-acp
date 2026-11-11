@@ -3082,3 +3082,155 @@ async def test_session_load_replays_legacy_persisted_carousel_turns_as_normalize
         "![Legacy 1](/Users/benwart/.gemini/antigravity-cli/brain/ee2ecabe/screen-2.png)\n\n"
         "![Legacy 2](/Users/benwart/.gemini/antigravity-cli/brain/ee2ecabe/screen-2b.png)\n"
     ]
+
+
+async def test_kirocrew_lite_consolidation_with_oversized_prompt_succeeds_without_tool_calls(
+    tmp_path: Path,
+) -> None:
+    """Oversized (>64 KiB) consolidation prompts on `kirocrew-lite` (`tools: []`) return JSON."""
+    from agy_acp.logic.wire import V3KasWireAdapter
+    from agy_acp.providers.agy_cli_provider import MAX_INLINE_PROMPT_BYTES, AgyCliProvider
+
+    fake_agy = tmp_path / "agy-consolidate-wire"
+    fake_agy.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "args = sys.argv[1:]\n"
+        "if args == ['models']:\n"
+        "    sys.exit(0)\n"
+        "if '-p' in args and args[args.index('-p') + 1] in ('/usage', '/credits'):\n"
+        "    print(json.dumps({'status': 'SUCCESS', 'command': {'name': 'quota', 'data': []}}))\n"
+        "    sys.exit(0)\n"
+        "assert '--input-format' in args\n"
+        "assert args[args.index('--input-format') + 1] == 'stream-json'\n"
+        "assert '--mode' in args and args[args.index('--mode') + 1] == 'plan'\n"
+        "assert '--dangerously-skip-permissions' not in args\n"
+        "frame = json.loads(sys.stdin.readline())\n"
+        "assert frame['event'] == 'user'\n"
+        "body = frame['message']['content']\n"
+        "out = json.dumps({'history_entry': f'ok:{len(body)}', 'semantic': [], 'lessons': []})\n"
+        "init_ev = {'event': 'init', 'init': {'conversation_id': 'conv-lite-1'}}\n"
+        "print(json.dumps(init_ev), flush=True)\n"
+        "step_ev = {\n"
+        "    'event': 'step_update',\n"
+        "    'step_update': {\n"
+        "        'step_index': 1,\n"
+        "        'step_type': 'agent_response',\n"
+        "        'state': 'DONE',\n"
+        "        'text_delta': out,\n"
+        "    },\n"
+        "}\n"
+        "print(json.dumps(step_ev), flush=True)\n"
+        "res_ev = {\n"
+        "    'event': 'result',\n"
+        "    'result': {\n"
+        "        'conversation_id': 'conv-lite-1',\n"
+        "        'status': 'SUCCESS',\n"
+        "        'response': out,\n"
+        "        'usage': {'input_tokens': 21000, 'output_tokens': 20, 'total_tokens': 21020},\n"
+        "    },\n"
+        "}\n"
+        "print(json.dumps(res_ev), flush=True)\n",
+        encoding="utf-8",
+    )
+    fake_agy.chmod(0o755)
+
+    emitted: list[dict[str, Any]] = []
+
+    async def _sink(msg: dict[str, Any]) -> None:
+        emitted.append(msg)
+
+    adapter = V3KasWireAdapter()
+    state_dir = tmp_path / "state"
+    cli = AgyCliProvider(bin_path=fake_agy, save_dir=state_dir)
+    mgr = SessionManager(save_dir=state_dir, cli_provider=cli, wire_adapter=adapter)
+    dispatcher = AcpDispatcher(
+        notification_sink=_sink,
+        session_manager=mgr,
+        quota_tracker=QuotaTracker(
+            provider=QuotaProvider(cli_provider=cli),
+            state_store=cli.state_store,
+        ),
+        wire_adapter=adapter,
+    )
+
+    ws = tmp_path / "_consolidate"
+    ws.mkdir()
+    new_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "session/new",
+                "params": {
+                    "cwd": str(ws),
+                    "mcpServers": [],
+                    "_meta": {
+                        "kiro": {
+                            "customAgents": [
+                                {
+                                    "id": "kirocrew-lite",
+                                    "name": "kirocrew-lite",
+                                    "prompt": "You are a Kiro Crew lightweight background agent.",
+                                    "tools": [],
+                                }
+                            ]
+                        }
+                    },
+                },
+            }
+        )
+    )
+    assert new_resp is not None
+    sid = new_resp["result"]["sessionId"]
+
+    mode_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/set_mode",
+                "params": {"sessionId": sid, "modeId": "kirocrew-lite"},
+            }
+        )
+    )
+    assert mode_resp is not None
+    assert "result" in mode_resp
+    emitted.clear()
+
+    big_consolidation = "You are a memory consolidation agent.\n" + ("Row\n" * 22000)
+    assert len(big_consolidation.encode("utf-8")) > MAX_INLINE_PROMPT_BYTES
+
+    prompt_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": sid,
+                    "prompt": [{"type": "text", "text": big_consolidation}],
+                },
+            }
+        )
+    )
+    assert prompt_resp is not None
+    assert prompt_resp["result"]["stopReason"] == "end_turn"
+
+    tool_updates = [
+        n
+        for n in emitted
+        if n.get("method") == "session/update"
+        and n["params"]["update"].get("sessionUpdate") in ("tool_call", "tool_call_update")
+    ]
+    assert tool_updates == []
+
+    chunks = [
+        n["params"]["update"]["content"]["text"]
+        for n in emitted
+        if n.get("method") == "session/update"
+        and n["params"]["update"].get("sessionUpdate") == "agent_message_chunk"
+    ]
+    parsed = json.loads("".join(chunks))
+    assert parsed["history_entry"].startswith("ok:")
+    assert parsed["lessons"] == []

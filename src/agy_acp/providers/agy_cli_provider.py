@@ -5,10 +5,10 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import re
 import secrets
 import shutil
 import signal
+import subprocess
 import sys
 import threading
 import uuid
@@ -238,38 +238,28 @@ def resolve_agy_binary(explicit_bin: str | Path | None = None) -> str:
     return "agy"
 
 
-def prepare_prompt_arg(
-    prompt: str,
-    *,
-    session_id: str | None = None,
-    temp_dir: Path | None = None,
-) -> tuple[str, Path | None]:
-    """Return `(prompt_arg, temp_file)` offloading prompts > 64 KiB to a 0600 temporary file."""
-    encoded = prompt.encode("utf-8")
-    if len(encoded) <= MAX_INLINE_PROMPT_BYTES:
-        return prompt, None
+@dataclass(frozen=True)
+class PromptDelivery:
+    """CLI prompt argument and optional `stream-json` stdin payload for an `agy` turn."""
 
-    target_dir = (
-        Path(temp_dir) if temp_dir is not None else (Path.home() / ".config" / "agy-acp" / "tmp")
+    prompt_arg: str
+    stdin_payload: bytes | None = None
+    input_format: str | None = None
+
+
+def prepare_prompt_delivery(prompt: str) -> PromptDelivery:
+    """Deliver prompts <= 64 KiB inline on `-p` and larger prompts via `stream-json` stdin."""
+    if len(prompt.encode("utf-8")) <= MAX_INLINE_PROMPT_BYTES:
+        return PromptDelivery(prompt_arg=prompt)
+
+    ndjson_line = (
+        json.dumps({"event": "user", "message": {"content": prompt}}, ensure_ascii=False) + "\n"
     )
-    target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with contextlib.suppress(OSError):
-        target_dir.chmod(0o700)
-    tag = re.sub(r"[^A-Za-z0-9_-]", "", (session_id or "default"))[:8] or "default"
-    filename = f"agy-acp-prompt-{tag}-{secrets.token_hex(8)}.md"
-    file_path = target_dir / filename
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(file_path, flags, 0o600)
-    try:
-        os.write(fd, encoded)
-    finally:
-        os.close(fd)
-    file_path.chmod(0o600)
-    instruction = (
-        f"Please read the prompt and context in {file_path} using view_file "
-        "and follow the instructions in it."
+    return PromptDelivery(
+        prompt_arg="",
+        stdin_payload=ndjson_line.encode("utf-8"),
+        input_format="stream-json",
     )
-    return instruction, file_path
 
 
 def _split_model_effort_suffix(model: str | None) -> tuple[str, str] | None:
@@ -316,6 +306,7 @@ def build_agy_args(
     effort: str | None = None,
     skip_permissions: bool | None = None,
     sandbox: bool = False,
+    input_format: str | None = None,
     output_format: str = "stream-json",
 ) -> list[str]:
     """Construct `agy` CLI flags for non-interactive print mode (`-p`)."""
@@ -347,6 +338,8 @@ def build_agy_args(
         args.append("--sandbox")
 
     args.extend(["--print-timeout", "0"])
+    if input_format:
+        args.extend(["--input-format", input_format])
     if output_format:
         args.extend(["--output-format", output_format])
     args.extend(["-p", prompt_arg])
@@ -1780,7 +1773,6 @@ class AgyCliProvider:
             "context_tokens": 0,
         }
         steer_temp_files: list[Path] = []
-        active_temp_file: Path | None = None
         did_denial_recovery = False
         subagent_tracker = _SubagentRosterTracker()
         self._active_turns.add(sid)
@@ -1788,17 +1780,17 @@ class AgyCliProvider:
 
         try:
             while True:
-                prompt_arg, temp_file = prepare_prompt_arg(current_prompt, session_id=sid)
-                active_temp_file = temp_file
+                delivery = prepare_prompt_delivery(current_prompt)
                 args = build_agy_args(
                     cwd=cwd,
-                    prompt_arg=prompt_arg,
+                    prompt_arg=delivery.prompt_arg,
                     conversation_id=resolved_conv_id or None,
                     model=current_model,
                     mode=mode,
                     effort=effort,
                     skip_permissions=skip_permissions,
                     sandbox=sandbox,
+                    input_format=delivery.input_format,
                     output_format="stream-json",
                 )
                 emitted_thoughts_by_step: dict[int, int] = {}
@@ -2149,6 +2141,31 @@ class AgyCliProvider:
                     async for chunk in TextReceiveStream(proc.stderr):
                         _stderr_chunks.append(chunk)
 
+                async def _feed_stdin(
+                    proc: anyio.abc.Process,
+                    *,
+                    _payload: bytes | None = delivery.stdin_payload,
+                ) -> None:
+                    if proc.stdin is None:
+                        return
+                    try:
+                        if _payload is not None:
+                            with contextlib.suppress(
+                                BrokenPipeError,
+                                anyio.BrokenResourceError,
+                                anyio.ClosedResourceError,
+                                OSError,
+                            ):
+                                await proc.stdin.send(_payload)
+                    finally:
+                        with contextlib.suppress(
+                            BrokenPipeError,
+                            anyio.BrokenResourceError,
+                            anyio.ClosedResourceError,
+                            OSError,
+                        ):
+                            await proc.stdin.aclose()
+
                 proc: anyio.abc.Process | None = None
                 try:
                     log_acp_event(
@@ -2161,6 +2178,11 @@ class AgyCliProvider:
                     )
                     proc = await anyio.open_process(
                         [self.bin_path, *args],
+                        stdin=(
+                            subprocess.PIPE
+                            if delivery.stdin_payload is not None
+                            else subprocess.DEVNULL
+                        ),
                         cwd=effective_cwd,
                         env=merged_env,
                         start_new_session=True,
@@ -2170,6 +2192,7 @@ class AgyCliProvider:
                         self._interrupt_process_for_steer(sid)
                     async with proc:
                         async with anyio.create_task_group() as tg:
+                            tg.start_soon(_feed_stdin, proc)
                             tg.start_soon(_consume_stdout, proc)
                             tg.start_soon(_consume_stderr, proc)
                         await proc.wait()
@@ -2195,10 +2218,6 @@ class AgyCliProvider:
                 finally:
                     self._cancel_abort_timer(sid)
                     self._active_processes.pop(sid, None)
-                    if temp_file is not None:
-                        with contextlib.suppress(OSError):
-                            temp_file.unlink(missing_ok=True)
-                    active_temp_file = None
 
                 final_result_obj = run_result_obj
                 was_cancelled = sid in self._cancelled_sessions or (
@@ -2301,9 +2320,6 @@ class AgyCliProvider:
             self._active_turns.discard(sid)
             self._turn_conv_ids.pop(sid, None)
             self._in_permission_request.pop(sid, None)
-            if active_temp_file is not None:
-                with contextlib.suppress(OSError):
-                    active_temp_file.unlink(missing_ok=True)
             for leftover in self._pop_queued_steers(sid):
                 steer_temp_files.extend(leftover.temp_files)
             for tmp_path in steer_temp_files:
