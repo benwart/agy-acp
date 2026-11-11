@@ -162,6 +162,16 @@ class SqliteStateStoreProvider:
             if "custom_agents_json" in row_keys
             else []
         )
+        raw_context_paths = auth_cfg.get("_context_paths", [])
+        context_paths = (
+            [str(p) for p in raw_context_paths] if isinstance(raw_context_paths, list) else []
+        )
+        raw_knowledge_entries = auth_cfg.get("_knowledge_entries", [])
+        knowledge_entries = (
+            [dict(e) if isinstance(e, dict) else e for e in raw_knowledge_entries]
+            if isinstance(raw_knowledge_entries, list)
+            else []
+        )
         return {
             "sessionId": str(row["session_id"]),
             "agyConversationId": row["agy_conversation_id"],
@@ -178,6 +188,8 @@ class SqliteStateStoreProvider:
             "modelPinnedByUser": bool(auth_cfg.get("_model_pinned_by_user", False)),
             "compactedSummary": auth_cfg.get("_compacted_summary"),
             "reinjectAgentPrompt": bool(auth_cfg.get("_reinject_agent_prompt", False)),
+            "contextPaths": context_paths,
+            "knowledgeEntries": knowledge_entries,
             "model": str(row["model"]),
             "reasoning_effort": str(row["reasoning_effort"]),
             "cancelled": bool(row["cancelled"]),
@@ -274,6 +286,16 @@ class SqliteStateStoreProvider:
                 auth_config["_reinject_agent_prompt"] = True
             else:
                 auth_config.pop("_reinject_agent_prompt", None)
+        if "contextPaths" in state:
+            if isinstance(state["contextPaths"], list) and state["contextPaths"]:
+                auth_config["_context_paths"] = [str(p) for p in state["contextPaths"]]
+            else:
+                auth_config.pop("_context_paths", None)
+        if "knowledgeEntries" in state:
+            if isinstance(state["knowledgeEntries"], list) and state["knowledgeEntries"]:
+                auth_config["_knowledge_entries"] = list(state["knowledgeEntries"])
+            else:
+                auth_config.pop("_knowledge_entries", None)
         created_at = str(existing.get("createdAt") or now)
 
         with self._connect() as conn:
@@ -426,6 +448,28 @@ class SqliteStateStoreProvider:
             cur = conn.execute(
                 "DELETE FROM session_turns WHERE session_id = ?",
                 (session_id,),
+            )
+            return cur.rowcount
+
+    def revert_turns_from_message_id(self, session_id: str, message_id: str) -> int:
+        """Delete all turns for `session_id` starting at the earliest turn matching `message_id`."""
+        if not session_id or not message_id:
+            return 0
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT MIN(turn_idx) AS target_idx
+                FROM session_turns
+                WHERE session_id = ? AND user_message_id = ?
+                """,
+                (session_id, message_id),
+            ).fetchone()
+            if row is None or row["target_idx"] is None:
+                return 0
+            target_idx = int(row["target_idx"])
+            cur = conn.execute(
+                "DELETE FROM session_turns WHERE session_id = ? AND turn_idx >= ?",
+                (session_id, target_idx),
             )
             return cur.rowcount
 

@@ -1612,6 +1612,15 @@ class AgyCliProvider:
         queue = self._steer_queues.pop(session_id, [])
         return list(queue)
 
+    def clear_steers(self, session_id: str) -> list[str]:
+        """Pop and discard all queued mid-turn steers for `session_id`, unlinking temp files."""
+        steers = self._pop_queued_steers(session_id)
+        for steer in steers:
+            for tmp in steer.temp_files:
+                with contextlib.suppress(OSError):
+                    tmp.unlink(missing_ok=True)
+        return [s.raw_message for s in steers if s.raw_message]
+
     def _interrupt_process_for_steer(self, session_id: str) -> None:
         """Interrupt the active `agy` subprocess for `session_id` when safe to steer."""
         if self._in_permission_request.get(session_id, 0) > 0:

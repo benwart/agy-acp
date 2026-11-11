@@ -448,6 +448,7 @@ class AcpDispatcher:
             session_manager.wire_adapter if session_manager is not None else V2KiroWireAdapter()
         )
         self._wire_adapter: EngineWireAdapter = resolved_adapter
+        self._wire: EngineWireAdapter = resolved_adapter
         self._session_manager = session_manager or SessionManager(wire_adapter=resolved_adapter)
         self._auth_manager = auth_manager
         self._quota_tracker = quota_tracker or QuotaTracker(
@@ -538,6 +539,10 @@ class AcpDispatcher:
             return True, ""
         if lower.startswith(("/compact ", "/compact\n", "/compact\t")):
             return True, candidate[len("/compact") :].strip()
+        if lower.endswith("/compact"):
+            prefix = candidate[: -len("/compact")]
+            if prefix and (prefix[-1].isspace() or prefix[-1] in {".", "?", "!", ":", ";"}):
+                return True, prefix.strip()
         return False, ""
 
     @classmethod
@@ -1457,6 +1462,81 @@ class AcpDispatcher:
             "result": desc,
         }
 
+    async def _handle_session_fork(
+        self,
+        message_id: Any,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Handle `session/fork`, copying session state and turns into a new session."""
+        source_session_id = _require_non_empty_str(params, "sessionId")
+        if source_session_id is None:
+            return _jsonrpc_error(message_id, -32602, "Invalid params: 'sessionId' is required")
+        raw_cwd = params.get("cwd")
+        cwd: str | None = None
+        if raw_cwd is not None:
+            if not isinstance(raw_cwd, str) or not raw_cwd.strip():
+                return _jsonrpc_error(message_id, -32602, "Invalid params: 'cwd' must be non-empty")
+            cwd = raw_cwd.strip()
+        raw_mcp = params.get("mcpServers")
+        if raw_mcp is not None and not isinstance(raw_mcp, list):
+            return _jsonrpc_error(message_id, -32602, "Invalid params: 'mcpServers' must be a list")
+        mcp_servers: list[dict[str, Any]] | None = (
+            [s for s in raw_mcp if isinstance(s, dict)] if isinstance(raw_mcp, list) else None
+        )
+        raw_meta = params.get("_meta")
+        if raw_meta is not None and not isinstance(raw_meta, dict):
+            return _jsonrpc_error(message_id, -32602, "Invalid params: '_meta' must be an object")
+        meta: dict[str, Any] | None = dict(raw_meta) if isinstance(raw_meta, dict) else None
+
+        raw_top_msg_id = params.get("messageId")
+        if raw_top_msg_id is not None and not isinstance(raw_top_msg_id, str):
+            return _jsonrpc_error(
+                message_id,
+                -32602,
+                "Invalid params: 'messageId' must be a string",
+            )
+        fork_msg_id: str | None = None
+        if isinstance(raw_meta, dict):
+            jb = raw_meta.get("jetbrains")
+            if isinstance(jb, dict):
+                air = jb.get("air")
+                if isinstance(air, dict):
+                    fork_obj = air.get("fork")
+                    if isinstance(fork_obj, dict) and isinstance(fork_obj.get("messageId"), str):
+                        fork_msg_id = fork_obj["messageId"].strip() or None
+            if fork_msg_id is None:
+                kiro_m = raw_meta.get("kiro")
+                if isinstance(kiro_m, dict):
+                    fork_obj = kiro_m.get("fork")
+                    if isinstance(fork_obj, dict) and isinstance(fork_obj.get("messageId"), str):
+                        fork_msg_id = fork_obj["messageId"].strip() or None
+        if fork_msg_id is None and isinstance(raw_top_msg_id, str):
+            fork_msg_id = raw_top_msg_id.strip() or None
+
+        try:
+            desc = await self._session_manager.fork_session(
+                source_session_id=source_session_id,
+                cwd=cwd,
+                mcp_servers=mcp_servers,
+                meta=meta,
+                message_id=fork_msg_id,
+            )
+        except KeyError as exc:
+            return _jsonrpc_error(message_id, -32002, str(exc))
+
+        sid = desc["sessionId"]
+        if self._wire_adapter.engine_id == "v2":
+            await self._emit_available_commands_update(sid)
+        await self._emit_or_queue_mcp_readiness(
+            sid,
+            post_response=(self._wire_adapter.engine_id == "v3"),
+        )
+        return {
+            "jsonrpc": "2.0",
+            "id": message_id,
+            "result": desc,
+        }
+
     async def _handle_session_set_mode(
         self,
         message_id: Any,
@@ -1866,6 +1946,150 @@ class AcpDispatcher:
             "result": {"queued": queued},
         }
 
+    async def _handle_session_steer_clear(
+        self,
+        message_id: Any,
+        params: dict[str, Any],
+        *,
+        is_request: bool = True,
+    ) -> dict[str, Any] | None:
+        """Handle `_session/steer/clear` to discard queued steers and emit notification."""
+        session_id = _require_non_empty_str(params, "sessionId")
+        if session_id is None:
+            return _jsonrpc_error(message_id, -32602, "Invalid params") if is_request else None
+        try:
+            self._session_manager.get_session(session_id)
+        except KeyError as exc:
+            return _jsonrpc_error(message_id, -32002, str(exc)) if is_request else None
+
+        dropped = self._session_manager.clear_session_steers(session_id)
+        await self._emit_notification(
+            self._wire_adapter.build_steering_notification(
+                session_id,
+                "discarded",
+                "\n".join(dropped),
+            )
+        )
+        if not is_request:
+            return None
+        return {
+            "jsonrpc": "2.0",
+            "id": message_id,
+            "result": {"cleared": True},
+        }
+
+    async def _handle_kas_session_context(
+        self,
+        message_id: Any,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Handle `_kiro/session/context` extension RPC."""
+        session_id = _require_non_empty_str(params, "sessionId")
+        subcommand = (
+            _require_non_empty_str(params, "subcommand")
+            or _require_non_empty_str(params, "action")
+            or _require_non_empty_str(params, "command")
+        )
+        if session_id is None or subcommand is None:
+            return _jsonrpc_error(message_id, -32602, "Invalid params")
+        raw_path = params.get("path")
+        if raw_path is not None and not isinstance(raw_path, str):
+            return _jsonrpc_error(message_id, -32602, "Invalid params")
+        raw_force = params.get("force", False)
+        if not isinstance(raw_force, bool):
+            return _jsonrpc_error(message_id, -32602, "Invalid params")
+        try:
+            res = self._session_manager.handle_session_context(
+                session_id,
+                subcommand=subcommand,
+                path=raw_path,
+                force=raw_force,
+            )
+        except KeyError as exc:
+            return _jsonrpc_error(message_id, -32002, str(exc))
+        return {
+            "jsonrpc": "2.0",
+            "id": message_id,
+            "result": res,
+        }
+
+    async def _handle_kas_knowledge(
+        self,
+        message_id: Any,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Handle `_kiro/knowledge` extension RPC."""
+        session_id = _require_non_empty_str(params, "sessionId")
+        if session_id is None:
+            return _jsonrpc_error(message_id, -32602, "Invalid params")
+        raw_sub = params.get("subcommand")
+        if raw_sub is not None and (not isinstance(raw_sub, str) or not raw_sub.strip()):
+            return _jsonrpc_error(message_id, -32602, "Invalid params")
+        try:
+            res = self._session_manager.handle_knowledge(session_id, params)
+        except KeyError as exc:
+            return _jsonrpc_error(message_id, -32002, str(exc))
+        return {
+            "jsonrpc": "2.0",
+            "id": message_id,
+            "result": res,
+        }
+
+    async def _handle_kas_code_intelligence(
+        self,
+        message_id: Any,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Handle `_kiro/codeIntelligence` extension RPC."""
+        session_id = _require_non_empty_str(params, "sessionId")
+        if session_id is None:
+            return _jsonrpc_error(message_id, -32602, "Invalid params")
+        raw_sub = (
+            params.get("subcommand")
+            if "subcommand" in params
+            else (params.get("action") if "action" in params else params.get("command"))
+        )
+        if raw_sub is not None and (not isinstance(raw_sub, str) or not raw_sub.strip()):
+            return _jsonrpc_error(message_id, -32602, "Invalid params")
+        subcommand = raw_sub.strip() if isinstance(raw_sub, str) else "status"
+        try:
+            res = self._session_manager.handle_code_intelligence(
+                session_id,
+                subcommand=subcommand,
+            )
+        except KeyError as exc:
+            return _jsonrpc_error(message_id, -32002, str(exc))
+        return {
+            "jsonrpc": "2.0",
+            "id": message_id,
+            "result": res,
+        }
+
+    async def _handle_kas_checkpoint_revert_multiple(
+        self,
+        message_id: Any,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Handle `_kiro/checkpoint/revertMultiple` extension RPC."""
+        session_id = _require_non_empty_str(params, "sessionId")
+        target_msg_id = _require_non_empty_str(params, "messageId")
+        if session_id is None or target_msg_id is None:
+            return _jsonrpc_error(message_id, -32602, "Invalid params")
+        try:
+            res = self._session_manager.revert_checkpoint_by_message_id(
+                session_id,
+                message_id=target_msg_id,
+            )
+        except KeyError as exc:
+            return _jsonrpc_error(message_id, -32002, str(exc))
+        except ValueError as exc:
+            return _jsonrpc_error(message_id, -32602, "Invalid params", data=str(exc))
+        return {
+            "jsonrpc": "2.0",
+            "id": message_id,
+            "result": res,
+        }
+
     async def _handle_session_set_config_option(
         self,
         message_id: Any,
@@ -2031,6 +2255,8 @@ class AcpDispatcher:
             return self._build_initialize_response(msg_id, params)
         if method == "session/new":
             return await self._handle_session_new(msg_id, params)
+        if method == "session/fork":
+            return await self._handle_session_fork(msg_id, params)
         if method in {"session/load", "session/resume"}:
             return await self._handle_session_load(
                 msg_id,
@@ -2067,6 +2293,14 @@ class AcpDispatcher:
             return await self._handle_session_set_config_option(msg_id, params)
         if method == "_kiro/session/compact":
             return await self._handle_kas_session_compact(msg_id, params)
+        if method == "_kiro/session/context":
+            return await self._handle_kas_session_context(msg_id, params)
+        if method == "_kiro/knowledge":
+            return await self._handle_kas_knowledge(msg_id, params)
+        if method == "_kiro/codeIntelligence":
+            return await self._handle_kas_code_intelligence(msg_id, params)
+        if method == "_kiro/checkpoint/revertMultiple":
+            return await self._handle_kas_checkpoint_revert_multiple(msg_id, params)
         if method == "_kiro/mcp/resetServer":
             return await self._handle_kas_mcp_reset_server(msg_id, params)
         if method == "_kiro.dev/commands/execute":
@@ -2084,6 +2318,12 @@ class AcpDispatcher:
                     return _jsonrpc_error(msg_id, -32002, str(exc))
             await self._session_manager.cancel(session_id=session_id)
             return {"jsonrpc": "2.0", "id": msg_id, "result": {}} if is_request else None
+        if method == "_session/steer/clear":
+            return await self._handle_session_steer_clear(
+                msg_id,
+                params,
+                is_request=is_request,
+            )
         if method in {"_session/steer", "_session/steering"}:
             return await self._handle_session_steer(
                 method,

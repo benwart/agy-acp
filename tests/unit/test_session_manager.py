@@ -940,3 +940,173 @@ async def test_compact_session_and_prompt_propagate_outcome_error(tmp_path: Path
     assert compact_res["status"] == "failed"
     assert compact_res["summary"] == "You have exhausted your capacity on this model."
     assert mgr.get_session(sid)["agyConversationId"] == "conv-keep-1"
+
+
+async def test_session_manager_fork_steer_clear_context_knowledge_code_intel_and_revert(
+    tmp_path: Path,
+) -> None:
+    """Verify 0.12.1 SessionManager fork, steer clear, context, knowledge, code intel, revert."""
+    from agy_acp.logic.wire import V3KasWireAdapter
+    from agy_acp.providers.agy_cli_provider import AgyCliProvider, PromptOutcome
+
+    seen_prompts: list[dict[str, Any]] = []
+
+    class _RecordCli(AgyCliProvider):
+        async def stream_prompt(self, **kwargs: Any) -> PromptOutcome:
+            seen_prompts.append(dict(kwargs))
+            return PromptOutcome(
+                conversation_id=f"conv-{len(seen_prompts)}",
+                stop_reason="end_turn",
+                response=f"Reply {len(seen_prompts)}",
+                usage={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            )
+
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'demo'\n", encoding="utf-8")
+    (tmp_path / "Cargo.toml").write_text("[package]\nname = 'demo'\n", encoding="utf-8")
+
+    cli = _RecordCli(save_dir=tmp_path / "state")
+    mgr = SessionManager(
+        save_dir=tmp_path / "state",
+        cli_provider=cli,
+        wire_adapter=V3KasWireAdapter(),
+    )
+    created = await mgr.create_session(
+        cwd=str(tmp_path),
+        meta={
+            "kiro": {
+                "customAgents": [
+                    {
+                        "id": "kirocrew",
+                        "name": "KiroCrew",
+                        "prompt": "Agent instructions",
+                        "tools": ["*"],
+                    }
+                ]
+            }
+        },
+    )
+    sid = created["sessionId"]
+    await mgr.set_mode(session_id=sid, mode_id="kirocrew")
+
+    # 1. Context paths add/remove/clear and injection in prompt()
+    ctx_add1 = mgr.handle_session_context(
+        sid,
+        subcommand="add",
+        path="src/main.py",
+    )
+    assert ctx_add1["success"] is True
+    ctx_add2 = mgr.handle_session_context(
+        sid,
+        subcommand="add",
+        path="README.md",
+    )
+    assert ctx_add2["success"] is True
+    ctx_rem = mgr.handle_session_context(
+        sid,
+        subcommand="remove",
+        path="src/main.py",
+    )
+    assert ctx_rem["success"] is True
+    assert mgr.get_session(sid)["contextPaths"] == ["README.md"]
+
+    await mgr.prompt(
+        session_id=sid,
+        prompt_blocks=[{"type": "text", "text": "Turn 1"}],
+    )
+    assert (
+        "<session_context_paths>\nREADME.md\n</session_context_paths>"
+        in seen_prompts[0]["prompt"]
+    )
+    mgr.state_store.append_session_turn(
+        session_id=sid,
+        user_message_id="msg-1",
+        prompt_blocks=[{"type": "text", "text": "Turn 1"}],
+        assistant_text="Reply 1",
+    )
+    mgr.state_store.append_session_turn(
+        session_id=sid,
+        user_message_id="msg-2",
+        prompt_blocks=[{"type": "text", "text": "Turn 2"}],
+        assistant_text="Reply 2",
+    )
+    mgr.state_store.append_session_turn(
+        session_id=sid,
+        user_message_id="msg-3",
+        prompt_blocks=[{"type": "text", "text": "Turn 3"}],
+        assistant_text="Reply 3",
+    )
+
+    # 2. Fork session bounded by message_id="msg-1" (copies turns up to msg-1 inclusive)
+    fork_desc = await mgr.fork_session(source_session_id=sid, message_id="msg-1")
+    fork_sid = fork_desc["sessionId"]
+    assert fork_sid != sid
+    fork_turns = mgr.state_store.get_session_turns(fork_sid)
+    assert len(fork_turns) == 1
+    assert fork_turns[0]["user_message_id"] == "msg-1"
+    fork_state = mgr.get_session(fork_sid)
+    assert fork_state["agyConversationId"] is None
+    assert fork_state["reinjectAgentPrompt"] is True
+    assert "Turn 1" in (fork_state["compactedSummary"] or "")
+    assert "Turn 2" not in (fork_state["compactedSummary"] or "")
+    assert fork_state["contextPaths"] == ["README.md"]
+
+    # Prompting the forked session consumes compactedSummary and reinjects agentPrompt
+    await mgr.prompt(
+        session_id=fork_sid,
+        prompt_blocks=[{"type": "text", "text": "Forked turn"}],
+    )
+    assert "[Compacted Session Summary]" in seen_prompts[-1]["prompt"]
+    assert "Agent instructions" in seen_prompts[-1]["prompt"]
+
+    # 3. Revert checkpoint by message_id on original session
+    rev_res = mgr.revert_checkpoint_by_message_id(sid, message_id="msg-2")
+    assert rev_res == {"success": True}
+    assert len(mgr.state_store.get_session_turns(sid)) == 1
+    rev_state = mgr.get_session(sid)
+    assert rev_state["agyConversationId"] is None
+    assert rev_state["reinjectAgentPrompt"] is True
+    assert "Turn 1" in (rev_state["compactedSummary"] or "")
+
+    # 4. Steer clear
+    cli._active_turns.add(sid)
+    await mgr.steer(session_id=sid, message="Pending steer 1")
+    assert mgr.clear_session_steers(sid) == ["Pending steer 1"]
+    cli._active_turns.discard(sid)
+
+    # 5. Knowledge CRUD
+    assert mgr.handle_knowledge(sid, subcommand="show") == {"success": True, "entries": []}
+    k_added = mgr.handle_knowledge(
+        sid,
+        subcommand="add",
+        name="Spec",
+        path="/docs/spec.md",
+        item_count=3,
+    )
+    assert k_added["success"] is True
+    k_show = mgr.handle_knowledge(sid, subcommand="show")
+    assert k_show["entries"] == [{"name": "Spec", "path": "/docs/spec.md", "item_count": 3}]
+    k_upd = mgr.handle_knowledge(
+        sid,
+        subcommand="update",
+        name="Spec",
+        path="/docs/spec-v2.md",
+        item_count=4,
+    )
+    assert k_upd["success"] is True
+    assert mgr.handle_knowledge(sid, subcommand="show")["entries"][0]["path"] == "/docs/spec-v2.md"
+    k_rem = mgr.handle_knowledge(sid, subcommand="remove", name="Spec")
+    assert k_rem["success"] is True
+    assert mgr.handle_knowledge(sid, subcommand="show") == {"success": True, "entries": []}
+    mgr.handle_knowledge(sid, subcommand="add", name="Tmp", path="/tmp/a.md")
+    assert mgr.handle_knowledge(sid, subcommand="clear")["success"] is True
+    assert mgr.handle_knowledge(sid, subcommand="cancel")["success"] is True
+
+    # 6. Code intelligence
+    ci_init = mgr.handle_code_intelligence(sid, subcommand="init")
+    assert ci_init["success"] is True
+    ci_status = mgr.handle_code_intelligence(sid, subcommand="status")
+    assert ci_status["success"] is True
+    assert ci_status["status"]["initialized"] is True
+    assert "python" in ci_status["status"]["languages"]
+    assert "rust" in ci_status["status"]["languages"]
+
