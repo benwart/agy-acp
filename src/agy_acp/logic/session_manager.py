@@ -15,19 +15,22 @@ from typing import Any
 
 import anyio
 
-from agy_acp.logic.custom_agents import CustomAgentRegistry, CustomAgentSpec
+from agy_acp.logic.custom_agents import (
+    CustomAgentRegistry,
+    CustomAgentSpec,
+    load_kiro_agent_spec,
+)
 from agy_acp.logic.mcp_catalog_prober import McpCatalogProber
-from agy_acp.logic.wire import EngineWireAdapter, McpServerStatus, V2KiroWireAdapter
-from agy_acp.providers.agy_cli_provider import (
+from agy_acp.logic.tool_classifier import (
     FALLBACK_MODELS,
     PER_SESSION_MCP_ENV_KEYS,
-    AgyCliProvider,
     ToolCallEvent,
     _dedupe_mcp_servers,
-    load_kiro_agent_spec,
     resolve_model_for_effort,
     translate_mcp_server,
 )
+from agy_acp.logic.wire import EngineWireAdapter, McpServerStatus, V2KiroWireAdapter
+from agy_acp.providers.agy_cli_provider import AgyCliProvider
 from agy_acp.providers.state_store import SqliteStateStoreProvider
 
 DEFAULT_MODEL_ID = "gemini-3.7-pro"
@@ -1148,9 +1151,7 @@ class SessionManager:
             copied.append(turn)
 
         compacted_summary = (
-            _format_remaining_turns_summary(copied)
-            if copied
-            else source.get("compactedSummary")
+            _format_remaining_turns_summary(copied) if copied else source.get("compactedSummary")
         )
         reinject_agent_prompt = True if copied else bool(source.get("reinjectAgentPrompt", False))
 
@@ -1748,9 +1749,11 @@ class SessionManager:
             **(dict(params) if isinstance(params, Mapping) else {}),
             **kwargs,
         }
-        sub = str(
-            merged.get("subcommand") or merged.get("action") or merged.get("command") or "show"
-        ).strip().lower()
+        sub = (
+            str(merged.get("subcommand") or merged.get("action") or merged.get("command") or "show")
+            .strip()
+            .lower()
+        )
         entries: list[dict[str, Any]] = [
             dict(e) for e in (state.get("knowledgeEntries") or []) if isinstance(e, dict)
         ]
@@ -1802,17 +1805,13 @@ class SessionManager:
             return {"success": True, "message": f"Added knowledge entry '{name_str}'."}
 
         if sub == "remove":
-            target = str(
-                merged.get("name") or merged.get("path") or merged.get("id") or ""
-            ).strip()
+            target = str(merged.get("name") or merged.get("path") or merged.get("id") or "").strip()
             if not target:
                 return {
                     "success": False,
                     "message": "Name or path is required to remove knowledge entry.",
                 }
-            remaining = [
-                e for e in entries if e.get("name") != target and e.get("path") != target
-            ]
+            remaining = [e for e in entries if e.get("name") != target and e.get("path") != target]
             if len(remaining) == len(entries):
                 return {"success": False, "message": f"Knowledge entry not found: {target}"}
             state["knowledgeEntries"] = remaining
@@ -1820,9 +1819,7 @@ class SessionManager:
             return {"success": True, "message": f"Removed knowledge entry '{target}'."}
 
         if sub == "update":
-            target = str(
-                merged.get("name") or merged.get("path") or merged.get("id") or ""
-            ).strip()
+            target = str(merged.get("name") or merged.get("path") or merged.get("id") or "").strip()
             if not target:
                 if entries:
                     return {"success": True, "message": "Updated knowledge entries."}

@@ -26,6 +26,7 @@ from agy_acp.logic.custom_agents import (
 )
 from agy_acp.logic.quota_tracker import QuotaTracker, TurnTelemetry
 from agy_acp.logic.session_manager import DEFAULT_MODEL_ID, SessionManager
+from agy_acp.logic.tool_classifier import ToolCallEvent
 from agy_acp.logic.wire import (
     EngineWireAdapter,
     McpServerStatus,
@@ -35,7 +36,6 @@ from agy_acp.logic.wire import (
     WireTurnTelemetry,
 )
 from agy_acp.providers.acp_logger import log_acp_event
-from agy_acp.providers.agy_cli_provider import ToolCallEvent
 
 MAX_FRAME_SIZE_BYTES = 16 * 1024 * 1024
 SLASH_QUOTA_COMMANDS = frozenset({"/quota", "/usage", "/credits"})

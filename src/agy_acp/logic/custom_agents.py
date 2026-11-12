@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
@@ -1034,3 +1035,163 @@ def evaluate_tool_call_permission(
         capability=capability,
         resource=resource,
     )
+
+
+_READ_ONLY_KIRO_TOOLS: frozenset[str] = frozenset(
+    {
+        "fs_read",
+        "grep",
+        "glob",
+        "code",
+        "web_search",
+        "web_fetch",
+        "tool_search",
+        "todo_list",
+    }
+)
+
+
+def load_kiro_agent_spec(
+    agent_name: str | None = None,
+    *,
+    cwd: str | None = None,
+    include_home: bool = True,
+    user_agents_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Load sanitized project agent fields and trusted user-scope `mcpServers`."""
+    candidates: list[str] = []
+    if agent_name and agent_name not in {"auto", "approve", "read-only"}:
+        candidates.append(agent_name)
+    if "kirocrew" not in candidates:
+        candidates.append("kirocrew")
+
+    # Each entry is (agents_dir, is_project_scope, containment_root)
+    search_dirs: list[tuple[Path, bool, Path]] = []
+    if cwd:
+        with contextlib.suppress(OSError, RuntimeError):
+            cwd_path = Path(cwd)
+            resolved_cwd = cwd_path.resolve()
+            kiro_dir = cwd_path / ".kiro"
+            proj_agents_dir = kiro_dir / "agents"
+            if (
+                not kiro_dir.is_symlink()
+                and not proj_agents_dir.is_symlink()
+                and proj_agents_dir.is_dir()
+                and proj_agents_dir.resolve().is_relative_to(resolved_cwd)
+            ):
+                search_dirs.append((proj_agents_dir, True, resolved_cwd))
+
+    trusted_user_dir: Path | None = None
+    if user_agents_dir is not None:
+        trusted_user_dir = Path(user_agents_dir)
+    elif include_home:
+        with contextlib.suppress(RuntimeError, OSError):
+            trusted_user_dir = Path.home() / ".kiro" / "agents"
+
+    if trusted_user_dir is not None:
+        with contextlib.suppress(OSError, RuntimeError):
+            if not trusted_user_dir.is_symlink() and trusted_user_dir.is_dir():
+                search_dirs.append((trusted_user_dir, False, trusted_user_dir.resolve()))
+
+    pinned_model: str | None = None
+    agent_prompt: str | None = None
+    agent_tools: list[str] | None = None
+    servers_by_name: dict[str, dict[str, Any]] = {}
+    disabled_names: list[str] = []
+
+    for cand in candidates:
+        found_candidate = False
+        for agents_dir, is_project_scope, containment_root in search_dirs:
+            spec_path = agents_dir / f"{cand}.json"
+            if spec_path.is_symlink() or not spec_path.is_file():
+                continue
+            with contextlib.suppress(
+                OSError,
+                json.JSONDecodeError,
+                CustomAgentSecurityError,
+                ValueError,
+            ):
+                resolved_spec = spec_path.resolve(strict=True)
+                if not resolved_spec.is_relative_to(containment_root):
+                    continue
+                loaded_spec = json.loads(resolved_spec.read_text(encoding="utf-8"))
+                if not isinstance(loaded_spec, dict):
+                    continue
+                if is_project_scope:
+                    raw_spec = sanitize_project_agent_spec(loaded_spec, agents_dir=agents_dir)
+                else:
+                    raw_spec = dict(loaded_spec)
+                    prompt_ref = raw_spec.get("prompt")
+                    if isinstance(prompt_ref, str) and prompt_ref.startswith("file://"):
+                        raw_spec["prompt"] = resolve_contained_prompt_file(
+                            prompt_ref,
+                            base_dir=agents_dir,
+                        )
+                found_candidate = True
+                raw_model = raw_spec.get("model")
+                if (
+                    pinned_model is None
+                    and isinstance(raw_model, str)
+                    and raw_model.strip()
+                    and raw_model.strip().lower() != "auto"
+                ):
+                    pinned_model = raw_model.strip()
+                raw_prompt = raw_spec.get("prompt")
+                if agent_prompt is None and isinstance(raw_prompt, str) and raw_prompt.strip():
+                    agent_prompt = raw_prompt.strip()
+                raw_tools = raw_spec.get("tools")
+                if agent_tools is None and isinstance(raw_tools, list):
+                    agent_tools = [str(t).strip() for t in raw_tools if str(t).strip()]
+                if not is_project_scope:
+                    raw_mcp = raw_spec.get("mcpServers")
+                    if isinstance(raw_mcp, dict):
+                        for srv_name, srv_cfg in raw_mcp.items():
+                            if not isinstance(srv_name, str) or not srv_name:
+                                continue
+                            if not isinstance(srv_cfg, dict):
+                                continue
+                            if srv_cfg.get("disabled"):
+                                if srv_name not in disabled_names:
+                                    disabled_names.append(srv_name)
+                            elif srv_name not in servers_by_name and srv_name not in disabled_names:
+                                servers_by_name[srv_name] = {"name": srv_name, **srv_cfg}
+                    elif isinstance(raw_mcp, list):
+                        for item in raw_mcp:
+                            if isinstance(item, dict) and item.get("name"):
+                                sname = str(item["name"])
+                                if item.get("disabled"):
+                                    if sname not in disabled_names:
+                                        disabled_names.append(sname)
+                                elif sname not in servers_by_name and sname not in disabled_names:
+                                    servers_by_name[sname] = dict(item)
+        if found_candidate:
+            break
+
+    is_read_only = agent_tools is not None and all(
+        tool in _READ_ONLY_KIRO_TOOLS for tool in agent_tools
+    )
+    return {
+        "model": pinned_model,
+        "prompt": agent_prompt,
+        "tools": agent_tools,
+        "read_only": is_read_only,
+        "mcp_servers": list(servers_by_name.values()),
+        "disabled_mcp_servers": disabled_names,
+    }
+
+
+def load_kiro_agent_mcp_servers(
+    agent_name: str | None = None,
+    *,
+    cwd: str | None = None,
+    include_home: bool = True,
+    user_agents_dir: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Load `mcpServers` definitions strictly from trusted user-scope `.kiro/agents`."""
+    spec = load_kiro_agent_spec(
+        agent_name,
+        cwd=cwd,
+        include_home=include_home,
+        user_agents_dir=user_agents_dir,
+    )
+    return list(spec["mcp_servers"])

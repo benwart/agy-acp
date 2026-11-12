@@ -309,4 +309,3 @@ def test_sqlite_context_paths_knowledge_entries_and_revert_turns_from_message_id
     remaining = store.get_session_turns("sess-0121")
     assert len(remaining) == 1
     assert remaining[0]["user_message_id"] == "m-0"
-

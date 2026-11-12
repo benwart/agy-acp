@@ -601,3 +601,71 @@ async def test_symlink_escape_nan_json_and_semantic_agent_validate(tmp_path: Pat
         encoding="utf-8",
     )
     assert await agent_validate.default(path=valid_with_perms_and_file) == 0
+
+
+def test_legacy_load_kiro_agent_spec_and_mcp_servers_in_custom_agents(tmp_path: Path) -> None:
+    """Verify `load_kiro_agent_spec`, `load_kiro_agent_mcp_servers`, and `_READ_ONLY_KIRO_TOOLS`."""
+    import agy_acp.logic.custom_agents as ca_mod
+    import agy_acp.providers.agy_cli_provider as cli_mod
+    from agy_acp.logic.custom_agents import (
+        _READ_ONLY_KIRO_TOOLS,
+        load_kiro_agent_mcp_servers,
+        load_kiro_agent_spec,
+    )
+
+    assert "fs_read" in _READ_ONLY_KIRO_TOOLS
+    assert cli_mod.load_kiro_agent_spec is ca_mod.load_kiro_agent_spec
+    assert cli_mod.load_kiro_agent_mcp_servers is ca_mod.load_kiro_agent_mcp_servers
+    assert cli_mod._READ_ONLY_KIRO_TOOLS is ca_mod._READ_ONLY_KIRO_TOOLS
+
+    repo = tmp_path / "repo"
+    proj_agents = repo / ".kiro" / "agents"
+    proj_agents.mkdir(parents=True)
+    (proj_agents / "reader.json").write_text(
+        json.dumps(
+            {
+                "name": "reader",
+                "model": "gemini-3.8-flash",
+                "prompt": "Read-only auditor",
+                "tools": ["fs_read", "grep"],
+                "mcpServers": {"untrusted-srv": {"command": "evil"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    user_agents = tmp_path / "user_agents"
+    user_agents.mkdir()
+    (user_agents / "reader.json").write_text(
+        json.dumps(
+            {
+                "name": "reader",
+                "mcpServers": {
+                    "trusted-srv": {"command": "node", "args": ["mcp.js"]},
+                    "off-srv": {"command": "node", "disabled": True},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    spec = load_kiro_agent_spec(
+        "reader",
+        cwd=str(repo),
+        include_home=False,
+        user_agents_dir=user_agents,
+    )
+    assert spec["model"] == "gemini-3.8-flash"
+    assert spec["prompt"] == "Read-only auditor"
+    assert spec["tools"] == ["fs_read", "grep"]
+    assert spec["read_only"] is True
+    assert [s["name"] for s in spec["mcp_servers"]] == ["trusted-srv"]
+    assert spec["disabled_mcp_servers"] == ["off-srv"]
+
+    servers = load_kiro_agent_mcp_servers(
+        "reader",
+        cwd=str(repo),
+        include_home=False,
+        user_agents_dir=user_agents,
+    )
+    assert [s["name"] for s in servers] == ["trusted-srv"]

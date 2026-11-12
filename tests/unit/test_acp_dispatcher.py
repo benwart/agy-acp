@@ -3456,4 +3456,3 @@ async def test_acp_dispatcher_0121_fork_steer_clear_kas_rpcs_and_trailing_compac
     assert rev_resp is not None
     assert rev_resp["result"] == {"success": True}
     assert len(mgr.state_store.get_session_turns(sid)) == 1
-

@@ -2199,4 +2199,3 @@ async def test_clear_steers_pops_queued_steers_and_unlinks_temp_files(tmp_path: 
     assert dropped == ["First raw", "Second raw"]
     assert not tf.exists()
     assert provider.clear_steers("sess-steer-clear") == []
-

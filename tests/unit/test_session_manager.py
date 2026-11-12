@@ -1014,8 +1014,7 @@ async def test_session_manager_fork_steer_clear_context_knowledge_code_intel_and
         prompt_blocks=[{"type": "text", "text": "Turn 1"}],
     )
     assert (
-        "<session_context_paths>\nREADME.md\n</session_context_paths>"
-        in seen_prompts[0]["prompt"]
+        "<session_context_paths>\nREADME.md\n</session_context_paths>" in seen_prompts[0]["prompt"]
     )
     mgr.state_store.append_session_turn(
         session_id=sid,
@@ -1109,4 +1108,3 @@ async def test_session_manager_fork_steer_clear_context_knowledge_code_intel_and
     assert ci_status["status"]["initialized"] is True
     assert "python" in ci_status["status"]["languages"]
     assert "rust" in ci_status["status"]["languages"]
-
