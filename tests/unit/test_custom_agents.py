@@ -605,8 +605,6 @@ async def test_symlink_escape_nan_json_and_semantic_agent_validate(tmp_path: Pat
 
 def test_legacy_load_kiro_agent_spec_and_mcp_servers_in_custom_agents(tmp_path: Path) -> None:
     """Verify `load_kiro_agent_spec`, `load_kiro_agent_mcp_servers`, and `_READ_ONLY_KIRO_TOOLS`."""
-    import agy_acp.logic.custom_agents as ca_mod
-    import agy_acp.providers.agy_cli_provider as cli_mod
     from agy_acp.logic.custom_agents import (
         _READ_ONLY_KIRO_TOOLS,
         load_kiro_agent_mcp_servers,
@@ -614,9 +612,6 @@ def test_legacy_load_kiro_agent_spec_and_mcp_servers_in_custom_agents(tmp_path: 
     )
 
     assert "fs_read" in _READ_ONLY_KIRO_TOOLS
-    assert cli_mod.load_kiro_agent_spec is ca_mod.load_kiro_agent_spec
-    assert cli_mod.load_kiro_agent_mcp_servers is ca_mod.load_kiro_agent_mcp_servers
-    assert cli_mod._READ_ONLY_KIRO_TOOLS is ca_mod._READ_ONLY_KIRO_TOOLS
 
     repo = tmp_path / "repo"
     proj_agents = repo / ".kiro" / "agents"
@@ -669,3 +664,28 @@ def test_legacy_load_kiro_agent_spec_and_mcp_servers_in_custom_agents(tmp_path: 
         user_agents_dir=user_agents,
     )
     assert [s["name"] for s in servers] == ["trusted-srv"]
+
+    (proj_agents / "egm--zoom-out.json").write_text(
+        json.dumps(
+            {
+                "name": "zoom-out",
+                "model": "auto",
+                "prompt": "Follow zoom_out.md strictly.",
+                "tools": ["fs_read", "grep", "glob", "code"],
+                "mcpServers": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    zoom_spec = load_kiro_agent_spec("egm--zoom-out", cwd=str(repo), include_home=False)
+    assert zoom_spec["model"] is None
+    assert zoom_spec["prompt"] == "Follow zoom_out.md strictly."
+    assert zoom_spec["read_only"] is True
+
+    (proj_agents / "empty-tools.json").write_text(
+        json.dumps({"name": "empty-tools", "prompt": "Safe prompt", "tools": []}),
+        encoding="utf-8",
+    )
+    empty_spec = load_kiro_agent_spec("empty-tools", cwd=str(repo), include_home=False)
+    assert empty_spec["tools"] == []
+    assert empty_spec["read_only"] is True

@@ -1256,3 +1256,38 @@ async def test_should_emit_raw_carousel_deltas_sync_loaded_prefs_and_drop_legacy
         if r["type"] == "recv" and r["msg"].get("method") == "session/set_model"
     ]
     assert "gemini-3.8-flash" in set_models
+
+
+def test_normalize_tool_arguments_populates_tool_use_purpose_and_task_commands() -> None:
+    """Verify `_normalize_tool_arguments` maps summary/role, path aliases, and task commands."""
+    from agy_acp.providers.agy_acp_client import _normalize_tool_arguments
+
+    norm_cmd = _normalize_tool_arguments(
+        {"CommandLine": "pytest -q", "toolSummary": "Run unit tests"},
+        tool_name="run_command",
+    )
+    assert norm_cmd["command"] == "pytest -q"
+    assert norm_cmd["description"] == "Run unit tests"
+    assert norm_cmd["__toolUsePurpose"] == "Run unit tests"
+
+    norm_find = _normalize_tool_arguments(
+        {"TargetDirectory": "/repo/target"},
+        tool_name="find_by_name",
+    )
+    assert norm_find["path"] == "/repo/target"
+
+    norm_sub = _normalize_tool_arguments(
+        {"TypeName": "research", "Role": "Codebase Auditor"},
+        tool_name="invoke_subagent",
+    )
+    assert norm_sub["description"] == "Codebase Auditor"
+    assert norm_sub["__toolUsePurpose"] == "Codebase Auditor"
+
+    norm_list = _normalize_tool_arguments({"Action": "list"}, tool_name="manage_task")
+    assert norm_list["command"] == "manage_task list"
+
+    norm_input = _normalize_tool_arguments(
+        {"CommandId": "cmd-9", "Input": "yes\n"},
+        tool_name="send_command_input",
+    )
+    assert norm_input["command"] == "send_command_input cmd-9"

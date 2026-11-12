@@ -5,12 +5,11 @@ from __future__ import annotations
 from typing import Any
 
 from agy_acp.logic.quota_tracker import QuotaTracker
-from agy_acp.providers.agy_cli_provider import AgyCliProvider
 from agy_acp.providers.quota_provider import QuotaProvider
 
 
-class _StubAgyCliProvider(AgyCliProvider):
-    """Test double for AgyCliProvider returning `/usage` and `/credits` JSON payloads."""
+class _StubSlashRunner:
+    """Test double returning `/usage` and `/credits` JSON payloads via `run_slash_command`."""
 
     async def run_slash_command(
         self,
@@ -87,7 +86,7 @@ class _StubAgyCliProvider(AgyCliProvider):
 
 
 def _make_tracker() -> QuotaTracker:
-    return QuotaTracker(provider=QuotaProvider(cli_provider=_StubAgyCliProvider()))
+    return QuotaTracker(provider=QuotaProvider(cli_provider=_StubSlashRunner()))
 
 
 async def test_five_hour_bucket_calculation() -> None:
@@ -434,7 +433,7 @@ async def test_kiro_credit_conversion_picks_min_of_7d_and_5h_with_matching_reset
     """Verify Option 1 credit conversion (7d=1000, 5h=200) picks min credits and its reset_time."""
     tracker = _make_tracker()
 
-    # In _StubAgyCliProvider for Gemini:
+    # In _StubSlashRunner for Gemini:
     # 5h: 0.95 * 200 = 190.0 credits (resets 2026-10-24T07:52:04Z)
     # 7d: 0.39 * 1000 = 390.0 credits (resets 2026-10-24T12:34:28Z)
     # G1 overage: 1000 credits
@@ -519,7 +518,7 @@ async def test_context_usage_reflects_active_session_context_not_global_ledger_a
         thinking_tokens=15_532,
     )
     tracker = QuotaTracker(
-        provider=QuotaProvider(cli_provider=_StubAgyCliProvider(save_dir=tmp_path)),
+        provider=QuotaProvider(cli_provider=_StubSlashRunner()),
         state_store=store,
     )
 
@@ -599,7 +598,7 @@ async def test_turn_telemetry_dataclass_delta_credits_and_rate_limit() -> None:
 
     class _DynamicQuotaProvider(QuotaProvider):
         def __init__(self) -> None:
-            super().__init__(cli_provider=_StubAgyCliProvider())
+            super().__init__(cli_provider=_StubSlashRunner())
             self._idx = 0
 
         async def fetch_quota_groups(self) -> list[dict[str, Any]]:
@@ -777,11 +776,11 @@ async def test_seed_session_baseline_single_usage_fetch_and_evict_session(tmp_pa
     assert "sess-turn1" not in tracker._last_session_effective_credits
 
 
-async def test_run_agy_slash_json_and_quota_provider_decoupled_from_agy_cli_provider(
+async def test_run_agy_slash_json_and_quota_provider_decoupled_from_acp_client(
     tmp_path: Any,
     monkeypatch: Any,
 ) -> None:
-    """Verify `run_agy_slash_json` and `QuotaProvider()` work without importing `AgyCliProvider`."""
+    """Verify `run_agy_slash_json` and `QuotaProvider()` work without importing `agy_acp_client`."""
     import ast
     import json
     from pathlib import Path
@@ -792,7 +791,7 @@ async def test_run_agy_slash_json_and_quota_provider_decoupled_from_agy_cli_prov
     import agy_acp.providers.quota_provider as qp_mod
     from agy_acp.providers.quota_provider import QuotaProvider, run_agy_slash_json
 
-    # 1. Static check: quota_provider.py must NOT import AgyCliProvider or agy_cli_provider
+    # 1. Static check: quota_provider.py must NOT import AgyAcpClientProvider or agy_acp_client
     source = Path(qp_mod.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
     imported_modules = [
@@ -803,7 +802,7 @@ async def test_run_agy_slash_json_and_quota_provider_decoupled_from_agy_cli_prov
         if isinstance(node, ast.Import)
         for alias in node.names
     ]
-    assert not any("agy_cli_provider" in mod for mod in imported_modules)
+    assert not any("agy_acp_client" in mod for mod in imported_modules)
 
     # 2. Verify run_agy_slash_json builds flags, parses JSON / NDJSON, and raises on error
     fake_bin = tmp_path / "fake-agy"
@@ -889,7 +888,7 @@ async def test_run_agy_slash_json_and_quota_provider_decoupled_from_agy_cli_prov
         "upgrade_uri": "https://one.google.com/ai",
     }
 
-    # 4. Duck-typed cli_provider (not inheriting AgyCliProvider) still works
+    # 4. Duck-typed cli_provider (not inheriting AgyAcpClientProvider) still works
     class _DuckCli:
         async def run_slash_command(self, command: str) -> dict[str, Any]:
             return {

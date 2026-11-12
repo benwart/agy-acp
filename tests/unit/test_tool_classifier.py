@@ -291,30 +291,106 @@ def test_resolve_agy_binary_and_resolve_model_for_effort(
     assert len(FALLBACK_MODELS) >= 1
 
 
-def test_agy_cli_provider_reexports_all_moved_classifier_symbols() -> None:
-    """Verify `agy_cli_provider` re-exports moved symbols identically for backward compatibility."""
-    import agy_acp.logic.tool_classifier as tc
-    import agy_acp.providers.agy_cli_provider as cli_mod
+def test_kas_tool_classification_table_and_task_commands() -> None:
+    """Verify full KAS built-in ID table, subagent targets, MCP prefix matching, and task tools."""
+    cases: list[tuple[str, dict[str, Any], str, str, str]] = [
+        ("run_command", {"CommandLine": "pytest -q"}, "run_command", "execute_bash", "execute"),
+        ("execute_command", {"command": "echo ok"}, "run_command", "execute_bash", "execute"),
+        ("read_file", {"Path": "/a.py"}, "read_file", "fs_read", "read"),
+        ("view_file", {"AbsolutePath": "/b.py"}, "read_file", "fs_read", "read"),
+        ("view_file_outline", {"AbsolutePath": "/c.py"}, "read_file", "fs_read", "read"),
+        ("view_code_item", {"File": "/d.py"}, "read_file", "fs_read", "read"),
+        ("list_dir", {"DirectoryPath": "/src"}, "list_directory", "fs_read", "read"),
+        ("list_directory", {"path": "/src"}, "list_directory", "fs_read", "read"),
+        ("write_file", {"Path": "/w.py", "Content": "x = 1\n"}, "fs_write", "fs_write", "edit"),
+        ("write_to_file", {"TargetFile": "/w2.py"}, "fs_write", "fs_write", "edit"),
+        ("create_file", {"path": "/w3.py"}, "fs_write", "fs_write", "edit"),
+        (
+            "edit_file",
+            {"Path": "/e.py", "Target": "a = 1", "Replacement": "a = 2"},
+            "str_replace",
+            "fs_write",
+            "edit",
+        ),
+        ("replace_file_content", {"TargetFile": "/e2.py"}, "str_replace", "fs_write", "edit"),
+        ("multi_replace_file_content", {"TargetFile": "/e3.py"}, "str_replace", "fs_write", "edit"),
+        ("delete_file", {"Path": "/gone.py"}, "delete_file", "fs_write", "delete"),
+        ("remove_file", {"path": "/gone2.py"}, "delete_file", "fs_write", "delete"),
+        ("grep_search", {"Query": "TODO"}, "grep_search", "grep", "search"),
+        ("grep", {"Pattern": "FIXME"}, "grep_search", "grep", "search"),
+        ("find_by_name", {"Pattern": "*.py"}, "file_search", "glob", "search"),
+        ("glob", {"pattern": "**/*.ts"}, "file_search", "glob", "search"),
+        ("file_search", {"query": "main"}, "file_search", "glob", "search"),
+        ("search_web", {"query": "acp spec"}, "remote_web_search", "web_search", "fetch"),
+        ("read_url_content", {"Url": "https://example.com"}, "web_fetch", "web_fetch", "fetch"),
+        ("web_fetch", {"url": "https://example.com"}, "web_fetch", "web_fetch", "fetch"),
+        (
+            "invoke_subagent",
+            {"TypeName": "research", "Role": "Auditor"},
+            "invoke_sub_agent",
+            "use_subagent",
+            "other",
+        ),
+        ("todo_list", {"todos": []}, "todo_list", "todo_list", "other"),
+        ("task_boundary", {"TaskName": "Build"}, "todo_list", "todo_list", "other"),
+    ]
+    for tool_name, raw_args, expected_kas, expected_v2, expected_kind in cases:
+        cls = classify_tool_call_step("tool", tool_name, raw_args)
+        assert cls.kas_builtin_id == expected_kas, f"{tool_name} kas_builtin_id"
+        assert cls.v2_tool_name == expected_v2, f"{tool_name} v2_tool_name"
+        assert cls.acp_kind == expected_kind, f"{tool_name} acp_kind"
+        assert cls.mcp_server == ""
+        assert cls.mcp_tool == ""
 
-    expected_symbols = (
-        "ToolCallClassification",
-        "ToolCallEvent",
-        "PromptOutcome",
-        "QueuedSteer",
-        "classify_tool_call_step",
-        "_resolve_kiro_tool_identity",
-        "_extract_mcp_identity",
-        "_extract_diff_content",
-        "_resolve_builtin_triple",
-        "_build_builtin_title",
-        "translate_mcp_server",
-        "_dedupe_mcp_servers",
-        "_pairs_to_dict",
-        "resolve_agy_binary",
-        "resolve_model_for_effort",
-        "VALID_EFFORTS",
-        "PER_SESSION_MCP_ENV_KEYS",
-        "FALLBACK_MODELS",
+    sub_by_type = classify_tool_call_step(
+        "tool", "invoke_subagent", {"TypeName": "research", "Role": "Codebase Researcher"}
     )
-    for sym in expected_symbols:
-        assert getattr(cli_mod, sym) is getattr(tc, sym), f"{sym} not re-exported identically"
+    assert sub_by_type.subagent_target == "research"
+    sub_by_agent = classify_tool_call_step(
+        "tool", "invoke_subagent", {"AgentName": "reviewer", "Role": "Reviewer"}
+    )
+    assert sub_by_agent.subagent_target == "reviewer"
+    sub_by_role = classify_tool_call_step("tool", "invoke_subagent", {"Role": "Debugger"})
+    assert sub_by_role.subagent_target == "Debugger"
+
+    grep_cls = classify_tool_call_step(
+        "tool",
+        "grep_search",
+        {"Query": "secret", "SearchDirectory": "/repo/sub"},
+    )
+    assert grep_cls.locations == [{"path": "/repo/sub"}]
+
+    underscored = classify_tool_call_step(
+        "tool",
+        "mcp_my_org_db_run_query",
+        {"sql": "SELECT 1"},
+        known_mcp_servers=["my", "my_org_db"],
+    )
+    assert underscored.mcp_server == "my_org_db"
+    assert underscored.mcp_tool == "run_query"
+    assert underscored.kiro_tool_id == "@my_org_db/run_query"
+
+    cls_list = classify_tool_call_step("tool", "manage_task", {"Action": "list"})
+    assert cls_list.kas_builtin_id == "run_command"
+    assert cls_list.v2_tool_name == "execute_bash"
+    assert cls_list.acp_kind == "execute"
+    assert cls_list.command == "manage_task list"
+    assert cls_list.title == "Running `manage_task list`"
+
+    cls_status = classify_tool_call_step(
+        "tool",
+        "manage_task",
+        {"Action": "status", "TaskId": "task-42"},
+    )
+    assert cls_status.command == "manage_task status task-42"
+    assert cls_status.title == "Running `manage_task status task-42`"
+
+    cls_input = classify_tool_call_step(
+        "tool",
+        "send_command_input",
+        {"CommandId": "cmd-9", "Input": "yes\n"},
+    )
+    assert cls_input.kas_builtin_id == "run_command"
+    assert cls_input.v2_tool_name == "execute_bash"
+    assert cls_input.acp_kind == "execute"
+    assert cls_input.command == "send_command_input cmd-9"
