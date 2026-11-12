@@ -775,3 +775,132 @@ async def test_seed_session_baseline_single_usage_fetch_and_evict_session(tmp_pa
     tracker.evict_session("sess-turn1")
     assert "sess-turn1" not in tracker._session_context_tokens
     assert "sess-turn1" not in tracker._last_session_effective_credits
+
+
+async def test_run_agy_slash_json_and_quota_provider_decoupled_from_agy_cli_provider(
+    tmp_path: Any,
+    monkeypatch: Any,
+) -> None:
+    """Verify `run_agy_slash_json` and `QuotaProvider()` work without importing `AgyCliProvider`."""
+    import ast
+    import json
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    import pytest
+
+    import agy_acp.providers.quota_provider as qp_mod
+    from agy_acp.providers.quota_provider import QuotaProvider, run_agy_slash_json
+
+    # 1. Static check: quota_provider.py must NOT import AgyCliProvider or agy_cli_provider
+    source = Path(qp_mod.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    imported_modules = [
+        node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+    ] + [
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    ]
+    assert not any("agy_cli_provider" in mod for mod in imported_modules)
+
+    # 2. Verify run_agy_slash_json builds flags, parses JSON / NDJSON, and raises on error
+    fake_bin = tmp_path / "fake-agy"
+    fake_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+    captured_calls: list[list[str]] = []
+
+    async def _fake_run_process(args: list[str], **kwargs: Any) -> Any:
+        _ = kwargs
+        captured_calls.append(list(args))
+        cmd_arg = args[-1]
+        if cmd_arg == "/usage":
+            payload = {
+                "status": "SUCCESS",
+                "command": {
+                    "name": "usage",
+                    "data": {
+                        "groups": [
+                            {
+                                "name": "Gemini Models",
+                                "buckets": [
+                                    {
+                                        "id": "gemini-5h",
+                                        "name": "Five Hour Limit Remaining",
+                                        "window": "5h",
+                                        "remaining_fraction": 0.75,
+                                        "reset_time": "2026-11-12T00:00:00Z",
+                                    }
+                                ],
+                            }
+                        ]
+                    },
+                },
+            }
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(payload).encode("utf-8"),
+                stderr=b"",
+            )
+        if cmd_arg == "/credits":
+            ndjson = "banner line\n" + json.dumps(
+                {
+                    "result": {
+                        "status": "SUCCESS",
+                        "command": {
+                            "name": "credits",
+                            "data": {
+                                "remaining_credits": 420,
+                                "upgrade_uri": "https://one.google.com/ai",
+                            },
+                        },
+                    }
+                }
+            )
+            return SimpleNamespace(returncode=0, stdout=ndjson.encode("utf-8"), stderr=b"")
+        return SimpleNamespace(returncode=2, stdout=b"", stderr=b"boom error")
+
+    monkeypatch.setattr(qp_mod.anyio, "run_process", _fake_run_process)
+
+    usage_res = await run_agy_slash_json("usage", agy_bin=fake_bin, cwd=str(tmp_path))
+    assert usage_res["command"]["name"] == "usage"
+    assert captured_calls[0] == [
+        str(fake_bin),
+        "--add-dir",
+        str(tmp_path),
+        "--output-format",
+        "json",
+        "-p",
+        "/usage",
+    ]
+
+    with pytest.raises(RuntimeError, match="exited with code 2: boom error"):
+        await run_agy_slash_json("/bad", agy_bin=fake_bin)
+
+    # 3. QuotaProvider() with no cli_provider uses run_agy_slash_json directly
+    monkeypatch.setenv("AGY_BIN", str(fake_bin))
+    standalone_provider = QuotaProvider()
+    groups = await standalone_provider.fetch_quota_groups()
+    assert len(groups) == 1
+    assert groups[0]["buckets"][0]["remaining_fraction"] == 0.75
+    credits_info = await standalone_provider.fetch_credits()
+    assert credits_info == {
+        "remaining_credits": 420,
+        "upgrade_uri": "https://one.google.com/ai",
+    }
+
+    # 4. Duck-typed cli_provider (not inheriting AgyCliProvider) still works
+    class _DuckCli:
+        async def run_slash_command(self, command: str) -> dict[str, Any]:
+            return {
+                "command": {
+                    "name": command.lstrip("/"),
+                    "data": {"remaining_credits": 77, "upgrade_uri": None},
+                }
+            }
+
+    duck_provider = QuotaProvider(cli_provider=_DuckCli())
+    assert await duck_provider.fetch_credits() == {
+        "remaining_credits": 77,
+        "upgrade_uri": None,
+    }

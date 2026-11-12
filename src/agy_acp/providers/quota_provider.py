@@ -2,20 +2,87 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
+from pathlib import Path
 from typing import Any
 
-from agy_acp.providers.agy_cli_provider import AgyCliProvider
+import anyio
+
+from agy_acp.logic.tool_classifier import resolve_agy_binary
+
+
+async def run_agy_slash_json(
+    command: str,
+    *,
+    agy_bin: str | Path | None = None,
+    cwd: str | None = None,
+    timeout: float = 30.0,
+) -> dict[str, Any]:
+    """Run a non-interactive slash command (`agy -p <cmd> --output-format json`) via anyio."""
+    normalized = command.strip()
+    if not normalized.startswith("/"):
+        normalized = f"/{normalized}"
+
+    bin_path = resolve_agy_binary(agy_bin)
+    args: list[str] = [bin_path]
+    if cwd:
+        args.extend(["--add-dir", cwd])
+    args.extend(["--output-format", "json", "-p", normalized])
+
+    with anyio.fail_after(timeout):
+        result = await anyio.run_process(args, check=False)
+
+    stdout = result.stdout.decode("utf-8", errors="replace").strip()
+    stderr = result.stderr.decode("utf-8", errors="replace").strip()
+
+    if stdout:
+        with contextlib.suppress(json.JSONDecodeError):
+            parsed = json.loads(stdout)
+            if isinstance(parsed, dict):
+                return parsed
+        for line in reversed(stdout.splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            with contextlib.suppress(json.JSONDecodeError):
+                parsed_line = json.loads(line)
+                if isinstance(parsed_line, dict):
+                    if "result" in parsed_line and isinstance(parsed_line["result"], dict):
+                        return parsed_line["result"]
+                    return parsed_line
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"agy command '{normalized}' exited with code {result.returncode}: {stderr or stdout}"
+        )
+    return {
+        "status": "SUCCESS",
+        "response": stdout,
+        "command": {"name": normalized.lstrip("/")},
+    }
 
 
 class QuotaProvider:
     """Fetches 5-hour (`5h`) and 7-day (`weekly`) quota buckets and G1 credits from `agy` CLI."""
 
-    def __init__(self, *, cli_provider: AgyCliProvider | None = None) -> None:
-        self._cli = cli_provider or AgyCliProvider()
+    def __init__(
+        self,
+        *,
+        cli_provider: Any | None = None,
+        agy_bin: str | Path | None = None,
+    ) -> None:
+        self._cli = cli_provider
+        self._agy_bin = agy_bin
+
+    async def _run_slash(self, command: str) -> dict[str, Any]:
+        if self._cli is not None:
+            return await self._cli.run_slash_command(command)
+        return await run_agy_slash_json(command, agy_bin=self._agy_bin)
 
     async def fetch_quota_groups(self) -> list[dict[str, Any]]:
         """Query `agy -p /usage --output-format json` and return normalized quota groups."""
-        payload = await self._cli.run_slash_command("/usage")
+        payload = await self._run_slash("/usage")
         cmd = payload.get("command")
         cmd_data = cmd.get("data") if isinstance(cmd, dict) else None
         raw_groups = cmd_data.get("groups") if isinstance(cmd_data, dict) else None
@@ -47,7 +114,7 @@ class QuotaProvider:
 
     async def fetch_credits(self) -> dict[str, Any]:
         """Query `agy -p /credits --output-format json` and return G1 remaining credits."""
-        payload = await self._cli.run_slash_command("/credits")
+        payload = await self._run_slash("/credits")
         cmd = payload.get("command")
         cmd_data = cmd.get("data") if isinstance(cmd, dict) else None
         if isinstance(cmd_data, dict) and "remaining_credits" in cmd_data:
