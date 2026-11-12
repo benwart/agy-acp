@@ -297,3 +297,130 @@ async def test_serve_stdin_eof_wakes_inflight_client_rpc_caller_without_hanging(
             )
     assert rc == 0
     assert perm_outcomes == [False]
+
+
+async def test_serve_default_write_bytes_offloads_to_thread_under_write_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify `_default_write_bytes` offloads blocking stdout writes via `to_thread` under lock."""
+    import threading
+
+    cli = _ServeStubCliProvider(save_dir=tmp_path)
+    adapter = create_wire_adapter("v3")
+    mgr = SessionManager(save_dir=tmp_path, cli_provider=cli, wire_adapter=adapter)
+    qt = QuotaTracker(provider=QuotaProvider(cli_provider=cli), state_store=cli.state_store)
+
+    main_tid = threading.get_ident()
+    first_write_entered = threading.Event()
+    unblock_first_write = threading.Event()
+    observed_tids: list[int] = []
+    written_chunks: list[bytes] = []
+    active_writers = 0
+    max_concurrent_writers = 0
+    state_guard = threading.Lock()
+
+    class _BlockingBuffer:
+        def write(self, data: bytes) -> int:
+            nonlocal active_writers, max_concurrent_writers
+            with state_guard:
+                active_writers += 1
+                max_concurrent_writers = max(max_concurrent_writers, active_writers)
+                is_first = len(observed_tids) == 0
+                observed_tids.append(threading.get_ident())
+            try:
+                if is_first:
+                    first_write_entered.set()
+                    # If running on event loop thread, waiting here blocks loop tasks -> timeout!
+                    assert unblock_first_write.wait(timeout=0.5), (
+                        "Event loop was blocked by synchronous stdout write"
+                    )
+                written_chunks.append(bytes(data))
+                return len(data)
+            finally:
+                with state_guard:
+                    active_writers -= 1
+
+        def flush(self) -> None:
+            return None
+
+    class _FakeStdout:
+        def __init__(self) -> None:
+            self.buffer = _BlockingBuffer()
+
+    monkeypatch.setattr("agy_acp.commands.serve.sys.stdout", _FakeStdout())
+
+    send_in, recv_in = anyio.create_memory_object_stream[str](8)
+
+    async def _readline() -> str:
+        try:
+            return await recv_in.receive()
+        except anyio.EndOfStream:
+            return ""
+
+    async def _concurrent_loop_unblocker() -> None:
+        while not first_write_entered.is_set():
+            await anyio.sleep(0.005)
+        unblock_first_write.set()
+
+    await send_in.send(
+        json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}) + "\n"
+    )
+    await send_in.send(
+        json.dumps({"jsonrpc": "2.0", "id": 2, "method": "session/list", "params": {}}) + "\n"
+    )
+    await send_in.aclose()
+
+    with anyio.fail_after(3.0):
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(_concurrent_loop_unblocker)
+            rc = await run_stdio_server(
+                session_manager=mgr,
+                wire_adapter=adapter,
+                quota_tracker=qt,
+                save_dir=tmp_path,
+                stdin_readline=_readline,
+                stdout_write=None,
+            )
+
+    assert rc == 0
+    assert len(observed_tids) >= 2
+    assert all(tid != main_tid for tid in observed_tids)
+    assert max_concurrent_writers == 1
+    parsed_frames = [
+        json.loads(line)
+        for line in b"".join(written_chunks).decode("utf-8").splitlines()
+        if line.strip()
+    ]
+    assert {f.get("id") for f in parsed_frames} == {1, 2}
+    assert all("result" in f and "error" not in f for f in parsed_frames)
+
+    # Also verify bufferless text stdout fallback runs cleanly off-loop
+    import io
+
+    text_out = io.StringIO()
+    monkeypatch.setattr("agy_acp.commands.serve.sys.stdout", text_out)
+    send_in2, recv_in2 = anyio.create_memory_object_stream[str](4)
+
+    async def _readline2() -> str:
+        try:
+            return await recv_in2.receive()
+        except anyio.EndOfStream:
+            return ""
+
+    await send_in2.send(
+        json.dumps({"jsonrpc": "2.0", "id": 3, "method": "session/list", "params": {}}) + "\n"
+    )
+    await send_in2.aclose()
+    assert (
+        await run_stdio_server(
+            session_manager=mgr,
+            wire_adapter=adapter,
+            quota_tracker=qt,
+            save_dir=tmp_path,
+            stdin_readline=_readline2,
+            stdout_write=None,
+        )
+        == 0
+    )
+    assert json.loads(text_out.getvalue().strip())["id"] == 3

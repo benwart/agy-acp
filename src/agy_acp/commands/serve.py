@@ -59,7 +59,7 @@ async def run_stdio_server(
     async def _default_readline() -> str:
         return await anyio.to_thread.run_sync(sys.stdin.readline)
 
-    async def _default_write_bytes(frame: bytes) -> None:
+    def _sync_write_stdout(frame: bytes) -> None:
         buffer = getattr(sys.stdout, "buffer", None)
         if buffer is not None:
             buffer.write(frame)
@@ -67,6 +67,9 @@ async def run_stdio_server(
         else:
             sys.stdout.write(frame.decode("utf-8"))
             sys.stdout.flush()
+
+    async def _default_write_bytes(frame: bytes) -> None:
+        await anyio.to_thread.run_sync(_sync_write_stdout, frame)
 
     readline_fn = stdin_readline or _default_readline
 
