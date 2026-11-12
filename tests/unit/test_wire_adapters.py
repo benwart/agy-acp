@@ -501,7 +501,7 @@ def test_turn_start_ttft_telemetry_steering_compaction_and_subagents() -> None:
         == "steering_cleared"
     )
     assert (
-        v2.build_steering_notification("sess-1", "unexpected", "Fallback")[  # type: ignore[arg-type]
+        v2.build_steering_notification("sess-1", "unexpected", "Fallback")[  # ty: ignore[invalid-argument-type]
             "params"
         ]["update"]["sessionUpdate"]
         == "steering_cleared"
