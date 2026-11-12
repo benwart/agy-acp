@@ -19,15 +19,12 @@ from agy_acp.cli import app
 FAKE_AGY_SCRIPT = """#!/usr/bin/env python3
 import json
 import os
+import queue
 import sys
+import threading
 import time
 
 args = sys.argv[1:]
-
-if args and args[0] == "models":
-    print("gemini-3.7-pro\\tGemini 3.7 Pro")
-    print("gemini-3.8-flash\\tGemini 3.8 Flash")
-    sys.exit(0)
 
 prompt = ""
 for i, arg in enumerate(args):
@@ -100,76 +97,160 @@ if prompt == "/credits":
     }))
     sys.exit(0)
 
-if os.environ.get("TEST_AGY_SLOW") == "1":
-    time.sleep(0.2)
+write_lock = threading.Lock()
+req_queue = queue.Queue()
+perm_waiters = {}
+cancel_events = {}
+sessions = {}
+seq = 0
 
-print(
-    json.dumps({"event": "init", "init": {"conversation_id": "conv-integration-001"}}),
-    flush=True,
-)
-print(json.dumps({
-    "event": "step_update",
-    "step_update": {
-        "step_index": 1,
-        "step_type": "planner_response",
-        "status": "RUNNING",
-        "thinking": "Processing prompt via agy subprocess...",
-    },
-}), flush=True)
 
-if "tool" in prompt.lower() or os.environ.get("GOOSE_MODE") == "approve":
-    print(json.dumps({
-        "event": "step_update",
-        "step_update": {
-            "step_index": 2,
-            "step_type": "run_command",
-            "status": "RUNNING",
-            "tool_name": "run_command",
-            "tool_info": {
-                "tool_name": "run_command",
-                "arguments": {"command": prompt},
+def send(obj):
+    with write_lock:
+        sys.stdout.write(json.dumps(obj) + "\\n")
+        sys.stdout.flush()
+
+
+def reader():
+    for raw in sys.stdin:
+        line = raw.strip()
+        if not line:
+            continue
+        msg = json.loads(line)
+        if "method" not in msg and "id" in msg:
+            q = perm_waiters.get(msg["id"])
+            if q is not None:
+                q.put(msg)
+        elif msg.get("method") == "session/cancel":
+            sid = (msg.get("params") or {}).get("sessionId", "")
+            ev = cancel_events.get(sid)
+            if ev is not None:
+                ev.set()
+        else:
+            req_queue.put(msg)
+    req_queue.put(None)
+
+
+threading.Thread(target=reader, daemon=True).start()
+
+MODELS = [
+    {"modelId": "gemini-3.7-pro", "name": "Gemini 3.7 Pro"},
+    {"modelId": "gemini-3.8-flash", "name": "Gemini 3.8 Flash"},
+]
+CONFIG_OPTS = [
+    {"id": "mode", "options": [{"value": "default"}, {"value": "plan"}]},
+    {"id": "thought_level", "options": [
+        {"value": "low"}, {"value": "medium"}, {"value": "high"}, {"value": "max"}
+    ]},
+]
+
+while True:
+    msg = req_queue.get()
+    if msg is None:
+        break
+    mid = msg.get("id")
+    method = msg.get("method")
+    params = msg.get("params") or {}
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "protocolVersion": 1,
+            "agentCapabilities": {"loadSession": True},
+        }})
+    elif method == "session/new":
+        seq += 1
+        sid = f"conv-integration-{seq:03d}"
+        sessions[sid] = {}
+        cancel_events[sid] = threading.Event()
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "sessionId": sid,
+            "models": {"currentModelId": "gemini-3.7-pro", "availableModels": MODELS},
+            "configOptions": CONFIG_OPTS,
+        }})
+    elif method == "session/load":
+        sid = params.get("sessionId") or "conv-integration-001"
+        sessions.setdefault(sid, {})
+        cancel_events.setdefault(sid, threading.Event())
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "sessionId": sid,
+            "models": {"currentModelId": "gemini-3.7-pro", "availableModels": MODELS},
+            "configOptions": CONFIG_OPTS,
+        }})
+    elif method in ("session/set_model", "session/set_config_option", "session/close"):
+        send({"jsonrpc": "2.0", "id": mid, "result": {}})
+    elif method == "session/prompt":
+        sid = params["sessionId"]
+        ev = cancel_events.setdefault(sid, threading.Event())
+        ev.clear()
+        blocks = params.get("prompt") or []
+        text = "\\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+        if os.environ.get("TEST_AGY_SLOW") == "1":
+            if ev.wait(0.2):
+                send({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "cancelled"}})
+                continue
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": sid,
+            "update": {
+                "sessionUpdate": "agent_thought_chunk",
+                "content": {"type": "text", "text": "Processing prompt via agy subprocess..."},
             },
-        },
-    }), flush=True)
-    print(json.dumps({
-        "event": "step_update",
-        "step_update": {
-            "step_index": 2,
-            "step_type": "run_command",
-            "status": "DONE",
-            "tool_name": "run_command",
-            "tool_info": {
-                "tool_name": "run_command",
-                "arguments": {"command": prompt},
-                "output": f"Executed: {prompt}",
+        }})
+        if "tool" in text.lower() or os.environ.get("GOOSE_MODE") == "approve":
+            tc_id = f"tc-int-{seq}"
+            send({"jsonrpc": "2.0", "method": "session/update", "params": {
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": tc_id,
+                    "title": "run_command",
+                    "kind": "execute",
+                    "status": "pending",
+                    "rawInput": {"CommandLine": text},
+                    "_meta": {"antigravity": {"toolName": "run_command"}},
+                },
+            }})
+            pq = queue.Queue()
+            pid = f"perm-{tc_id}"
+            perm_waiters[pid] = pq
+            send({"jsonrpc": "2.0", "id": pid, "method": "session/request_permission", "params": {
+                "sessionId": sid,
+                "toolCall": {
+                    "toolCallId": tc_id,
+                    "title": "run_command",
+                    "kind": "execute",
+                    "status": "pending",
+                    "rawInput": {"CommandLine": text},
+                    "_meta": {"antigravity": {"toolName": "run_command"}},
+                },
+                "options": [
+                    {"optionId": "allow_once", "kind": "allow_once"},
+                    {"optionId": "reject_once", "kind": "reject_once"},
+                ],
+            }})
+            presp = pq.get(timeout=5.0)
+            perm_waiters.pop(pid, None)
+            opt = ((presp.get("result") or {}).get("outcome") or {}).get("optionId")
+            allowed = opt == "allow_once"
+            send({"jsonrpc": "2.0", "method": "session/update", "params": {
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": tc_id,
+                    "status": "completed" if allowed else "failed",
+                    "rawOutput": f"Executed: {text}" if allowed else "Rejected",
+                },
+            }})
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": sid,
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": f"Processed: {text}"},
             },
-        },
-    }), flush=True)
-
-print(json.dumps({
-    "event": "step_update",
-    "step_update": {
-        "step_index": 3,
-        "step_type": "planner_response",
-        "status": "DONE",
-        "text": f"Processed: {prompt}",
-    },
-}), flush=True)
-print(json.dumps({
-    "event": "result",
-    "result": {
-        "conversation_id": "conv-integration-001",
-        "status": "SUCCESS",
-        "response": f"Processed: {prompt}",
-        "usage": {
-            "input_tokens": 12,
-            "output_tokens": 8,
-            "thinking_tokens": 2,
-            "cache_read_tokens": 0,
-            "total_tokens": 22,
-        },
-    },
-}), flush=True)
+        }})
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": sid,
+            "update": {"sessionUpdate": "usage_update", "used": 22, "size": 1000000},
+        }})
+        send({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})
 """
 
 

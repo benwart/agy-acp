@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -12,12 +12,13 @@ import pytest
 from agy_acp.logic.acp_dispatcher import AcpDispatcher
 from agy_acp.logic.quota_tracker import QuotaTracker
 from agy_acp.logic.session_manager import SessionManager
-from agy_acp.providers.agy_cli_provider import AgyCliProvider, PromptOutcome, ToolCallEvent
+from agy_acp.logic.tool_classifier import PromptOutcome, ToolCallEvent
+from agy_acp.providers.agy_acp_client import AgyAcpClientProvider
 from agy_acp.providers.quota_provider import QuotaProvider
 
 
-class _StubAgyCliProvider(AgyCliProvider):
-    """Test double for AgyCliProvider used exclusively in unit tests."""
+class _StubAgyAcpClientProvider(AgyAcpClientProvider):
+    """Test double for AgyAcpClientProvider used exclusively in unit tests."""
 
     async def run_slash_command(
         self,
@@ -72,7 +73,7 @@ class _StubAgyCliProvider(AgyCliProvider):
         self,
         *,
         cwd: str,
-        prompt: str,
+        prompt: str = "",
         session_id: str | None = None,
         conversation_id: str | None = None,
         model: str | None = None,
@@ -80,7 +81,7 @@ class _StubAgyCliProvider(AgyCliProvider):
         effort: str | None = None,
         skip_permissions: bool | None = None,
         sandbox: bool = False,
-        env: dict[str, str] | None = None,
+        env: Mapping[str, str] | None = None,
         known_mcp_servers: Sequence[str] = (),
         on_thought: Callable[[str], Awaitable[None]] | None = None,
         on_text: Callable[[str], Awaitable[None]] | None = None,
@@ -89,6 +90,7 @@ class _StubAgyCliProvider(AgyCliProvider):
         on_usage: Callable[[int], Awaitable[None]] | None = None,
         on_steer_consumed: Callable[[str], Awaitable[None]] | None = None,
         on_subagent_list: Callable[[list[dict[str, Any]]], Awaitable[None]] | None = None,
+        **_extra: Any,
     ) -> PromptOutcome:
         _ = (
             cwd,
@@ -103,6 +105,7 @@ class _StubAgyCliProvider(AgyCliProvider):
             on_usage,
             on_steer_consumed,
             on_subagent_list,
+            _extra,
         )
         if on_thought is not None:
             await on_thought("Analyzing prompt...")
@@ -149,7 +152,7 @@ def _make_dispatcher(
     notification_sink: Any = None,
     client_rpc_caller: Any = None,
 ) -> AcpDispatcher:
-    cli = _StubAgyCliProvider()
+    cli = _StubAgyAcpClientProvider()
     return AcpDispatcher(
         notification_sink=notification_sink,
         client_rpc_caller=client_rpc_caller,
@@ -496,7 +499,7 @@ async def test_kiro_commands_execute_quota_effort_mcp_and_tools() -> None:
 async def test_session_prompt_wires_active_context_tokens_to_metadata() -> None:
     """Verify AcpDispatcher passes usage.context_tokens to QuotaTracker wire notifications."""
 
-    class _MultiStepCliProvider(_StubAgyCliProvider):
+    class _MultiStepCliProvider(_StubAgyAcpClientProvider):
         async def stream_prompt(self, **kwargs: Any) -> PromptOutcome:
             on_usage = kwargs.get("on_usage")
             if on_usage is not None:
@@ -622,8 +625,9 @@ async def test_mid_turn_steer_and_steering_with_image_attachment(tmp_path: Any) 
 
     turn_started = anyio.Event()
     received_prompts: list[str] = []
+    received_steer_blocks: list[list[dict[str, Any]] | None] = []
 
-    class _SteerableStubCliProvider(_StubAgyCliProvider):
+    class _SteerableStubCliProvider(_StubAgyAcpClientProvider):
         async def stream_prompt(self, **kwargs: Any) -> PromptOutcome:
             sid = str(kwargs.get("session_id") or "default")
             prompt = str(kwargs.get("prompt") or "")
@@ -639,11 +643,12 @@ async def test_mid_turn_steer_and_steering_with_image_attachment(tmp_path: Any) 
                     await anyio.sleep(0.01)
                 steers = self._pop_queued_steers(sid)
                 if steers and on_steer_consumed is not None:
-                    await on_steer_consumed("\n".join(s.raw_message for s in steers))
+                    await on_steer_consumed("\n".join(s.steer.raw_message for s in steers))
                 for s in steers:
-                    received_prompts.append(s.prompt)
+                    received_prompts.append(s.steer.prompt)
+                    received_steer_blocks.append(s.content_blocks)
                     if on_text is not None:
-                        await on_text(f"Steered: {s.prompt}")
+                        await on_text(f"Steered: {s.steer.prompt}")
                 return PromptOutcome(
                     conversation_id="conv-steered-1",
                     stop_reason="end_turn",
@@ -740,8 +745,11 @@ async def test_mid_turn_steer_and_steering_with_image_attachment(tmp_path: Any) 
     assert consumed_updates[0]["content"] == raw_steer_message
     assert len(received_prompts) == 2
     assert "Here are the errors from the IDE" in received_prompts[1]
-    assert "[User attached an image:" in received_prompts[1]
-    assert "inspect it with view_file if needed]" in received_prompts[1]
+    assert len(received_steer_blocks) == 1
+    assert received_steer_blocks[0] is not None
+    steer_img_blocks = [b for b in received_steer_blocks[0] if b.get("type") == "image"]
+    assert len(steer_img_blocks) == 1
+    assert steer_img_blocks[0]["mimeType"] == "image/png"
 
     # When no turn is active, _session/steering returns outcome: failed
     idle_steering = await dispatcher.handle_message(
@@ -796,7 +804,7 @@ async def test_kirocrew_0111_mcp_init_agent_switched_and_commands_inventory(
     async def _sink(msg: dict[str, Any]) -> None:
         emitted.append(msg)
 
-    cli = _StubAgyCliProvider(save_dir=tmp_path)
+    cli = _StubAgyAcpClientProvider(save_dir=tmp_path)
     dispatcher = AcpDispatcher(
         notification_sink=_sink,
         session_manager=SessionManager(
@@ -907,7 +915,7 @@ async def test_compact_slash_command_emits_compaction_status_and_resets_context(
 
     calls: list[dict[str, Any]] = []
 
-    class _CompactCliProvider(_StubAgyCliProvider):
+    class _CompactCliProvider(_StubAgyAcpClientProvider):
         async def stream_prompt(self, **kwargs: Any) -> PromptOutcome:
             calls.append(dict(kwargs))
             prompt_str = str(kwargs.get("prompt") or "")
@@ -1088,7 +1096,7 @@ async def test_compact_slash_command_emits_compaction_status_and_resets_context(
 async def test_session_prompt_emits_kiro_subagent_list_update_notifications() -> None:
     """Verify `AcpDispatcher` emits `_kiro.dev/subagent/list_update` with `sessionId`."""
 
-    class _SubagentStubCliProvider(_StubAgyCliProvider):
+    class _SubagentStubCliProvider(_StubAgyAcpClientProvider):
         async def stream_prompt(self, **kwargs: Any) -> PromptOutcome:
             on_subagent_list = kwargs.get("on_subagent_list")
             if on_subagent_list is not None:
@@ -1229,7 +1237,7 @@ async def test_kas_v3_initialize_session_new_set_mode_load_replay_and_reset_serv
         emitted.append(msg)
 
     adapter = V3KasWireAdapter()
-    cli = _StubAgyCliProvider(save_dir=tmp_path)
+    cli = _StubAgyAcpClientProvider(save_dir=tmp_path)
     mgr = SessionManager(save_dir=tmp_path, cli_provider=cli, wire_adapter=adapter)
     dispatcher = AcpDispatcher(
         notification_sink=_sink,
@@ -1471,17 +1479,11 @@ async def test_kas_v3_tool_permissions_allow_deny_ask_subagents_steer_and_compac
 ) -> None:
     """Verify KAS v3 permission evaluator, diff tool calls, subagents, steer, and compact RPC."""
     from agy_acp.logic.wire import V3KasWireAdapter
-    from agy_acp.providers.agy_cli_provider import ToolCallEvent
 
     perm_calls: list[dict[str, Any]] = []
     emitted: list[dict[str, Any]] = []
-    aborted_sessions: list[str] = []
 
-    class _V3TurnStubCli(_StubAgyCliProvider):
-        def abort_active_process(self, session_id: str) -> bool:
-            aborted_sessions.append(session_id)
-            return True
-
+    class _V3TurnStubCli(_StubAgyAcpClientProvider):
         async def stream_prompt(self, **kwargs: Any) -> PromptOutcome:
             prompt_str = str(kwargs.get("prompt", ""))
             if "Summarize our conversation" in prompt_str:
@@ -1673,7 +1675,6 @@ async def test_kas_v3_tool_permissions_allow_deny_ask_subagents_steer_and_compac
     assert perm_calls[0]["_meta"]["kiro"]["toolId"] == "str_replace"
     assert "kind" not in perm_calls[0]["toolCall"]
     assert perm_calls[0]["toolCall"]["content"][0]["type"] == "diff"
-    assert aborted_sessions == [sid]
 
     updates = [n["params"]["update"] for n in emitted if n.get("method") == "session/update"]
     subtask_updates = [
@@ -1752,7 +1753,7 @@ async def test_wave5b_reset_server_emits_full_snapshot_without_reprobing_peers(
         emitted.append(msg)
 
     adapter = V3KasWireAdapter()
-    cli = _StubAgyCliProvider(save_dir=tmp_path)
+    cli = _StubAgyAcpClientProvider(save_dir=tmp_path)
     mgr = SessionManager(save_dir=tmp_path, cli_provider=cli, wire_adapter=adapter)
     dispatcher = AcpDispatcher(
         notification_sink=_sink,
@@ -1828,14 +1829,9 @@ async def test_wave5b_strict_permission_evaluation_v2_v3_and_mcp_longest_prefix(
     """Verify strict fail-closed permission order, path normalization, and MCP prefix on v2/v3."""
     from agy_acp.logic.wire import V2KiroWireAdapter, V3KasWireAdapter
 
-    aborted: list[str] = []
     recorded_results: list[bool] = []
 
-    class _PermStubCli(_StubAgyCliProvider):
-        def abort_active_process(self, session_id: str) -> bool:
-            aborted.append(session_id)
-            return True
-
+    class _PermStubCli(_StubAgyAcpClientProvider):
         async def stream_prompt(self, **kwargs: Any) -> PromptOutcome:
             on_tool_call = kwargs.get("on_tool_call")
             assert on_tool_call is not None
@@ -1961,7 +1957,6 @@ async def test_wave5b_strict_permission_evaluation_v2_v3_and_mcp_longest_prefix(
 
     for adapter in (V2KiroWireAdapter(), V3KasWireAdapter()):
         recorded_results.clear()
-        aborted.clear()
         sub_dir = tmp_path / adapter.engine_id
         sub_dir.mkdir(parents=True, exist_ok=True)
         cli = _PermStubCli(save_dir=sub_dir)
@@ -2061,10 +2056,8 @@ async def test_wave5b_strict_permission_evaluation_v2_v3_and_mcp_longest_prefix(
             )
         )
         assert recorded_results == [False]
-        assert len(aborted) == 1
 
         recorded_results.clear()
-        aborted.clear()
         await dispatcher.handle_message(
             json.dumps(
                 {
@@ -2090,7 +2083,6 @@ async def test_wave5b_strict_permission_evaluation_v2_v3_and_mcp_longest_prefix(
             )
         )
         assert recorded_results == [True, False, False, False, True, False, True]
-        assert len(aborted) == 4
 
 
 async def test_wave5b_turn1_credit_baseline_ttft_gating_context_breakdown_and_eviction(
@@ -2102,7 +2094,7 @@ async def test_wave5b_turn1_credit_baseline_ttft_gating_context_breakdown_and_ev
     usage_calls = 0
     current_credits = 500
 
-    class _TelemetryStubCli(_StubAgyCliProvider):
+    class _TelemetryStubCli(_StubAgyAcpClientProvider):
         async def run_slash_command(
             self,
             command: str,
@@ -2324,7 +2316,7 @@ async def test_wave5b_jsonrpc_input_validation_and_concurrent_post_notifications
     from agy_acp.logic.wire import V3KasWireAdapter
 
     adapter = V3KasWireAdapter()
-    cli = _StubAgyCliProvider(save_dir=tmp_path)
+    cli = _StubAgyAcpClientProvider(save_dir=tmp_path)
     mgr = SessionManager(save_dir=tmp_path, cli_provider=cli, wire_adapter=adapter)
     dispatcher = AcpDispatcher(
         session_manager=mgr,
@@ -2448,7 +2440,7 @@ async def test_kas_mcp_reset_server_start_oauth_and_model_fallback_notifications
         outbound_rpcs.append((method, dict(params)))
         return {"success": True}
 
-    class _FallbackAndOAuthStubCli(_StubAgyCliProvider):
+    class _FallbackAndOAuthStubCli(_StubAgyAcpClientProvider):
         async def stream_prompt(self, **kwargs: Any) -> PromptOutcome:
             requested_model = str(kwargs.get("model") or "")
             on_text = kwargs.get("on_text")
@@ -2709,19 +2701,14 @@ async def test_kas_mcp_reset_server_start_oauth_and_model_fallback_notifications
 
 async def test_custom_agent_execute_bash_allowlist_permits_manage_task(tmp_path: Path) -> None:
     """Custom agent with execute_bash in tools allowlist permits manage_task without policy deny."""
+    from agy_acp.logic.tool_classifier import classify_tool_call_step
     from agy_acp.logic.wire import V3KasWireAdapter
-    from agy_acp.providers.agy_cli_provider import (
-        AgyCliProvider,
-        PromptOutcome,
-        ToolCallEvent,
-        _normalize_tool_arguments,
-        classify_tool_call_step,
-    )
+    from agy_acp.providers.agy_acp_client import _normalize_tool_arguments
 
     observed_allowed: list[bool] = []
     permission_requests: list[dict[str, Any]] = []
 
-    class _ManageTaskCli(AgyCliProvider):
+    class _ManageTaskCli(_StubAgyAcpClientProvider):
         async def stream_prompt(self, **kwargs: Any) -> PromptOutcome:
             on_tool_call = kwargs.get("on_tool_call")
             on_text = kwargs.get("on_text")
@@ -2837,9 +2824,8 @@ async def test_session_prompt_returns_jsonrpc_error_on_unrecovered_cli_error(
 ) -> None:
     """Unrecovered agy CLI ERROR returns JSON-RPC -32603 after emitting telemetry frames."""
     from agy_acp.logic.wire import V3KasWireAdapter
-    from agy_acp.providers.agy_cli_provider import AgyCliProvider, PromptOutcome
 
-    class _ConnResetCli(AgyCliProvider):
+    class _ConnResetCli(_StubAgyAcpClientProvider):
         async def stream_prompt(self, **_kwargs: Any) -> PromptOutcome:
             return PromptOutcome(
                 conversation_id="conv-reset-1",
@@ -2913,7 +2899,6 @@ async def test_session_prompt_normalizes_carousel_stream_and_stamps_ttft_on_firs
 ) -> None:
     """Split carousel stream emits unwrapped image chunks, preserves TTFT, and saves clean turn."""
     from agy_acp.logic.wire import V3KasWireAdapter
-    from agy_acp.providers.agy_cli_provider import AgyCliProvider, PromptOutcome
 
     raw_chunks = [
         "````carousel\n",
@@ -2921,7 +2906,7 @@ async def test_session_prompt_normalizes_carousel_stream_and_stamps_ttft_on_firs
         "![Slide 2](file:///Users/benwart/.gemini/antigravity-cli/brain/id/s2.png)\n````",
     ]
 
-    class _CarouselStubCli(AgyCliProvider):
+    class _CarouselStubCli(_StubAgyAcpClientProvider):
         async def stream_prompt(self, **kwargs: Any) -> PromptOutcome:
             on_text = kwargs.get("on_text")
             if on_text is not None:
@@ -3014,7 +2999,7 @@ async def test_session_load_replays_legacy_persisted_carousel_turns_as_normalize
         emitted.append(msg)
 
     adapter = V3KasWireAdapter()
-    cli = _StubAgyCliProvider(save_dir=tmp_path)
+    cli = _StubAgyAcpClientProvider(save_dir=tmp_path)
     mgr = SessionManager(save_dir=tmp_path, cli_provider=cli, wire_adapter=adapter)
     dispatcher = AcpDispatcher(
         notification_sink=_sink,
@@ -3095,48 +3080,69 @@ async def test_kirocrew_lite_consolidation_with_oversized_prompt_succeeds_withou
 ) -> None:
     """Oversized (>64 KiB) consolidation prompts on `kirocrew-lite` (`tools: []`) return JSON."""
     from agy_acp.logic.wire import V3KasWireAdapter
-    from agy_acp.providers.agy_cli_provider import MAX_INLINE_PROMPT_BYTES, AgyCliProvider
 
     fake_agy = tmp_path / "agy-consolidate-wire"
     fake_agy.write_text(
         "#!/usr/bin/env python3\n"
         "import json, sys\n"
         "args = sys.argv[1:]\n"
-        "if args == ['models']:\n"
-        "    sys.exit(0)\n"
         "if '-p' in args and args[args.index('-p') + 1] in ('/usage', '/credits'):\n"
         "    print(json.dumps({'status': 'SUCCESS', 'command': {'name': 'quota', 'data': []}}))\n"
         "    sys.exit(0)\n"
-        "assert '--input-format' in args\n"
-        "assert args[args.index('--input-format') + 1] == 'stream-json'\n"
-        "assert '--mode' in args and args[args.index('--mode') + 1] == 'plan'\n"
-        "assert '--dangerously-skip-permissions' not in args\n"
-        "frame = json.loads(sys.stdin.readline())\n"
-        "assert frame['event'] == 'user'\n"
-        "body = frame['message']['content']\n"
-        "out = json.dumps({'history_entry': f'ok:{len(body)}', 'semantic': [], 'lessons': []})\n"
-        "init_ev = {'event': 'init', 'init': {'conversation_id': 'conv-lite-1'}}\n"
-        "print(json.dumps(init_ev), flush=True)\n"
-        "step_ev = {\n"
-        "    'event': 'step_update',\n"
-        "    'step_update': {\n"
-        "        'step_index': 1,\n"
-        "        'step_type': 'agent_response',\n"
-        "        'state': 'DONE',\n"
-        "        'text_delta': out,\n"
-        "    },\n"
-        "}\n"
-        "print(json.dumps(step_ev), flush=True)\n"
-        "res_ev = {\n"
-        "    'event': 'result',\n"
-        "    'result': {\n"
-        "        'conversation_id': 'conv-lite-1',\n"
-        "        'status': 'SUCCESS',\n"
-        "        'response': out,\n"
-        "        'usage': {'input_tokens': 21000, 'output_tokens': 20, 'total_tokens': 21020},\n"
-        "    },\n"
-        "}\n"
-        "print(json.dumps(res_ev), flush=True)\n",
+        "assert args[:2] == ['acp', '--stdio']\n"
+        "sessions = {}\n"
+        "seq = 0\n"
+        "for raw in sys.stdin:\n"
+        "    line = raw.strip()\n"
+        "    if not line:\n"
+        "        continue\n"
+        "    msg = json.loads(line)\n"
+        "    mid = msg.get('id')\n"
+        "    method = msg.get('method')\n"
+        "    params = msg.get('params') or {}\n"
+        "    if method == 'initialize':\n"
+        "        print(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': {'protocolVersion': 1}}),"
+        " flush=True)\n"
+        "    elif method == 'session/new':\n"
+        "        seq += 1\n"
+        "        sid = f'conv-lite-{seq}'\n"
+        "        sessions[sid] = {'meta': params.get('_meta', {}), 'configs': {}}\n"
+        "        print(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': {\n"
+        "            'sessionId': sid,\n"
+        "            'models': {'currentModelId': 'gemini-4-argon-medium', 'availableModels': [\n"
+        "                {'modelId': 'gemini-4-argon-medium', 'name': 'Gemini 4 Argon'}\n"
+        "            ]},\n"
+        "            'configOptions': [{'id': 'mode', 'options': [{'value': 'plan'}]}],\n"
+        "        }}), flush=True)\n"
+        "    elif method == 'session/set_config_option':\n"
+        "        s = sessions.get(params.get('sessionId'), {})\n"
+        "        s.setdefault('configs', {})[params.get('configId')] = params.get('value')\n"
+        "        print(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': {}}), flush=True)\n"
+        "    elif method == 'session/set_model':\n"
+        "        print(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': {}}), flush=True)\n"
+        "    elif method == 'session/close':\n"
+        "        print(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': {}}), flush=True)\n"
+        "    elif method == 'session/prompt':\n"
+        "        sid = params['sessionId']\n"
+        "        s = sessions[sid]\n"
+        "        assert s['configs'].get('mode') == 'plan'\n"
+        "        sys_app = s['meta'].get('antigravity', {})"
+        ".get('systemPrompt', {}).get('append', '')\n"
+        "        assert 'lightweight background agent' in sys_app\n"
+        "        body = params['prompt'][0]['text']\n"
+        "        out = json.dumps("
+        "{'history_entry': f'ok:{len(body)}', 'semantic': [], 'lessons': []})\n"
+        "        print(json.dumps({'jsonrpc': '2.0', 'method': 'session/update', 'params': {\n"
+        "            'sessionId': sid,\n"
+        "            'update': {'sessionUpdate': 'agent_message_chunk',"
+        " 'content': {'type': 'text', 'text': out}},\n"
+        "        }}), flush=True)\n"
+        "        print(json.dumps({'jsonrpc': '2.0', 'method': 'session/update', 'params': {\n"
+        "            'sessionId': sid,\n"
+        "            'update': {'sessionUpdate': 'usage_update', 'used': 21020, 'size': 1000000},\n"
+        "        }}), flush=True)\n"
+        "        print(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': {"
+        "'stopReason': 'end_turn'}}), flush=True)\n",
         encoding="utf-8",
     )
     fake_agy.chmod(0o755)
@@ -3148,98 +3154,103 @@ async def test_kirocrew_lite_consolidation_with_oversized_prompt_succeeds_withou
 
     adapter = V3KasWireAdapter()
     state_dir = tmp_path / "state"
-    cli = AgyCliProvider(bin_path=fake_agy, save_dir=state_dir)
+    cli = AgyAcpClientProvider(bin_path=fake_agy, save_dir=state_dir)
     mgr = SessionManager(save_dir=state_dir, cli_provider=cli, wire_adapter=adapter)
-    dispatcher = AcpDispatcher(
-        notification_sink=_sink,
-        session_manager=mgr,
-        quota_tracker=QuotaTracker(
-            provider=QuotaProvider(cli_provider=cli),
-            state_store=cli.state_store,
-        ),
-        wire_adapter=adapter,
-    )
+    try:
+        dispatcher = AcpDispatcher(
+            notification_sink=_sink,
+            session_manager=mgr,
+            quota_tracker=QuotaTracker(
+                provider=QuotaProvider(cli_provider=cli),
+                state_store=cli.state_store,
+            ),
+            wire_adapter=adapter,
+        )
 
-    ws = tmp_path / "_consolidate"
-    ws.mkdir()
-    new_resp = await dispatcher.handle_message(
-        json.dumps(
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "session/new",
-                "params": {
-                    "cwd": str(ws),
-                    "mcpServers": [],
-                    "_meta": {
-                        "kiro": {
-                            "customAgents": [
-                                {
-                                    "id": "kirocrew-lite",
-                                    "name": "kirocrew-lite",
-                                    "prompt": "You are a Kiro Crew lightweight background agent.",
-                                    "tools": [],
-                                }
-                            ]
-                        }
+        ws = tmp_path / "_consolidate"
+        ws.mkdir()
+        new_resp = await dispatcher.handle_message(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "session/new",
+                    "params": {
+                        "cwd": str(ws),
+                        "mcpServers": [],
+                        "_meta": {
+                            "kiro": {
+                                "customAgents": [
+                                    {
+                                        "id": "kirocrew-lite",
+                                        "name": "kirocrew-lite",
+                                        "prompt": (
+                                            "You are a Kiro Crew lightweight background agent."
+                                        ),
+                                        "tools": [],
+                                    }
+                                ]
+                            }
+                        },
                     },
-                },
-            }
+                }
+            )
         )
-    )
-    assert new_resp is not None
-    sid = new_resp["result"]["sessionId"]
+        assert new_resp is not None
+        sid = new_resp["result"]["sessionId"]
 
-    mode_resp = await dispatcher.handle_message(
-        json.dumps(
-            {
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "session/set_mode",
-                "params": {"sessionId": sid, "modeId": "kirocrew-lite"},
-            }
+        mode_resp = await dispatcher.handle_message(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "session/set_mode",
+                    "params": {"sessionId": sid, "modeId": "kirocrew-lite"},
+                }
+            )
         )
-    )
-    assert mode_resp is not None
-    assert "result" in mode_resp
-    emitted.clear()
+        assert mode_resp is not None
+        assert "result" in mode_resp
+        emitted.clear()
 
-    big_consolidation = "You are a memory consolidation agent.\n" + ("Row\n" * 22000)
-    assert len(big_consolidation.encode("utf-8")) > MAX_INLINE_PROMPT_BYTES
+        big_consolidation = "You are a memory consolidation agent.\n" + ("Row\n" * 22000)
+        assert len(big_consolidation.encode("utf-8")) > 65_536
 
-    prompt_resp = await dispatcher.handle_message(
-        json.dumps(
-            {
-                "jsonrpc": "2.0",
-                "id": 3,
-                "method": "session/prompt",
-                "params": {
-                    "sessionId": sid,
-                    "prompt": [{"type": "text", "text": big_consolidation}],
-                },
-            }
+        prompt_resp = await dispatcher.handle_message(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "session/prompt",
+                    "params": {
+                        "sessionId": sid,
+                        "prompt": [{"type": "text", "text": big_consolidation}],
+                    },
+                }
+            )
         )
-    )
-    assert prompt_resp is not None
-    assert prompt_resp["result"]["stopReason"] == "end_turn"
+        assert prompt_resp is not None
+        assert prompt_resp["result"]["stopReason"] == "end_turn"
 
-    tool_updates = [
-        n
-        for n in emitted
-        if n.get("method") == "session/update"
-        and n["params"]["update"].get("sessionUpdate") in ("tool_call", "tool_call_update")
-    ]
-    assert tool_updates == []
+        tool_updates = [
+            n
+            for n in emitted
+            if n.get("method") == "session/update"
+            and n["params"]["update"].get("sessionUpdate") in ("tool_call", "tool_call_update")
+        ]
+        assert tool_updates == []
 
-    chunks = [
-        n["params"]["update"]["content"]["text"]
-        for n in emitted
-        if n.get("method") == "session/update"
-        and n["params"]["update"].get("sessionUpdate") == "agent_message_chunk"
-    ]
-    parsed = json.loads("".join(chunks))
-    assert parsed["history_entry"].startswith("ok:")
-    assert parsed["lessons"] == []
+        chunks = [
+            n["params"]["update"]["content"]["text"]
+            for n in emitted
+            if n.get("method") == "session/update"
+            and n["params"]["update"].get("sessionUpdate") == "agent_message_chunk"
+        ]
+        parsed = json.loads("".join(chunks))
+        assert parsed["history_entry"].startswith("ok:")
+        assert parsed["lessons"] == []
+    finally:
+        await mgr.close()
 
 
 async def test_acp_dispatcher_0121_fork_steer_clear_kas_rpcs_and_trailing_compact(
@@ -3265,7 +3276,7 @@ async def test_acp_dispatcher_0121_fork_steer_clear_kas_rpcs_and_trailing_compac
         emitted.append(msg)
 
     adapter = V3KasWireAdapter()
-    cli = _StubAgyCliProvider(save_dir=tmp_path)
+    cli = _StubAgyAcpClientProvider(save_dir=tmp_path)
     mgr = SessionManager(save_dir=tmp_path, cli_provider=cli, wire_adapter=adapter)
     dispatcher = AcpDispatcher(
         notification_sink=_sink,

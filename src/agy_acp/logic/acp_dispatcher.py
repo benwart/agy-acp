@@ -155,7 +155,7 @@ def _to_normalized_tool_event(
     *,
     known_mcp_servers: Sequence[str] = (),
 ) -> NormalizedToolEvent:
-    """Convert an `AgyCliProvider` `ToolCallEvent` into a wire `NormalizedToolEvent`."""
+    """Convert an `AgyAcpClientProvider` `ToolCallEvent` into a wire `NormalizedToolEvent`."""
     mcp_server, mcp_tool = _resolve_event_mcp_identity(event, known_mcp_servers)
     is_mcp = bool(mcp_server and mcp_tool)
     kas_id = event.kas_builtin_id or (
@@ -659,7 +659,6 @@ class AcpDispatcher:
     ) -> bool:
         """Prompt the ACP client for tool approval, failing closed when headless or rejected."""
         if self._client_rpc_caller is None:
-            self._session_manager.cli_provider.abort_active_process(session_id)
             return False
 
         perm_response = await self._client_rpc_caller("session/request_permission", perm_params)
@@ -668,10 +667,7 @@ class AcpDispatcher:
             await self._session_manager.cancel(session_id=session_id)
             return False
         selected_option = outcome.get("optionId") if isinstance(outcome, dict) else None
-        allowed = selected_option in {"allow_once", "allow_always"}
-        if not allowed:
-            self._session_manager.cli_provider.abort_active_process(session_id)
-        return allowed
+        return selected_option in {"allow_once", "allow_always"}
 
     async def _emit_turn_telemetry_frames(
         self,
@@ -746,7 +742,6 @@ class AcpDispatcher:
         if decision == "allow":
             return True
         if decision == "deny":
-            self._session_manager.cli_provider.abort_active_process(session_id)
             return False
 
         perm_params = self._wire_adapter.build_permission_request_params(session_id, norm)
@@ -815,7 +810,6 @@ class AcpDispatcher:
         if decision == "allow":
             return True
         if decision == "deny":
-            self._session_manager.cli_provider.abort_active_process(session_id)
             return False
 
         perm_params = {
@@ -937,6 +931,9 @@ class AcpDispatcher:
             self._session_manager.state_store.clear_session_turns(session_id)
             existing = self._session_manager.state_store.get_session(session_id)
             if existing is not None:
+                old_agy_id = str(existing.get("agyConversationId") or "").strip()
+                if old_agy_id:
+                    await self._session_manager.cli_provider.close_backend_session(old_agy_id)
                 existing["agyConversationId"] = None
                 existing["compactedSummary"] = None
                 existing["contextTokens"] = 0
@@ -2075,6 +2072,12 @@ class AcpDispatcher:
         target_msg_id = _require_non_empty_str(params, "messageId")
         if session_id is None or target_msg_id is None:
             return _jsonrpc_error(message_id, -32602, "Invalid params")
+        existing = self._session_manager.state_store.get_session(session_id)
+        old_agy_id = (
+            str(existing.get("agyConversationId") or "").strip() if existing is not None else ""
+        )
+        if old_agy_id:
+            await self._session_manager.cli_provider.close_backend_session(old_agy_id)
         try:
             res = self._session_manager.revert_checkpoint_by_message_id(
                 session_id,

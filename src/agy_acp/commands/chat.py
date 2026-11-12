@@ -11,7 +11,7 @@ from cyclopts import Parameter
 
 from agy_acp.commands.serve import AGENT_ENGINE_HELP, normalize_agent_engine
 from agy_acp.logic.quota_tracker import QuotaTracker, format_local_reset_date
-from agy_acp.providers.agy_cli_provider import AgyCliProvider
+from agy_acp.providers.agy_acp_client import AgyAcpClientProvider
 
 DEFAULT_CONTEXT_WINDOW_TOKENS = 1_000_000
 
@@ -37,8 +37,8 @@ async def default(
     _ = (format, no_interactive, agent_engine, agent, model, extra_kwargs)
 
     if list_models:
-        provider = AgyCliProvider()
-        discovered = await provider.discover_models()
+        async with AgyAcpClientProvider() as provider:
+            discovered = await provider.discover_models()
         catalog_rows = [
             {
                 "model_id": m["modelId"],
@@ -73,12 +73,12 @@ async def default(
         )
         return 0
 
-    provider = AgyCliProvider()
-    outcome = await provider.stream_prompt(
-        cwd=".",
-        prompt=prompt_text,
-        model=model,
-        session_id="cli-chat",
-    )
+    async with AgyAcpClientProvider() as provider:
+        outcome = await provider.stream_prompt(
+            cwd=".",
+            prompt=prompt_text,
+            model=model,
+            session_id="cli-chat",
+        )
     print(outcome.response)
     return 0

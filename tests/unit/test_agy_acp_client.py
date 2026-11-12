@@ -9,12 +9,12 @@ from typing import Any
 
 import anyio
 
+from agy_acp.logic.tool_classifier import FALLBACK_MODELS, ToolCallEvent
 from agy_acp.providers.agy_acp_client import (
     AgyAcpClientProvider,
     format_acp_mcp_servers,
     normalize_acp_content_blocks,
 )
-from agy_acp.providers.agy_cli_provider import FALLBACK_MODELS, ToolCallEvent
 from agy_acp.providers.state_store import SqliteStateStoreProvider
 
 MOCK_AGY_ACP_SERVER = '''#!/usr/bin/env python3
@@ -1204,3 +1204,55 @@ async def test_should_recover_automatically_after_worker_crash_or_eof(
     ]
     assert len(loads) >= 2
     assert all(m["params"]["sessionId"] == agy_sid for m in loads)
+
+
+async def test_should_emit_raw_carousel_deltas_sync_loaded_prefs_and_drop_legacy_stubs(
+    tmp_path: Path,
+) -> None:
+    """Verify raw text delta streaming (no double carousel normalization) and pref updates."""
+    assert not hasattr(AgyAcpClientProvider, "abort_active_process")
+    assert not hasattr(AgyAcpClientProvider, "sync_mcp_servers")
+
+    script, state_file = _make_mock_agy(tmp_path)
+    store = SqliteStateStoreProvider(tmp_path / "state")
+    raw_carousel = "Intro\n\n````carousel\n![Slide](/tmp/slide.png)\n````\n"
+    seen_chunks: list[str] = []
+
+    async def _on_text(chunk: str) -> None:
+        seen_chunks.append(chunk)
+
+    async with AgyAcpClientProvider(
+        bin_path=script,
+        state_store=store,
+        env={"MOCK_AGY_STATE_FILE": str(state_file)},
+    ) as client:
+        first = await client.stream_prompt(
+            cwd=str(tmp_path),
+            session_id="sess-raw",
+            prompt=raw_carousel,
+            model="gemini-3.7-pro",
+            mode="auto",
+            effort="medium",
+            on_text=_on_text,
+        )
+        assert "````carousel" in "".join(seen_chunks)
+        assert "````carousel" in first.response
+
+        # Second turn on already-loaded session updates model + mode + effort
+        second = await client.stream_prompt(
+            cwd=str(tmp_path),
+            session_id="sess-raw",
+            agy_session_id=first.conversation_id,
+            prompt="follow up",
+            model="gemini-3.8-flash",
+            mode="read-only",
+            effort="high",
+        )
+        assert second.resolved_model == "gemini-3.8-flash"
+
+    set_models = [
+        r["msg"]["params"]["modelId"]
+        for r in _read_mock_records(state_file)
+        if r["type"] == "recv" and r["msg"].get("method") == "session/set_model"
+    ]
+    assert "gemini-3.8-flash" in set_models

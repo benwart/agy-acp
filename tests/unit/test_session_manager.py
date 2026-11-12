@@ -241,21 +241,44 @@ async def test_skill_view_agent_mcp_sync_and_pinned_model_on_set_mode(tmp_path: 
         encoding="utf-8",
     )
 
+    closed_backend_ids: list[str] = []
+
+    from agy_acp.providers.agy_acp_client import AgyAcpClientProvider
+
+    class _CloseTrackingCli(AgyAcpClientProvider):
+        async def close_backend_session(self, agy_session_id: str) -> dict[str, Any]:
+            closed_backend_ids.append(agy_session_id)
+            return {}
+
+    cli = _CloseTrackingCli(save_dir=tmp_path)
     mgr = SessionManager(
         save_dir=tmp_path,
+        cli_provider=cli,
         default_agent="kirocrew-skill-view-111",
     )
     desc = await mgr.create_session(cwd=str(tmp_path), mcp_servers=[])
     sid = desc["sessionId"]
 
-    mcp_cfg = json.loads((tmp_path / "mcp_config.json").read_text(encoding="utf-8"))
-    assert "crew-core" in mcp_cfg["mcpServers"]
-    assert "legacy-srv" in mcp_cfg["mcpServers"]
-    assert "evil-proj-mcp" not in mcp_cfg["mcpServers"]
+    assert not (tmp_path / "mcp_config.json").exists()
     assert [s["name"] for s in mgr.get_session(sid)["mcp_servers"]] == ["crew-core", "legacy-srv"]
 
+    # Simulate active backend session + persisted turn before switching custom agent
+    seeded = mgr.get_session(sid)
+    seeded["agyConversationId"] = "agy-sess-111"
+    mgr.state_store.upsert_session(seeded)
+    mgr.state_store.append_session_turn(
+        session_id=sid,
+        user_message_id="msg-before-switch",
+        prompt_blocks=[{"type": "text", "text": "Prior turn question"}],
+        assistant_text="Prior turn answer",
+    )
+
     await mgr.set_mode(session_id=sid, mode_id="untrusted-proj")
-    assert mgr.get_session(sid)["mcp_servers"] == []
+    after_untrusted = mgr.get_session(sid)
+    assert after_untrusted["mcp_servers"] == []
+    assert after_untrusted["agyConversationId"] is None
+    assert closed_backend_ids == ["agy-sess-111"]
+    assert "Prior turn question" in (after_untrusted.get("compactedSummary") or "")
 
     await mgr.set_mode(session_id=sid, mode_id="kirocrew-skill-view-222")
     session_after = mgr.get_session(sid)
@@ -263,83 +286,77 @@ async def test_skill_view_agent_mcp_sync_and_pinned_model_on_set_mode(tmp_path: 
     assert session_after["model"] == "gemini-3.8-flash"
     assert session_after.get("switchedModel") == "gemini-3.8-flash"
     assert [s["name"] for s in session_after["mcp_servers"]] == ["crew-core", "skill-extra"]
-
-    mcp_cfg_after = json.loads((tmp_path / "mcp_config.json").read_text(encoding="utf-8"))
-    assert "crew-core" in mcp_cfg_after["mcpServers"]
-    assert "skill-extra" in mcp_cfg_after["mcpServers"]
-    assert "legacy-srv" not in mcp_cfg_after["mcpServers"]
+    assert not (tmp_path / "mcp_config.json").exists()
 
 
 async def test_format_steer_message_and_markdown_local_images(tmp_path: Path) -> None:
-    """Verify markdown image links inside cwd are staged to 0700 dir while escapes are blocked."""
-    from agy_acp.logic.session_manager import _format_prompt_blocks, _format_steer_message
+    """Verify markdown image links inside cwd become inline base64 blocks with zero temp files."""
+    import base64
+
+    from agy_acp.logic.session_manager import _build_acp_content_blocks, _format_steer_message
 
     uploads_dir = tmp_path / "uploads"
     uploads_dir.mkdir(parents=True)
     img_file = uploads_dir / "4bd8ebef_pasted-image.png"
     png_bytes = b"\x89PNG\r\n\x1a\nfake-png-payload"
     img_file.write_bytes(png_bytes)
+    expected_b64 = base64.b64encode(png_bytes).decode("ascii")
 
     raw_steer = (
         f"<user_message>\n![image]({img_file})\n\nHere are the errors from the IDE\n</user_message>"
     )
-    priv_img_dir = tmp_path / "priv_images"
-    formatted, staged_files = _format_steer_message(
+    formatted, steer_blocks = _format_steer_message(
         raw_steer,
         cwd=str(tmp_path),
-        image_dir=priv_img_dir,
     )
-    try:
-        assert "<user_message>" not in formatted
-        assert "</user_message>" not in formatted
-        assert "Here are the errors from the IDE" in formatted
-        assert len(staged_files) == 1
-        staged_path = staged_files[0]
-        assert staged_path.is_file()
-        assert staged_path.read_bytes() == png_bytes
-        assert (priv_img_dir.stat().st_mode & 0o777) == 0o700
-        assert (staged_path.stat().st_mode & 0o777) == 0o600
-        assert (
-            f"[User attached an image: {staged_path} — inspect it with view_file if needed]"
-            in formatted
-        )
-    finally:
-        for f in staged_files:
-            f.unlink(missing_ok=True)
+    assert "<user_message>" not in formatted
+    assert "</user_message>" not in formatted
+    assert "Here are the errors from the IDE" in formatted
+    assert steer_blocks == [
+        {"type": "text", "text": formatted},
+        {"type": "image", "data": expected_b64, "mimeType": "image/png"},
+    ]
+    assert not (tmp_path / "images").exists()
 
-    # Also verify _format_prompt_blocks extracts markdown local images inside cwd
-    prompt_text, prompt_files = _format_prompt_blocks(
-        [{"type": "text", "text": f"Check this screenshot: ![screenshot]({img_file})"}],
+    # Verify _build_acp_content_blocks passes native image/resource blocks and extracts md images
+    direct_b64 = base64.b64encode(b"direct-webp").decode("ascii")
+    prompt_text, acp_blocks = _build_acp_content_blocks(
+        [
+            {"type": "text", "text": f"Check this screenshot: ![screenshot]({img_file})"},
+            {"type": "image", "data": direct_b64, "mimeType": "image/webp"},
+            {"type": "resource", "resource": {"uri": "file:///a.txt", "text": "hello"}},
+        ],
         cwd=str(tmp_path),
-        image_dir=priv_img_dir,
+        prefix_text="<session_context_paths>\nREADME.md\n</session_context_paths>",
     )
-    try:
-        assert len(prompt_files) == 1
-        assert prompt_files[0].read_bytes() == png_bytes
-        assert (
-            f"[User attached an image: {prompt_files[0]} — inspect it with view_file if needed]"
-            in prompt_text
-        )
-    finally:
-        for f in prompt_files:
-            f.unlink(missing_ok=True)
+    assert prompt_text.startswith("<session_context_paths>")
+    assert acp_blocks[0]["type"] == "text"
+    assert acp_blocks[0]["text"].startswith("<session_context_paths>")
+    assert acp_blocks[1] == {"type": "image", "data": expected_b64, "mimeType": "image/png"}
+    assert acp_blocks[2] == {"type": "image", "data": direct_b64, "mimeType": "image/webp"}
+    assert acp_blocks[3] == {
+        "type": "resource",
+        "resource": {"uri": "file:///a.txt", "text": "hello"},
+    }
+    assert not (tmp_path / "images").exists()
 
-    # Markdown image outside cwd or without cwd MUST NOT be staged
+    # Markdown image outside cwd, symlink escaping cwd, or missing cwd MUST NOT be read
     outside_img = tmp_path.parent / f"outside_{tmp_path.name}.png"
     outside_img.write_bytes(png_bytes)
+    escaped_symlink = uploads_dir / "escaped_link.png"
+    escaped_symlink.symlink_to(outside_img)
     try:
-        _, no_cwd_files = _format_prompt_blocks(
+        _, no_cwd_blocks = _build_acp_content_blocks(
             [{"type": "text", "text": f"![x]({img_file})"}],
-            image_dir=priv_img_dir,
         )
-        assert no_cwd_files == []
-        _, escaped_files = _format_prompt_blocks(
-            [{"type": "text", "text": f"![x]({outside_img})"}],
+        assert [b["type"] for b in no_cwd_blocks] == ["text"]
+        _, escaped_blocks = _build_acp_content_blocks(
+            [{"type": "text", "text": f"![x]({outside_img}) ![y]({escaped_symlink})"}],
             cwd=str(tmp_path),
-            image_dir=priv_img_dir,
         )
-        assert escaped_files == []
+        assert [b["type"] for b in escaped_blocks] == ["text"]
     finally:
+        escaped_symlink.unlink(missing_ok=True)
         outside_img.unlink(missing_ok=True)
 
 
@@ -351,6 +368,8 @@ async def test_prompt_isolates_per_session_mcp_token_and_injects_spawn_run_routi
     import json
     import stat
 
+    from agy_acp.providers.agy_acp_client import AgyAcpClientProvider
+
     monkeypatch.setenv("KIROCREW_STUB_SESSION_TOKEN", "leaked-parent-token")
     monkeypatch.setenv("KIROCREW_ROUTE_SPAWN_RUN", "1")
 
@@ -358,16 +377,66 @@ async def test_prompt_isolates_per_session_mcp_token_and_injects_spawn_run_routi
     fake_agy.write_text(
         "#!/usr/bin/env python3\n"
         "import json, os, sys\n"
-        "prompt = sys.argv[sys.argv.index('-p') + 1]\n"
-        "resp = json.dumps({\n"
-        "    'tok': os.environ.get('KIROCREW_STUB_SESSION_TOKEN'),\n"
-        "    'route': os.environ.get('KIROCREW_ROUTE_SPAWN_RUN'),\n"
-        "    'prompt': prompt,\n"
-        "    'args': sys.argv[1:],\n"
-        "})\n"
-        "print(json.dumps({'event': 'init', 'init': {'conversation_id': 'conv-kc-1'}}))\n"
-        "print(json.dumps({'event': 'result', 'result': {"
-        "'conversation_id': 'conv-kc-1', 'status': 'SUCCESS', 'response': resp}}))\n",
+        "sessions = {}\n"
+        "seq = 0\n"
+        "for raw in sys.stdin:\n"
+        "    line = raw.strip()\n"
+        "    if not line:\n"
+        "        continue\n"
+        "    msg = json.loads(line)\n"
+        "    mid = msg.get('id')\n"
+        "    method = msg.get('method')\n"
+        "    params = msg.get('params') or {}\n"
+        "    if method == 'initialize':\n"
+        "        print(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': {'protocolVersion': 1}}),"
+        " flush=True)\n"
+        "    elif method == 'session/new':\n"
+        "        seq += 1\n"
+        "        sid = f'agy-kc-{seq}'\n"
+        "        sessions[sid] = {\n"
+        "            'mcpServers': params.get('mcpServers', []),\n"
+        "            'meta': params.get('_meta', {}),\n"
+        "            'configs': {},\n"
+        "            'models_set': [],\n"
+        "        }\n"
+        "        print(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': {\n"
+        "            'sessionId': sid,\n"
+        "            'models': {'currentModelId': 'gemini-4-argon-medium', 'availableModels': [\n"
+        "                {'modelId': 'gemini-4-argon-medium', 'name': 'Gemini 4 Argon'}\n"
+        "            ]},\n"
+        "            'configOptions': [{'id': 'thought_level', 'options': [\n"
+        "                {'value': 'low'}, {'value': 'medium'}, {'value': 'high'}\n"
+        "            ]}],\n"
+        "        }}), flush=True)\n"
+        "    elif method == 'session/set_config_option':\n"
+        "        s = sessions.get(params.get('sessionId'), {})\n"
+        "        s.setdefault('configs', {})[params.get('configId')] = params.get('value')\n"
+        "        print(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': {}}), flush=True)\n"
+        "    elif method == 'session/set_model':\n"
+        "        s = sessions.get(params.get('sessionId'), {})\n"
+        "        s.setdefault('models_set', []).append(params.get('modelId'))\n"
+        "        print(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': {}}), flush=True)\n"
+        "    elif method == 'session/close':\n"
+        "        print(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': {}}), flush=True)\n"
+        "    elif method == 'session/prompt':\n"
+        "        sid = params['sessionId']\n"
+        "        s = sessions[sid]\n"
+        "        resp = json.dumps({\n"
+        "            'procStubToken': os.environ.get('KIROCREW_STUB_SESSION_TOKEN'),\n"
+        "            'mcpServers': s['mcpServers'],\n"
+        "            'systemPromptAppend': s['meta'].get('antigravity', {})"
+        ".get('systemPrompt', {}).get('append', ''),\n"
+        "            'configs': s['configs'],\n"
+        "            'modelsSet': s['models_set'],\n"
+        "            'promptBlocks': params.get('prompt', []),\n"
+        "        })\n"
+        "        print(json.dumps({'jsonrpc': '2.0', 'method': 'session/update', 'params': {\n"
+        "            'sessionId': sid,\n"
+        "            'update': {'sessionUpdate': 'agent_message_chunk',"
+        " 'content': {'type': 'text', 'text': resp}},\n"
+        "        }}), flush=True)\n"
+        "        print(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': {"
+        "'stopReason': 'end_turn'}}), flush=True)\n",
         encoding="utf-8",
     )
     fake_agy.chmod(fake_agy.stat().st_mode | stat.S_IEXEC)
@@ -387,50 +456,49 @@ async def test_prompt_isolates_per_session_mcp_token_and_injects_spawn_run_routi
         encoding="utf-8",
     )
 
-    from agy_acp.providers.agy_cli_provider import AgyCliProvider
-
-    cli = AgyCliProvider(bin_path=fake_agy, save_dir=tmp_path)
+    cli = AgyAcpClientProvider(bin_path=fake_agy, save_dir=tmp_path)
     mgr = SessionManager(save_dir=tmp_path, cli_provider=cli, default_model="gemini-4-argon-medium")
+    try:
+        parent = await mgr.create_session(
+            cwd=str(tmp_path),
+            mcp_servers=[
+                {
+                    "name": "kirocrew-core",
+                    "command": "kirocrew",
+                    "args": ["mcp-core"],
+                    "env": [{"name": "KIROCREW_STUB_SESSION_TOKEN", "value": "tok-parent-aaa"}],
+                }
+            ],
+        )
+        child = await mgr.create_session(cwd=str(tmp_path), mcp_servers=[])
+        await mgr.set_mode(session_id=child["sessionId"], mode_id="egm--zoom-out")
 
-    parent = await mgr.create_session(
-        cwd=str(tmp_path),
-        mcp_servers=[
-            {
-                "name": "kirocrew-core",
-                "command": "kirocrew",
-                "args": ["mcp-core"],
-                "env": [{"name": "KIROCREW_STUB_SESSION_TOKEN", "value": "tok-parent-aaa"}],
-            }
-        ],
-    )
-    child = await mgr.create_session(cwd=str(tmp_path), mcp_servers=[])
-    await mgr.set_mode(session_id=child["sessionId"], mode_id="egm--zoom-out")
+        parent_res = await mgr.prompt(
+            session_id=parent["sessionId"],
+            prompt_blocks=[{"type": "text", "text": "Run drift review"}],
+        )
+        parent_payload = json.loads(parent_res["response"])
+        assert parent_payload["procStubToken"] is None
+        parent_mcp = parent_payload["mcpServers"][0]
+        parent_env = {item["name"]: item["value"] for item in parent_mcp["env"]}
+        assert parent_env["KIROCREW_STUB_SESSION_TOKEN"] == "tok-parent-aaa"
+        assert "spawn_run" in parent_payload["systemPromptAppend"]
+        assert "invoke_subagent" in parent_payload["systemPromptAppend"]
+        assert parent_payload["promptBlocks"] == [{"type": "text", "text": "Run drift review"}]
 
-    parent_res = await mgr.prompt(
-        session_id=parent["sessionId"],
-        prompt_blocks=[{"type": "text", "text": "Run drift review"}],
-    )
-    parent_payload = json.loads(parent_res["response"])
-    assert parent_payload["tok"] == "tok-parent-aaa"
-    assert parent_payload["route"] == "1"
-    assert "spawn_run" in parent_payload["prompt"]
-    assert "invoke_subagent" in parent_payload["prompt"]
-
-    child_res = await mgr.prompt(
-        session_id=child["sessionId"],
-        prompt_blocks=[{"type": "text", "text": "Audit architecture"}],
-    )
-    child_payload = json.loads(child_res["response"])
-    assert child_payload["tok"] == ""
-    assert child_payload["route"] == ""
-    assert "Read zoom_out.md strictly." in child_payload["prompt"]
-    assert "--mode" in child_payload["args"]
-    assert child_payload["args"][child_payload["args"].index("--mode") + 1] == "plan"
-    assert "auto" not in [
-        child_payload["args"][i + 1]
-        for i, flag in enumerate(child_payload["args"][:-1])
-        if flag == "--model"
-    ]
+        child_res = await mgr.prompt(
+            session_id=child["sessionId"],
+            prompt_blocks=[{"type": "text", "text": "Audit architecture"}],
+        )
+        child_payload = json.loads(child_res["response"])
+        assert child_payload["mcpServers"] == []
+        assert "Read zoom_out.md strictly." in child_payload["systemPromptAppend"]
+        assert "spawn_run" not in child_payload["systemPromptAppend"]
+        assert child_payload["configs"]["mode"] == "plan"
+        assert "auto" not in child_payload["modelsSet"]
+        assert not (tmp_path / "mcp_config.json").exists()
+    finally:
+        await mgr.close()
 
 
 async def test_kas_v3_custom_agents_modes_effort_and_spawn_run_routing(tmp_path: Path) -> None:
@@ -439,8 +507,8 @@ async def test_kas_v3_custom_agents_modes_effort_and_spawn_run_routing(tmp_path:
         _extract_session_mcp_env,
         _session_has_kirocrew_spawn_run,
     )
+    from agy_acp.logic.tool_classifier import PER_SESSION_MCP_ENV_KEYS
     from agy_acp.logic.wire import V3KasWireAdapter
-    from agy_acp.providers.agy_cli_provider import PER_SESSION_MCP_ENV_KEYS
 
     assert "KIROCREW_PORT" in PER_SESSION_MCP_ENV_KEYS
     assert "KIROCREW_HOME" in PER_SESSION_MCP_ENV_KEYS
@@ -630,10 +698,11 @@ async def test_evict_vs_delete_session_and_load_with_updated_mcp_and_turns(tmp_p
 
 async def test_concurrent_sessions_mcp_shim_isolation_and_prober(tmp_path: Path) -> None:
     """Verify concurrent sessions isolate conflicting MCP server args and probe session MCPs."""
-    import json
     import sys
 
+    from agy_acp.logic.session_manager import _extract_session_mcp_env
     from agy_acp.logic.wire import V3KasWireAdapter
+    from agy_acp.providers.agy_acp_client import format_acp_mcp_servers
 
     mcp_stub = tmp_path / "mcp_echo_stub.py"
     mcp_stub.write_text(
@@ -695,26 +764,38 @@ async def test_concurrent_sessions_mcp_shim_isolation_and_prober(tmp_path: Path)
     assert [t.name for t in statuses_b[0].tools] == ["tool_sessB_7002"]
     assert statuses_b[0].tools[0].description == "/home/b"
 
-    # Also verify mcp_config.json uses mux wrapper when conflicting args exist across sessions
-    mcp_cfg = json.loads((tmp_path / "mcp_config.json").read_text(encoding="utf-8"))
-    mux_entry = mcp_cfg["mcpServers"]["shared-shim"]
-    assert "mcp_session_mux" in " ".join(mux_entry["args"])
+    # Zero global mcp_config.json writes; each session passes isolated ACP mcpServers
+    assert not (tmp_path / "mcp_config.json").exists()
+    state_a = mgr.get_session(s_a["sessionId"])
+    state_b = mgr.get_session(s_b["sessionId"])
+    acp_a = format_acp_mcp_servers(
+        state_a["mcp_servers"], session_env=_extract_session_mcp_env(state_a)
+    )
+    acp_b = format_acp_mcp_servers(
+        state_b["mcp_servers"], session_env=_extract_session_mcp_env(state_b)
+    )
+    assert acp_a[0]["args"] == [str(mcp_stub), "--session", "sessA"]
+    assert acp_b[0]["args"] == [str(mcp_stub), "--session", "sessB"]
 
 
 async def test_wave5b_session_manager_security_and_lifecycle(tmp_path: Path) -> None:
     """Verify Wave 5B SessionManager fixes: tools=[], unshadowing, locks, mid-turn, delete MCP."""
-    import json
-
+    from agy_acp.logic.tool_classifier import PromptOutcome
     from agy_acp.logic.wire import V3KasWireAdapter
-    from agy_acp.providers.agy_cli_provider import AgyCliProvider, PromptOutcome
+    from agy_acp.providers.agy_acp_client import AgyAcpClientProvider
 
     turn_started = anyio.Event()
     allow_finish = anyio.Event()
     observed_skip_perms: list[bool | None] = []
+    closed_agy_ids: list[str] = []
     active_count = 0
     max_concurrent = 0
 
-    class _LockStubCli(AgyCliProvider):
+    class _LockStubCli(AgyAcpClientProvider):
+        async def close_backend_session(self, agy_session_id: str) -> dict[str, Any]:
+            closed_agy_ids.append(agy_session_id)
+            return {}
+
         async def stream_prompt(self, **kwargs: Any) -> PromptOutcome:
             nonlocal active_count, max_concurrent
             observed_skip_perms.append(kwargs.get("skip_permissions"))
@@ -840,26 +921,27 @@ async def test_wave5b_session_manager_security_and_lifecycle(tmp_path: Path) -> 
 
     assert mgr.state_store.get_session(sid2) is None
 
-    # 4. close_session(delete_persisted=True) removes exclusive MCP servers from mcp_config.json
-    # Re-create s2 holding shared-srv, then delete s1: exclusive-s1 removed, shared-srv retained
+    # 4. close_session(delete_persisted=True) closes backend session while leaving peer untouched
     s2_new = await mgr.create_session(
         cwd=str(tmp_path),
         mcp_servers=[{"name": "shared-srv", "command": "echo", "args": ["shared"]}],
     )
-    _ = s2_new
     await mgr.close_session(session_id=sid1, delete_persisted=True)
-    mcp_cfg = json.loads((tmp_path / "mcp_config.json").read_text(encoding="utf-8"))
-    assert "exclusive-s1" not in mcp_cfg["mcpServers"]
-    assert "shared-srv" in mcp_cfg["mcpServers"]
+    assert "conv-locked-1" in closed_agy_ids
+    assert not (tmp_path / "mcp_config.json").exists()
+    assert [s["name"] for s in mgr.get_session(s2_new["sessionId"])["mcp_servers"]] == [
+        "shared-srv"
+    ]
 
 
 async def test_effort_option_and_compact_sync_effort_suffixed_models(tmp_path: Path) -> None:
     """Verify effortLevel updates and compaction resolve sibling effort-suffixed models."""
-    from agy_acp.providers.agy_cli_provider import AgyCliProvider, PromptOutcome
+    from agy_acp.logic.tool_classifier import PromptOutcome
+    from agy_acp.providers.agy_acp_client import AgyAcpClientProvider
 
     seen_calls: list[tuple[str | None, str | None]] = []
 
-    class _RecordingCli(AgyCliProvider):
+    class _RecordingCli(AgyAcpClientProvider):
         async def stream_prompt(self, **kwargs: Any) -> PromptOutcome:
             seen_calls.append((kwargs.get("model"), kwargs.get("effort")))
             return PromptOutcome(
@@ -901,11 +983,12 @@ async def test_effort_option_and_compact_sync_effort_suffixed_models(tmp_path: P
 
 async def test_compact_session_and_prompt_propagate_outcome_error(tmp_path: Path) -> None:
     """Verify SessionManager propagates PromptOutcome.error for prompt() and compact_session()."""
-    from agy_acp.providers.agy_cli_provider import AgyCliProvider, PromptOutcome
+    from agy_acp.logic.tool_classifier import PromptOutcome
+    from agy_acp.providers.agy_acp_client import AgyAcpClientProvider
 
     fail_next = False
 
-    class _ErrStubCli(AgyCliProvider):
+    class _ErrStubCli(AgyAcpClientProvider):
         async def stream_prompt(self, **_kwargs: Any) -> PromptOutcome:
             if fail_next:
                 return PromptOutcome(
@@ -946,12 +1029,13 @@ async def test_session_manager_fork_steer_clear_context_knowledge_code_intel_and
     tmp_path: Path,
 ) -> None:
     """Verify 0.12.1 SessionManager fork, steer clear, context, knowledge, code intel, revert."""
+    from agy_acp.logic.tool_classifier import PromptOutcome
     from agy_acp.logic.wire import V3KasWireAdapter
-    from agy_acp.providers.agy_cli_provider import AgyCliProvider, PromptOutcome
+    from agy_acp.providers.agy_acp_client import AgyAcpClientProvider
 
     seen_prompts: list[dict[str, Any]] = []
 
-    class _RecordCli(AgyCliProvider):
+    class _RecordCli(AgyAcpClientProvider):
         async def stream_prompt(self, **kwargs: Any) -> PromptOutcome:
             seen_prompts.append(dict(kwargs))
             return PromptOutcome(
@@ -1049,13 +1133,14 @@ async def test_session_manager_fork_steer_clear_context_knowledge_code_intel_and
     assert "Turn 2" not in (fork_state["compactedSummary"] or "")
     assert fork_state["contextPaths"] == ["README.md"]
 
-    # Prompting the forked session consumes compactedSummary and reinjects agentPrompt
+    # Prompting the forked session consumes compactedSummary and supplies system_prompt_append
     await mgr.prompt(
         session_id=fork_sid,
         prompt_blocks=[{"type": "text", "text": "Forked turn"}],
     )
     assert "[Compacted Session Summary]" in seen_prompts[-1]["prompt"]
-    assert "Agent instructions" in seen_prompts[-1]["prompt"]
+    assert "[Compacted Session Summary]" in seen_prompts[-1]["content_blocks"][0]["text"]
+    assert "Agent instructions" in (seen_prompts[-1]["system_prompt_append"] or "")
 
     # 3. Revert checkpoint by message_id on original session
     rev_res = mgr.revert_checkpoint_by_message_id(sid, message_id="msg-2")

@@ -13,13 +13,14 @@ import pytest
 from agy_acp.commands.serve import normalize_agent_engine, run_stdio_server
 from agy_acp.logic.quota_tracker import QuotaTracker
 from agy_acp.logic.session_manager import SessionManager
+from agy_acp.logic.tool_classifier import FALLBACK_MODELS, PromptOutcome, ToolCallEvent
 from agy_acp.logic.wire import create_wire_adapter
-from agy_acp.providers.agy_cli_provider import AgyCliProvider, PromptOutcome, ToolCallEvent
+from agy_acp.providers.agy_acp_client import AgyAcpClientProvider
 from agy_acp.providers.quota_provider import QuotaProvider
 
 
-class _ServeStubCliProvider(AgyCliProvider):
-    """Stub CLI provider for exercising `serve.run_stdio_server` without external binaries."""
+class _ServeStubCliProvider(AgyAcpClientProvider):
+    """Stub ACP client provider for exercising `serve.run_stdio_server` offline."""
 
     def __init__(
         self,
@@ -31,6 +32,16 @@ class _ServeStubCliProvider(AgyCliProvider):
         super().__init__(save_dir=save_dir)
         self._permission_requested = permission_requested
         self._permission_outcomes = permission_outcomes
+
+    async def discover_models(
+        self,
+        *,
+        cwd: str = ".",
+        refresh: bool = False,
+    ) -> list[dict[str, str]]:
+        _ = (cwd, refresh)
+        await anyio.sleep(0)
+        return [dict(m) for m in FALLBACK_MODELS]
 
     async def run_slash_command(
         self,
@@ -57,7 +68,7 @@ class _ServeStubCliProvider(AgyCliProvider):
         self,
         *,
         cwd: str,
-        prompt: str,
+        prompt: str = "",
         session_id: str | None = None,
         conversation_id: str | None = None,
         on_tool_call: Callable[[ToolCallEvent], Awaitable[bool]] | None = None,
@@ -424,3 +435,35 @@ async def test_serve_default_write_bytes_offloads_to_thread_under_write_lock(
         == 0
     )
     assert json.loads(text_out.getvalue().strip())["id"] == 3
+
+
+async def test_run_stdio_server_closes_session_manager_on_exit(tmp_path: Path) -> None:
+    """Verify `run_stdio_server` calls `await session_manager.close()` in its `finally:` block."""
+    closed_calls: list[bool] = []
+
+    class _ClosingSessionManager(SessionManager):
+        async def close(self) -> None:
+            closed_calls.append(True)
+            await super().close()
+
+    cli = _ServeStubCliProvider(save_dir=tmp_path)
+    mgr = _ClosingSessionManager(save_dir=tmp_path, cli_provider=cli)
+    qt = QuotaTracker(provider=QuotaProvider(cli_provider=cli), state_store=cli.state_store)
+
+    async def _eof_readline() -> str:
+        await anyio.sleep(0)
+        return ""
+
+    async def _noop_write(_frame: bytes) -> None:
+        await anyio.sleep(0)
+
+    rc = await run_stdio_server(
+        session_manager=mgr,
+        wire_adapter=create_wire_adapter("v3"),
+        quota_tracker=qt,
+        save_dir=tmp_path,
+        stdin_readline=_eof_readline,
+        stdout_write=_noop_write,
+    )
+    assert rc == 0
+    assert closed_calls == [True]

@@ -84,22 +84,14 @@ def _write_custom_fake_agy(bin_path: Path, trace_file: Path, marker_file: Path) 
     """Write a scenario-driven fake `agy` binary testing KAS v3 tools, steer, and compaction."""
     bin_path.write_text(
         f"""#!/usr/bin/env python3
-import json, os, pathlib, sys, time
+import json, os, pathlib, queue, sys, threading, time
 
 args = sys.argv[1:]
-if args and args[0] == "models":
-    print("gemini-3.7-pro\\tGemini 3.7 Pro")
-    print("gemini-3.8-flash\\tGemini 3.8 Flash")
-    print("claude-sonnet-4-6\\tClaude Sonnet 4.6")
-    sys.exit(0)
 
 prompt = ""
-conv_id = ""
 for i, arg in enumerate(args):
     if arg in ("-p", "--print", "--prompt") and i + 1 < len(args):
         prompt = args[i + 1]
-    elif arg == "--conversation" and i + 1 < len(args):
-        conv_id = args[i + 1]
 
 if prompt == "/usage":
     print(json.dumps({{
@@ -127,240 +119,265 @@ if prompt == "/credits":
     }}))
     sys.exit(0)
 
-trace_entry = {{
-    "args": args,
-    "prompt": prompt,
-    "conversation_id": conv_id,
-    "env": {{
-        "KIROCREW_PORT": os.environ.get("KIROCREW_PORT", ""),
-        "KIROCREW_STUB_SESSION_TOKEN": os.environ.get("KIROCREW_STUB_SESSION_TOKEN", ""),
-        "KIROCREW_ROUTE_SPAWN_RUN": os.environ.get("KIROCREW_ROUTE_SPAWN_RUN", ""),
-    }},
-}}
-with open({str(trace_file)!r}, "a", encoding="utf-8") as fh:
-    fh.write(json.dumps(trace_entry) + "\\n")
+write_lock = threading.Lock()
+req_queue = queue.Queue()
+perm_waiters = {{}}
+cancel_events = {{}}
+sessions = {{}}
+seq = 0
+tc_seq = 0
 
-active_conv = conv_id or "conv-kas-v3-001"
-print(json.dumps({{"event": "init", "init": {{"conversation_id": active_conv}}}}), flush=True)
 
-if "Summarize our conversation so far" in prompt:
-    summary = "Summary: KAS v3 session compacted cleanly."
-    print(json.dumps({{
-        "event": "result",
-        "result": {{
-            "conversation_id": active_conv,
-            "status": "SUCCESS",
-            "response": summary,
-            "usage": {{"input_tokens": 18, "output_tokens": 9, "total_tokens": 27}},
-        }},
-    }}), flush=True)
-    sys.exit(0)
+def send(obj):
+    with write_lock:
+        sys.stdout.write(json.dumps(obj) + "\\n")
+        sys.stdout.flush()
 
-if "TRIGGER_SLOW_STEER" in prompt:
-    print(json.dumps({{
-        "event": "step_update",
-        "step_update": {{
-            "step_index": 1,
-            "step_type": "planner_response",
-            "status": "DONE",
-            "text": "Working before steer... ",
-        }},
-    }}), flush=True)
-    time.sleep(0.35)
-    print(json.dumps({{
-        "event": "result",
-        "result": {{
-            "conversation_id": active_conv,
-            "status": "SUCCESS",
-            "response": "Working before steer...",
-            "usage": {{"input_tokens": 10, "output_tokens": 6, "total_tokens": 16}},
-        }},
-    }}), flush=True)
-    sys.exit(0)
 
-if "TRIGGER_KAS_TOOLS" in prompt:
-    # 1. run_command
-    print(json.dumps({{
-        "event": "step_update",
-        "step_update": {{
-            "step_index": 1,
-            "step_type": "run_command",
-            "status": "RUNNING",
-            "tool_name": "run_command",
-            "tool_info": {{
-                "tool_name": "run_command",
-                "arguments": {{"CommandLine": "pytest -q"}},
-            }},
-        }},
-    }}), flush=True)
-    time.sleep(0.08)
-    print(json.dumps({{
-        "event": "step_update",
-        "step_update": {{
-            "step_index": 1,
-            "step_type": "run_command",
-            "status": "DONE",
-            "tool_name": "run_command",
-            "tool_info": {{
-                "tool_name": "run_command",
-                "arguments": {{"CommandLine": "pytest -q"}},
-                "output": "1 passed",
-            }},
-        }},
-    }}), flush=True)
+def reader():
+    for raw in sys.stdin:
+        line = raw.strip()
+        if not line:
+            continue
+        msg = json.loads(line)
+        if "method" not in msg and "id" in msg:
+            q = perm_waiters.get(msg["id"])
+            if q is not None:
+                q.put(msg)
+        elif msg.get("method") == "session/cancel":
+            sid = (msg.get("params") or {{}}).get("sessionId", "")
+            ev = cancel_events.get(sid)
+            if ev is not None:
+                ev.set()
+        else:
+            req_queue.put(msg)
+    req_queue.put(None)
 
-    # 2. edit_file -> str_replace + diff
-    print(json.dumps({{
-        "event": "step_update",
-        "step_update": {{
-            "step_index": 2,
-            "step_type": "edit_file",
-            "status": "RUNNING",
-            "tool_name": "edit_file",
-            "tool_info": {{
-                "tool_name": "edit_file",
-                "arguments": {{
-                    "Path": "/repo/app.py",
-                    "Target": "old_val = 1",
-                    "Replacement": "new_val = 2",
+
+threading.Thread(target=reader, daemon=True).start()
+
+MODELS = [
+    {{"modelId": "gemini-3.7-pro", "name": "Gemini 3.7 Pro"}},
+    {{"modelId": "gemini-3.8-flash", "name": "Gemini 3.8 Flash"}},
+    {{"modelId": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6"}},
+]
+CONFIG_OPTS = [
+    {{"id": "mode", "options": [{{"value": "default"}}, {{"value": "plan"}}]}},
+    {{"id": "thought_level", "options": [
+        {{"value": "low"}}, {{"value": "medium"}}, {{"value": "high"}},
+        {{"value": "xhigh"}}, {{"value": "max"}}
+    ]}},
+]
+
+
+def ask_tool(sid, tool_name, kind, raw_input, output_text):
+    global tc_seq
+    tc_seq += 1
+    tc_id = f"tc-kas-{{tc_seq}}"
+    tc_payload = {{
+        "toolCallId": tc_id,
+        "title": tool_name,
+        "kind": kind,
+        "status": "pending",
+        "rawInput": raw_input,
+        "_meta": {{"antigravity": {{"toolName": tool_name}}}},
+    }}
+    send({{"jsonrpc": "2.0", "method": "session/update", "params": {{
+        "sessionId": sid,
+        "update": {{"sessionUpdate": "tool_call", **tc_payload}},
+    }}}})
+    pq = queue.Queue()
+    pid = f"perm-{{tc_id}}"
+    perm_waiters[pid] = pq
+    send({{"jsonrpc": "2.0", "id": pid, "method": "session/request_permission", "params": {{
+        "sessionId": sid,
+        "toolCall": tc_payload,
+        "options": [
+            {{"optionId": "allow_once", "kind": "allow_once"}},
+            {{"optionId": "reject_once", "kind": "reject_once"}},
+        ],
+    }}}})
+    presp = pq.get(timeout=5.0)
+    perm_waiters.pop(pid, None)
+    opt = ((presp.get("result") or {{}}).get("outcome") or {{}}).get("optionId")
+    allowed = opt == "allow_once"
+    send({{"jsonrpc": "2.0", "method": "session/update", "params": {{
+        "sessionId": sid,
+        "update": {{
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": tc_id,
+            "status": "completed" if allowed else "failed",
+            "rawOutput": output_text if allowed else "Rejected",
+        }},
+    }}}})
+    return allowed
+
+
+while True:
+    msg = req_queue.get()
+    if msg is None:
+        break
+    mid = msg.get("id")
+    method = msg.get("method")
+    params = msg.get("params") or {{}}
+    if method == "initialize":
+        send({{"jsonrpc": "2.0", "id": mid, "result": {{
+            "protocolVersion": 1,
+            "agentCapabilities": {{"loadSession": True}},
+        }}}})
+    elif method == "session/new":
+        seq += 1
+        sid = f"conv-kas-v3-{{seq:03d}}"
+        sys_app = (
+            ((params.get("_meta") or {{}}).get("antigravity") or {{}})
+            .get("systemPrompt", {{}})
+            .get("append", "")
+        )
+        sessions[sid] = {{
+            "mcp_servers": params.get("mcpServers", []),
+            "system_prompt": sys_app,
+            "model": "gemini-3.7-pro",
+            "configs": {{}},
+        }}
+        cancel_events[sid] = threading.Event()
+        send({{"jsonrpc": "2.0", "id": mid, "result": {{
+            "sessionId": sid,
+            "models": {{"currentModelId": "gemini-3.7-pro", "availableModels": MODELS}},
+            "configOptions": CONFIG_OPTS,
+        }}}})
+    elif method == "session/load":
+        sid = params.get("sessionId") or "conv-kas-v3-001"
+        sys_app = (
+            ((params.get("_meta") or {{}}).get("antigravity") or {{}})
+            .get("systemPrompt", {{}})
+            .get("append", "")
+        )
+        s = sessions.setdefault(sid, {{
+            "mcp_servers": [],
+            "system_prompt": "",
+            "model": "gemini-3.7-pro",
+            "configs": {{}},
+        }})
+        if "mcpServers" in params:
+            s["mcp_servers"] = params["mcpServers"]
+        if sys_app:
+            s["system_prompt"] = sys_app
+        cancel_events.setdefault(sid, threading.Event())
+        send({{"jsonrpc": "2.0", "id": mid, "result": {{
+            "sessionId": sid,
+            "models": {{"currentModelId": s["model"], "availableModels": MODELS}},
+            "configOptions": CONFIG_OPTS,
+        }}}})
+    elif method == "session/set_model":
+        s = sessions.get(params.get("sessionId"), {{}})
+        if "modelId" in params:
+            s["model"] = params["modelId"]
+        send({{"jsonrpc": "2.0", "id": mid, "result": {{}}}})
+    elif method == "session/set_config_option":
+        s = sessions.get(params.get("sessionId"), {{}})
+        s.setdefault("configs", {{}})[params.get("configId")] = params.get("value")
+        send({{"jsonrpc": "2.0", "id": mid, "result": {{}}}})
+    elif method == "session/close":
+        send({{"jsonrpc": "2.0", "id": mid, "result": {{}}}})
+    elif method == "session/prompt":
+        sid = params["sessionId"]
+        s = sessions[sid]
+        ev = cancel_events.setdefault(sid, threading.Event())
+        ev.clear()
+        blocks = params.get("prompt") or []
+        text = "\\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+        trace_entry = {{
+            "args": args,
+            "prompt": text,
+            "conversation_id": sid,
+            "model": s.get("model", ""),
+            "configs": dict(s.get("configs", {{}})),
+            "system_prompt": s.get("system_prompt", ""),
+            "mcp_servers": s.get("mcp_servers", []),
+        }}
+        with open({str(trace_file)!r}, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(trace_entry) + "\\n")
+
+        if "Summarize our conversation so far" in text:
+            summary = "Summary: KAS v3 session compacted cleanly."
+            send({{"jsonrpc": "2.0", "method": "session/update", "params": {{
+                "sessionId": sid,
+                "update": {{
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {{"type": "text", "text": summary}},
                 }},
-            }},
-        }},
-    }}), flush=True)
-    time.sleep(0.08)
-    print(json.dumps({{
-        "event": "step_update",
-        "step_update": {{
-            "step_index": 2,
-            "step_type": "edit_file",
-            "status": "DONE",
-            "tool_name": "edit_file",
-            "tool_info": {{
-                "tool_name": "edit_file",
-                "arguments": {{
-                    "Path": "/repo/app.py",
-                    "Target": "old_val = 1",
-                    "Replacement": "new_val = 2",
+            }}}})
+            send({{"jsonrpc": "2.0", "method": "session/update", "params": {{
+                "sessionId": sid,
+                "update": {{"sessionUpdate": "usage_update", "used": 27, "size": 1000000}},
+            }}}})
+            send({{"jsonrpc": "2.0", "id": mid, "result": {{"stopReason": "end_turn"}}}})
+            continue
+
+        if "TRIGGER_SLOW_STEER" in text:
+            send({{"jsonrpc": "2.0", "method": "session/update", "params": {{
+                "sessionId": sid,
+                "update": {{
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {{"type": "text", "text": "Working before steer... "}},
                 }},
-                "output": "Edited /repo/app.py",
-            }},
-        }},
-    }}), flush=True)
+            }}}})
+            if ev.wait(0.5):
+                send({{"jsonrpc": "2.0", "id": mid, "result": {{"stopReason": "cancelled"}}}})
+                continue
+            send({{"jsonrpc": "2.0", "id": mid, "result": {{"stopReason": "end_turn"}}}})
+            continue
 
-    # 3. delete_file -> delete
-    print(json.dumps({{
-        "event": "step_update",
-        "step_update": {{
-            "step_index": 3,
-            "step_type": "delete_file",
-            "status": "RUNNING",
-            "tool_name": "delete_file",
-            "tool_info": {{
-                "tool_name": "delete_file",
-                "arguments": {{"Path": "/repo/obsolete.py"}},
-            }},
-        }},
-    }}), flush=True)
-    time.sleep(0.08)
-    print(json.dumps({{
-        "event": "step_update",
-        "step_update": {{
-            "step_index": 3,
-            "step_type": "delete_file",
-            "status": "DONE",
-            "tool_name": "delete_file",
-            "tool_info": {{
-                "tool_name": "delete_file",
-                "arguments": {{"Path": "/repo/obsolete.py"}},
-                "output": "Deleted",
-            }},
-        }},
-    }}), flush=True)
-
-    # 4. Allowed MCP tool: kirocrew-core/spawn_run (auto-approved by permissions!)
-    print(json.dumps({{
-        "event": "step_update",
-        "step_update": {{
-            "step_index": 4,
-            "step_type": "call_mcp_tool",
-            "status": "RUNNING",
-            "tool_name": "call_mcp_tool",
-            "tool_info": {{
-                "tool_name": "call_mcp_tool",
-                "arguments": {{
+        if "TRIGGER_KAS_TOOLS" in text:
+            ask_tool(sid, "run_command", "execute", {{"CommandLine": "pytest -q"}}, "1 passed")
+            ask_tool(
+                sid,
+                "edit_file",
+                "edit",
+                {{"Path": "/repo/app.py", "Target": "old_val = 1", "Replacement": "new_val = 2"}},
+                "Edited /repo/app.py",
+            )
+            ask_tool(sid, "delete_file", "delete", {{"Path": "/repo/obsolete.py"}}, "Deleted")
+            ask_tool(
+                sid,
+                "call_mcp_tool",
+                "other",
+                {{
                     "ServerName": "kirocrew-core",
                     "ToolName": "spawn_run",
                     "Arguments": {{"tasks": [{{"goal": "verify"}}]}},
                 }},
-            }},
-        }},
-    }}), flush=True)
-    time.sleep(0.05)
-    print(json.dumps({{
-        "event": "step_update",
-        "step_update": {{
-            "step_index": 4,
-            "step_type": "call_mcp_tool",
-            "status": "DONE",
-            "tool_name": "call_mcp_tool",
-            "tool_info": {{
-                "tool_name": "call_mcp_tool",
-                "arguments": {{
-                    "ServerName": "kirocrew-core",
-                    "ToolName": "spawn_run",
-                    "Arguments": {{"tasks": [{{"goal": "verify"}}]}},
-                }},
-                "output": "spawned",
-            }},
-        }},
-    }}), flush=True)
-
-    # 5. Unapproved MCP tool: ext-srv/drop_table (rejected -> aborts subprocess!)
-    print(json.dumps({{
-        "event": "step_update",
-        "step_update": {{
-            "step_index": 5,
-            "step_type": "call_mcp_tool",
-            "status": "RUNNING",
-            "tool_name": "call_mcp_tool",
-            "tool_info": {{
-                "tool_name": "call_mcp_tool",
-                "arguments": {{
+                "spawned",
+            )
+            allowed_drop = ask_tool(
+                sid,
+                "call_mcp_tool",
+                "other",
+                {{
                     "ServerName": "ext-srv",
                     "ToolName": "drop_table",
                     "Arguments": {{"table": "users"}},
                 }},
-            }},
-        }},
-    }}), flush=True)
-    time.sleep(0.4)
-    # Must NEVER execute if subprocess was terminated upon permission rejection!
-    pathlib.Path({str(marker_file)!r}).write_text("LEAKED_AFTER_REJECT", encoding="utf-8")
+                "dropped",
+            )
+            if allowed_drop:
+                pathlib.Path({str(marker_file)!r}).write_text(
+                    "LEAKED_AFTER_REJECT", encoding="utf-8"
+                )
 
-reply_text = f"ACK_V3: {{prompt.splitlines()[-1] if prompt else ''}}"
-print(json.dumps({{
-    "event": "step_update",
-    "step_update": {{
-        "step_index": 10,
-        "step_type": "planner_response",
-        "status": "DONE",
-        "text": reply_text,
-    }},
-}}), flush=True)
-print(json.dumps({{
-    "event": "result",
-    "result": {{
-        "conversation_id": active_conv,
-        "status": "SUCCESS",
-        "response": reply_text,
-        "usage": {{
-            "input_tokens": 25,
-            "output_tokens": 12,
-            "total_tokens": 37,
-            "context_tokens": 4200,
-        }},
-    }},
-}}), flush=True)
+        reply_text = f"ACK_V3: {{text.splitlines()[-1] if text else ''}}"
+        send({{"jsonrpc": "2.0", "method": "session/update", "params": {{
+            "sessionId": sid,
+            "update": {{
+                "sessionUpdate": "agent_message_chunk",
+                "content": {{"type": "text", "text": reply_text}},
+            }},
+        }}}})
+        send({{"jsonrpc": "2.0", "method": "session/update", "params": {{
+            "sessionId": sid,
+            "update": {{"sessionUpdate": "usage_update", "used": 4200, "size": 1000000}},
+        }}}})
+        send({{"jsonrpc": "2.0", "id": mid, "result": {{"stopReason": "end_turn"}}}})
 """,
         encoding="utf-8",
     )
@@ -514,14 +531,16 @@ async def test_kas_v3_initialize_mcp_catalog_custom_agent_and_mandate_injection(
         json.loads(line) for line in trace_file.read_text(encoding="utf-8").splitlines() if line
     ]
     assert len(traces) == 1
-    sent_prompt = traces[0]["prompt"]
-    assert "[AGENT MANDATE]" in sent_prompt
-    assert "[KIROCREW SUBAGENT ROUTING]" in sent_prompt
-    assert "[AGENT SYSTEM PROMPT]" in sent_prompt
-    assert "You are Kiro v3 custom agent." in sent_prompt
-    assert traces[0]["env"]["KIROCREW_PORT"] == "9444"
-    assert traces[0]["env"]["KIROCREW_STUB_SESSION_TOKEN"] == "tok-live-v3"
-    assert traces[0]["env"]["KIROCREW_ROUTE_SPAWN_RUN"] == "1"
+    sys_prompt = traces[0]["system_prompt"]
+    assert "[AGENT MANDATE]" in sys_prompt
+    assert "[KIROCREW SUBAGENT ROUTING]" in sys_prompt
+    assert "[AGENT SYSTEM PROMPT]" in sys_prompt
+    assert "You are Kiro v3 custom agent." in sys_prompt
+    assert traces[0]["prompt"] == "Verify turn 1 mandate"
+    mcp_env = {item["name"]: item["value"] for item in traces[0]["mcp_servers"][0]["env"]}
+    assert mcp_env["KIROCREW_PORT"] == "9444"
+    assert mcp_env["KIROCREW_STUB_SESSION_TOKEN"] == "tok-live-v3"
+    assert mcp_env["KIROCREW_ROUTE_SPAWN_RUN"] == "1"
 
 
 async def test_kas_v3_live_mcp_wire_reinjection_close_load_replay_order(
@@ -672,9 +691,8 @@ async def test_kas_v3_set_config_option_model_and_effort_level_xhigh(
     traces = [
         json.loads(line) for line in trace_file.read_text(encoding="utf-8").splitlines() if line
     ]
-    sent_args = traces[-1]["args"]
-    assert sent_args[sent_args.index("--model") + 1] == "claude-sonnet-4-6"
-    assert sent_args[sent_args.index("--effort") + 1] == "xhigh"
+    assert traces[-1]["model"] == "claude-sonnet-4-6"
+    assert traces[-1]["configs"]["thought_level"] == "xhigh"
 
 
 async def test_kas_v3_tool_call_envelopes_permissions_and_reject_abort(
@@ -918,7 +936,7 @@ async def test_kas_v3_compact_steer_reset_server_and_delete_extensions(
         json.loads(line) for line in trace_file.read_text(encoding="utf-8").splitlines() if line
     ]
     assert "[Compacted Session Summary]" in traces[-1]["prompt"]
-    assert "Persistent contract" in traces[-1]["prompt"]
+    assert "Persistent contract" in traces[-1]["system_prompt"]
 
     # 3. _kiro/mcp/resetServer -> re-probes updated tools_json
     tools_json.write_text(
@@ -996,23 +1014,17 @@ def _write_wave6_fake_agy(
     """Write fake `agy` binary supporting multi-turn `/usage` deltas and tool mount probes."""
     bin_path.write_text(
         f"""#!/usr/bin/env python3
-import json, pathlib, sys, time
+import json, pathlib, queue, sys, threading, time
 
 TURN_COUNTER = pathlib.Path({str(turn_counter_file)!r})
 LEAK_DIR = pathlib.Path({str(leak_dir)!r})
 
 args = sys.argv[1:]
-if args and args[0] == "models":
-    print("gemini-3.7-pro\\tGemini 3.7 Pro")
-    sys.exit(0)
 
 prompt = ""
-conv_id = ""
 for i, arg in enumerate(args):
     if arg in ("-p", "--print", "--prompt") and i + 1 < len(args):
         prompt = args[i + 1]
-    elif arg == "--conversation" and i + 1 < len(args):
-        conv_id = args[i + 1]
 
 if prompt == "/usage":
     turns = int(TURN_COUNTER.read_text(encoding="utf-8")) if TURN_COUNTER.is_file() else 0
@@ -1042,165 +1054,208 @@ if prompt == "/credits":
     }}))
     sys.exit(0)
 
-prev_turns = int(TURN_COUNTER.read_text(encoding="utf-8")) if TURN_COUNTER.is_file() else 0
-TURN_COUNTER.write_text(str(prev_turns + 1), encoding="utf-8")
+write_lock = threading.Lock()
+req_queue = queue.Queue()
+perm_waiters = {{}}
+sessions = {{}}
+seq = 0
+tc_seq = 0
 
-active_conv = conv_id or "conv-kas-wave6-001"
-print(json.dumps({{"event": "init", "init": {{"conversation_id": active_conv}}}}), flush=True)
 
-if "SCENARIO_MOUNT_ZERO_TOOLS" in prompt:
-    print(json.dumps({{
-        "event": "step_update",
-        "step_update": {{
-            "step_index": 1,
-            "step_type": "run_command",
-            "status": "RUNNING",
-            "tool_name": "run_command",
-            "tool_info": {{
-                "tool_name": "run_command",
-                "arguments": {{"CommandLine": "rm -rf /tmp/forbidden"}},
-            }},
-        }},
-    }}), flush=True)
-    time.sleep(0.35)
-    (LEAK_DIR / "zero_tools_leaked.txt").write_text("LEAKED", encoding="utf-8")
-    sys.exit(0)
+def send(obj):
+    with write_lock:
+        sys.stdout.write(json.dumps(obj) + "\\n")
+        sys.stdout.flush()
 
-if "SCENARIO_MOUNT_READ_ONLY" in prompt:
-    print(json.dumps({{
-        "event": "step_update",
-        "step_update": {{
-            "step_index": 1,
-            "step_type": "read_file",
-            "status": "RUNNING",
-            "tool_name": "read_file",
-            "tool_info": {{
-                "tool_name": "read_file",
-                "arguments": {{"Path": "/repo/allowed.txt"}},
-            }},
-        }},
-    }}), flush=True)
-    time.sleep(0.05)
-    print(json.dumps({{
-        "event": "step_update",
-        "step_update": {{
-            "step_index": 1,
-            "step_type": "read_file",
-            "status": "DONE",
-            "tool_name": "read_file",
-            "tool_info": {{
-                "tool_name": "read_file",
-                "arguments": {{"Path": "/repo/allowed.txt"}},
-                "output": "allowed contents",
-            }},
-        }},
-    }}), flush=True)
-    print(json.dumps({{
-        "event": "step_update",
-        "step_update": {{
-            "step_index": 2,
-            "step_type": "delete_file",
-            "status": "RUNNING",
-            "tool_name": "delete_file",
-            "tool_info": {{
-                "tool_name": "delete_file",
-                "arguments": {{"Path": "/repo/secret.txt"}},
-            }},
-        }},
-    }}), flush=True)
-    time.sleep(0.35)
-    (LEAK_DIR / "read_only_leaked.txt").write_text("LEAKED", encoding="utf-8")
-    sys.exit(0)
 
-if "SCENARIO_ALLOWED_FS_WRITE_ALIAS" in prompt:
-    print(json.dumps({{
-        "event": "step_update",
-        "step_update": {{
-            "step_index": 1,
-            "step_type": "edit_file",
-            "status": "RUNNING",
-            "tool_name": "edit_file",
-            "tool_info": {{
-                "tool_name": "edit_file",
-                "arguments": {{
-                    "Path": "/repo/module.py",
-                    "Target": "x = 1",
-                    "Replacement": "x = 2",
+def reader():
+    for raw in sys.stdin:
+        line = raw.strip()
+        if not line:
+            continue
+        msg = json.loads(line)
+        if "method" not in msg and "id" in msg:
+            q = perm_waiters.get(msg["id"])
+            if q is not None:
+                q.put(msg)
+        elif msg.get("method") == "session/cancel":
+            pass
+        else:
+            req_queue.put(msg)
+    req_queue.put(None)
+
+
+threading.Thread(target=reader, daemon=True).start()
+
+MODELS = [{{"modelId": "gemini-3.7-pro", "name": "Gemini 3.7 Pro"}}]
+CONFIG_OPTS = [
+    {{"id": "mode", "options": [{{"value": "default"}}, {{"value": "plan"}}]}},
+    {{"id": "thought_level", "options": [
+        {{"value": "low"}}, {{"value": "medium"}}, {{"value": "high"}}
+    ]}},
+]
+
+
+def ask_mutating_tool(sid, tool_name, kind, raw_input, output_text):
+    global tc_seq
+    tc_seq += 1
+    tc_id = f"tc-w6-{{tc_seq}}"
+    tc_payload = {{
+        "toolCallId": tc_id,
+        "title": tool_name,
+        "kind": kind,
+        "status": "pending",
+        "rawInput": raw_input,
+        "_meta": {{"antigravity": {{"toolName": tool_name}}}},
+    }}
+    send({{"jsonrpc": "2.0", "method": "session/update", "params": {{
+        "sessionId": sid,
+        "update": {{"sessionUpdate": "tool_call", **tc_payload}},
+    }}}})
+    pq = queue.Queue()
+    pid = f"perm-{{tc_id}}"
+    perm_waiters[pid] = pq
+    send({{"jsonrpc": "2.0", "id": pid, "method": "session/request_permission", "params": {{
+        "sessionId": sid,
+        "toolCall": tc_payload,
+        "options": [
+            {{"optionId": "allow_once", "kind": "allow_once"}},
+            {{"optionId": "reject_once", "kind": "reject_once"}},
+        ],
+    }}}})
+    presp = pq.get(timeout=5.0)
+    perm_waiters.pop(pid, None)
+    opt = ((presp.get("result") or {{}}).get("outcome") or {{}}).get("optionId")
+    allowed = opt == "allow_once"
+    send({{"jsonrpc": "2.0", "method": "session/update", "params": {{
+        "sessionId": sid,
+        "update": {{
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": tc_id,
+            "status": "completed" if allowed else "failed",
+            "rawOutput": output_text if allowed else "Rejected",
+        }},
+    }}}})
+    return allowed
+
+
+while True:
+    msg = req_queue.get()
+    if msg is None:
+        break
+    mid = msg.get("id")
+    method = msg.get("method")
+    params = msg.get("params") or {{}}
+    if method == "initialize":
+        send({{"jsonrpc": "2.0", "id": mid, "result": {{
+            "protocolVersion": 1,
+            "agentCapabilities": {{"loadSession": True}},
+        }}}})
+    elif method == "session/new":
+        seq += 1
+        sid = f"conv-kas-wave6-{{seq:03d}}"
+        sessions[sid] = {{}}
+        send({{"jsonrpc": "2.0", "id": mid, "result": {{
+            "sessionId": sid,
+            "models": {{"currentModelId": "gemini-3.7-pro", "availableModels": MODELS}},
+            "configOptions": CONFIG_OPTS,
+        }}}})
+    elif method == "session/load":
+        sid = params.get("sessionId") or "conv-kas-wave6-001"
+        sessions.setdefault(sid, {{}})
+        send({{"jsonrpc": "2.0", "id": mid, "result": {{
+            "sessionId": sid,
+            "models": {{"currentModelId": "gemini-3.7-pro", "availableModels": MODELS}},
+            "configOptions": CONFIG_OPTS,
+        }}}})
+    elif method in ("session/set_model", "session/set_config_option", "session/close"):
+        send({{"jsonrpc": "2.0", "id": mid, "result": {{}}}})
+    elif method == "session/prompt":
+        sid = params["sessionId"]
+        prev_turns = int(TURN_COUNTER.read_text(encoding="utf-8")) if TURN_COUNTER.is_file() else 0
+        TURN_COUNTER.write_text(str(prev_turns + 1), encoding="utf-8")
+        blocks = params.get("prompt") or []
+        text = "\\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+
+        last_line = text.splitlines()[-1] if text else ""
+
+        if "SCENARIO_MOUNT_ZERO_TOOLS" in last_line:
+            allowed = ask_mutating_tool(
+                sid, "run_command", "execute", {{"CommandLine": "rm -rf /tmp/forbidden"}}, "ran"
+            )
+            if allowed:
+                (LEAK_DIR / "zero_tools_leaked.txt").write_text("LEAKED", encoding="utf-8")
+            send({{"jsonrpc": "2.0", "id": mid, "result": {{"stopReason": "end_turn"}}}})
+            continue
+
+        if "SCENARIO_MOUNT_READ_ONLY" in last_line:
+            tc_seq += 1
+            ro_id = f"tc-w6-{{tc_seq}}"
+            send({{"jsonrpc": "2.0", "method": "session/update", "params": {{
+                "sessionId": sid,
+                "update": {{
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": ro_id,
+                    "title": "read_file",
+                    "kind": "read",
+                    "status": "in_progress",
+                    "rawInput": {{"Path": "/repo/allowed.txt"}},
+                    "_meta": {{"antigravity": {{"toolName": "read_file"}}}},
                 }},
-            }},
-        }},
-    }}), flush=True)
-    time.sleep(0.05)
-    print(json.dumps({{
-        "event": "step_update",
-        "step_update": {{
-            "step_index": 1,
-            "step_type": "edit_file",
-            "status": "DONE",
-            "tool_name": "edit_file",
-            "tool_info": {{
-                "tool_name": "edit_file",
-                "arguments": {{
-                    "Path": "/repo/module.py",
-                    "Target": "x = 1",
-                    "Replacement": "x = 2",
+            }}}})
+            send({{"jsonrpc": "2.0", "method": "session/update", "params": {{
+                "sessionId": sid,
+                "update": {{
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": ro_id,
+                    "status": "completed",
+                    "rawOutput": "allowed contents",
                 }},
-                "output": "Edited /repo/module.py",
-            }},
-        }},
-    }}), flush=True)
-    print(json.dumps({{
-        "event": "step_update",
-        "step_update": {{
-            "step_index": 2,
-            "step_type": "delete_file",
-            "status": "RUNNING",
-            "tool_name": "delete_file",
-            "tool_info": {{
-                "tool_name": "delete_file",
-                "arguments": {{"Path": "/repo/critical.py"}},
-            }},
-        }},
-    }}), flush=True)
-    time.sleep(0.35)
-    (LEAK_DIR / "fs_write_delete_leaked.txt").write_text("LEAKED", encoding="utf-8")
-    sys.exit(0)
+            }}}})
+            allowed = ask_mutating_tool(
+                sid, "delete_file", "delete", {{"Path": "/repo/secret.txt"}}, "deleted"
+            )
+            if allowed:
+                (LEAK_DIR / "read_only_leaked.txt").write_text("LEAKED", encoding="utf-8")
+            send({{"jsonrpc": "2.0", "id": mid, "result": {{"stopReason": "end_turn"}}}})
+            continue
 
-last_line = prompt.splitlines()[-1] if prompt else ""
-reply_text = f"WAVE6_ACK: {{last_line}}"
-print(json.dumps({{
-    "event": "step_update",
-    "step_update": {{
-        "step_index": 1,
-        "step_type": "thinking",
-        "status": "RUNNING",
-        "thinking_delta": "Reasoning about turn...",
-    }},
-}}), flush=True)
-print(json.dumps({{
-    "event": "step_update",
-    "step_update": {{
-        "step_index": 2,
-        "step_type": "planner_response",
-        "status": "DONE",
-        "text_delta": reply_text,
-        "usage": {{"input_tokens": 1200, "output_tokens": 300, "cache_read_tokens": 100}},
-    }},
-}}), flush=True)
-print(json.dumps({{
-    "event": "result",
-    "result": {{
-        "conversation_id": active_conv,
-        "status": "SUCCESS",
-        "response": reply_text,
-        "usage": {{
-            "input_tokens": 1200,
-            "output_tokens": 300,
-            "cache_read_tokens": 100,
-            "context_tokens": 3600,
-        }},
-    }},
-}}), flush=True)
+        if "SCENARIO_ALLOWED_FS_WRITE_ALIAS" in last_line:
+            ask_mutating_tool(
+                sid,
+                "edit_file",
+                "edit",
+                {{"Path": "/repo/module.py", "Target": "x = 1", "Replacement": "x = 2"}},
+                "Edited /repo/module.py",
+            )
+            allowed = ask_mutating_tool(
+                sid, "delete_file", "delete", {{"Path": "/repo/critical.py"}}, "deleted"
+            )
+            if allowed:
+                (LEAK_DIR / "fs_write_delete_leaked.txt").write_text("LEAKED", encoding="utf-8")
+            send({{"jsonrpc": "2.0", "id": mid, "result": {{"stopReason": "end_turn"}}}})
+            continue
+
+        reply_text = f"WAVE6_ACK: {{last_line}}"
+        send({{"jsonrpc": "2.0", "method": "session/update", "params": {{
+            "sessionId": sid,
+            "update": {{
+                "sessionUpdate": "agent_thought_chunk",
+                "content": {{"type": "text", "text": "Reasoning about turn..."}},
+            }},
+        }}}})
+        send({{"jsonrpc": "2.0", "method": "session/update", "params": {{
+            "sessionId": sid,
+            "update": {{
+                "sessionUpdate": "agent_message_chunk",
+                "content": {{"type": "text", "text": reply_text}},
+            }},
+        }}}})
+        send({{"jsonrpc": "2.0", "method": "session/update", "params": {{
+            "sessionId": sid,
+            "update": {{"sessionUpdate": "usage_update", "used": 1600, "size": 1000000}},
+        }}}})
+        send({{"jsonrpc": "2.0", "id": mid, "result": {{"stopReason": "end_turn"}}}})
 """,
         encoding="utf-8",
     )
@@ -1654,8 +1709,8 @@ async def test_kas_v3_carousel_prompt_and_session_load_render_markdown_images(
         "#!/usr/bin/env python3\n"
         "import json, sys\n"
         "args = sys.argv[1:]\n"
-        "if args and args[0] == 'models':\n"
-        "    print('gemini-3.7-pro\\tGemini 3.7 Pro')\n"
+        "if '-p' in args:\n"
+        "    print(json.dumps({'status': 'SUCCESS', 'command': {'name': 'quota', 'data': {}}}))\n"
         "    sys.exit(0)\n"
         "chunks = [\n"
         "    'Summary:\\n\\n```',\n"
@@ -1663,25 +1718,53 @@ async def test_kas_v3_carousel_prompt_and_session_load_render_markdown_images(
         "    '<!-- slide -->\\n![Shot B]'\n"
         "    '(file:///Users/benwart/.gemini/antigravity-cli/brain/id/b.png)\\n````\\n',\n"
         "]\n"
-        "init_ev = {'event': 'init', 'init': {'conversation_id': 'conv-car-e2e'}}\n"
-        "print(json.dumps(init_ev), flush=True)\n"
-        "for d in chunks:\n"
-        "    step = {\n"
-        "        'step_index': 1,\n"
-        "        'step_type': 'planner_response',\n"
-        "        'status': 'RUNNING',\n"
-        "        'text_delta': d,\n"
-        "    }\n"
-        "    print(json.dumps({'event': 'step_update', 'step_update': step}), flush=True)\n"
-        "print(json.dumps({\n"
-        "    'event': 'result',\n"
-        "    'result': {\n"
-        "        'conversation_id': 'conv-car-e2e',\n"
-        "        'status': 'SUCCESS',\n"
-        "        'response': ''.join(chunks),\n"
-        "        'usage': {'input_tokens': 10, 'output_tokens': 14, 'total_tokens': 24},\n"
-        "    },\n"
-        "}), flush=True)\n",
+        "seq = 0\n"
+        "for raw in sys.stdin:\n"
+        "    line = raw.strip()\n"
+        "    if not line:\n"
+        "        continue\n"
+        "    msg = json.loads(line)\n"
+        "    mid = msg.get('id')\n"
+        "    method = msg.get('method')\n"
+        "    params = msg.get('params') or {}\n"
+        "    if method == 'initialize':\n"
+        "        print(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': {"
+        "'protocolVersion': 1, 'agentCapabilities': {'loadSession': True}}}), flush=True)\n"
+        "    elif method == 'session/new':\n"
+        "        seq += 1\n"
+        "        sid = f'conv-car-e2e-{seq}'\n"
+        "        print(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': {\n"
+        "            'sessionId': sid,\n"
+        "            'models': {'currentModelId': 'gemini-3.7-pro', 'availableModels': [\n"
+        "                {'modelId': 'gemini-3.7-pro', 'name': 'Gemini 3.7 Pro'}\n"
+        "            ]},\n"
+        "            'configOptions': [],\n"
+        "        }}), flush=True)\n"
+        "    elif method == 'session/load':\n"
+        "        sid = params.get('sessionId') or 'conv-car-e2e-1'\n"
+        "        print(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': {\n"
+        "            'sessionId': sid,\n"
+        "            'models': {'currentModelId': 'gemini-3.7-pro', 'availableModels': [\n"
+        "                {'modelId': 'gemini-3.7-pro', 'name': 'Gemini 3.7 Pro'}\n"
+        "            ]},\n"
+        "            'configOptions': [],\n"
+        "        }}), flush=True)\n"
+        "    elif method in ('session/set_model', 'session/set_config_option', 'session/close'):\n"
+        "        print(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': {}}), flush=True)\n"
+        "    elif method == 'session/prompt':\n"
+        "        sid = params['sessionId']\n"
+        "        for d in chunks:\n"
+        "            print(json.dumps({'jsonrpc': '2.0', 'method': 'session/update', 'params': {\n"
+        "                'sessionId': sid,\n"
+        "                'update': {'sessionUpdate': 'agent_message_chunk',"
+        " 'content': {'type': 'text', 'text': d}},\n"
+        "            }}), flush=True)\n"
+        "        print(json.dumps({'jsonrpc': '2.0', 'method': 'session/update', 'params': {\n"
+        "            'sessionId': sid,\n"
+        "            'update': {'sessionUpdate': 'usage_update', 'used': 24, 'size': 1000000},\n"
+        "        }}), flush=True)\n"
+        "        print(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': {"
+        "'stopReason': 'end_turn'}}), flush=True)\n",
         encoding="utf-8",
     )
     carousel_bin.chmod(0o755)

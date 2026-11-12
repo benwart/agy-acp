@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import math
 import os
 import subprocess
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
@@ -16,37 +17,21 @@ import anyio
 import anyio.abc
 from anyio.streams.text import TextReceiveStream
 
-from agy_acp.logic.carousel_normalizer import CarouselStreamNormalizer
+from agy_acp.logic.tool_classifier import (
+    FALLBACK_MODELS,
+    PER_SESSION_MCP_ENV_KEYS,
+    PromptOutcome,
+    QueuedSteer,
+    ToolCallClassification,
+    ToolCallEvent,
+    classify_tool_call_step,
+    resolve_agy_binary,
+    resolve_model_for_effort,
+    translate_mcp_server,
+)
 from agy_acp.logic.wire.base import synthesize_task_command
 from agy_acp.providers.acp_logger import log_acp_event
 from agy_acp.providers.state_store import SqliteStateStoreProvider
-
-try:
-    from agy_acp.logic.tool_classifier import (  # ty: ignore[unresolved-import]
-        FALLBACK_MODELS,
-        PER_SESSION_MCP_ENV_KEYS,
-        PromptOutcome,
-        QueuedSteer,
-        ToolCallClassification,
-        ToolCallEvent,
-        classify_tool_call_step,
-        resolve_agy_binary,
-        resolve_model_for_effort,
-        translate_mcp_server,
-    )
-except ImportError:
-    from agy_acp.providers.agy_cli_provider import (
-        FALLBACK_MODELS,
-        PER_SESSION_MCP_ENV_KEYS,
-        PromptOutcome,
-        QueuedSteer,
-        ToolCallClassification,
-        ToolCallEvent,
-        classify_tool_call_step,
-        resolve_agy_binary,
-        resolve_model_for_effort,
-        translate_mcp_server,
-    )
 
 _NATIVE_SUBAGENT_TOOLS: frozenset[str] = frozenset(
     {
@@ -153,7 +138,7 @@ def format_acp_mcp_servers(
             else {}
         )
         if session_env is not None:
-            for env_key in PER_SESSION_MCP_ENV_KEYS:
+            for env_key in (*PER_SESSION_MCP_ENV_KEYS, "KIROCREW_ROUTE_SPAWN_RUN"):
                 val = session_env.get(env_key)
                 if isinstance(val, str) and val:
                     env_map[env_key] = val
@@ -522,7 +507,6 @@ class _ActiveTurnState:
     on_tool_call: Callable[[ToolCallEvent], Awaitable[bool]] | None
     on_tool_update: Callable[[ToolCallEvent], Awaitable[None]] | None
     on_usage: Callable[[int], Awaitable[None]] | None
-    normalizer: CarouselStreamNormalizer
     collected_texts: list[str]
     usage: dict[str, int]
     stream_lock: anyio.Lock = field(default_factory=anyio.Lock)
@@ -595,7 +579,15 @@ class _AcpSubprocessConnection:
         self._spawn_error: BaseException | None = None
         self._closed = False
         self._stderr_tail: list[str] = []
+        self._notif_send, self._notif_recv = anyio.create_memory_object_stream[dict[str, Any]](
+            math.inf
+        )
+        self._inflight_frames = 0
+        self._idle_event = anyio.Event()
+        self._idle_event.set()
         self.loaded_sessions: set[str] = set()
+        self.session_results: dict[str, dict[str, Any]] = {}
+        self.session_prefs: dict[str, tuple[str, str, str]] = {}
         self.initialized = False
 
     @property
@@ -724,6 +716,7 @@ class _AcpSubprocessConnection:
         try:
             async with proc:
                 async with anyio.create_task_group() as tg:
+                    tg.start_soon(self._notification_worker)
                     tg.start_soon(self._stdout_reader, proc, tg)
                     tg.start_soon(self._stderr_reader, proc)
                     tg.start_soon(self._shutdown_watcher, proc, tg)
@@ -806,6 +799,8 @@ class _AcpSubprocessConnection:
             pass
         finally:
             stderr_summary = "".join(self._stderr_tail[-20:]).strip()
+            with contextlib.suppress(Exception):
+                self._notif_send.close()
             self._fail_pending(
                 AgyAcpTransportError(
                     "agy acp stdout closed unexpectedly"
@@ -814,8 +809,37 @@ class _AcpSubprocessConnection:
             )
             self._shutdown_event.set()
 
+    def _begin_frame(self) -> None:
+        if self._inflight_frames == 0:
+            self._idle_event = anyio.Event()
+        self._inflight_frames += 1
+
+    def _finish_frame(self) -> None:
+        self._inflight_frames = max(0, self._inflight_frames - 1)
+        if self._inflight_frames == 0:
+            self._idle_event.set()
+
+    async def wait_idle(self) -> None:
+        """Wait until all inbound notifications and server requests received so far finish."""
+        while self._inflight_frames > 0:
+            await self._idle_event.wait()
+
+    async def _notification_worker(self) -> None:
+        with self._notif_recv:
+            async for msg in self._notif_recv:
+                try:
+                    await self._on_notification(self, msg)
+                finally:
+                    self._finish_frame()
+
+    async def _run_server_request(self, msg: dict[str, Any]) -> None:
+        try:
+            await self._on_server_request(self, msg)
+        finally:
+            self._finish_frame()
+
     def _route_frame(self, msg: dict[str, Any], tg: anyio.abc.TaskGroup) -> None:
-        """Dispatch JSON-RPC responses immediately and spawn requests/notifications via `tg`."""
+        """Dispatch JSON-RPC responses immediately, FIFO notifications, and async server RPCs."""
         has_method = isinstance(msg.get("method"), str) and bool(msg["method"])
         if not has_method and "id" in msg and ("result" in msg or "error" in msg):
             resp_id = msg["id"]
@@ -826,11 +850,16 @@ class _AcpSubprocessConnection:
             return
 
         if has_method and "id" in msg:
-            tg.start_soon(self._on_server_request, self, msg)
+            self._begin_frame()
+            tg.start_soon(self._run_server_request, msg)
             return
 
         if has_method:
-            tg.start_soon(self._on_notification, self, msg)
+            self._begin_frame()
+            try:
+                self._notif_send.send_nowait(msg)
+            except anyio.BrokenResourceError, anyio.ClosedResourceError, anyio.WouldBlock:
+                self._finish_frame()
 
 
 class AgyAcpClientProvider:
@@ -873,6 +902,11 @@ class AgyAcpClientProvider:
         return self._is_custom_store
 
     @property
+    def has_explicit_bin(self) -> bool:
+        """Return whether a binary path was explicitly configured via arg or `AGY_BIN`."""
+        return bool(self._explicit_bin or os.environ.get("AGY_BIN"))
+
+    @property
     def bin_path(self) -> str:
         """Resolve the `agy` CLI executable path dynamically."""
         return resolve_agy_binary(self._explicit_bin)
@@ -898,27 +932,24 @@ class AgyAcpClientProvider:
 
     aclose = close
 
-    def abort_active_process(self, session_id: str) -> bool:
-        """Compatibility no-op: `AgyAcpClientProvider` rejects via JSON-RPC with zero SIGKILL."""
-        _ = session_id
-        return False
-
-    def sync_mcp_servers(
+    async def run_slash_command(
         self,
-        mcp_servers: list[dict[str, Any]],
+        command: str,
         *,
-        remove_servers: list[str] | None = None,
+        cwd: str | None = None,
         session_id: str | None = None,
-    ) -> list[str]:
-        """Compatibility stub: `AgyAcpClientProvider` passes `mcpServers` per ACP session."""
-        _ = (remove_servers, session_id)
-        return [
-            str(srv.get("name") or "").strip()
-            for srv in mcp_servers
-            if isinstance(srv, Mapping)
-            and srv.get("disabled") is not True
-            and str(srv.get("name") or "").strip()
-        ]
+        timeout: float = 30.0,
+    ) -> dict[str, Any]:
+        """Run a non-interactive slash command (`agy -p <cmd> --output-format json`)."""
+        from agy_acp.providers.quota_provider import run_agy_slash_json
+
+        _ = session_id
+        return await run_agy_slash_json(
+            command,
+            agy_bin=self.bin_path,
+            cwd=cwd,
+            timeout=timeout,
+        )
 
     def _on_connection_disconnect(self, conn: _AcpSubprocessConnection) -> None:
         if self._conn is conn:
@@ -936,7 +967,9 @@ class AgyAcpClientProvider:
                 with contextlib.suppress(Exception):
                     await stale.close()
 
-            child_env = {**os.environ, **self._base_env}
+            scrubbed_keys = {*PER_SESSION_MCP_ENV_KEYS, "KIROCREW_ROUTE_SPAWN_RUN"}
+            child_env = {k: v for k, v in os.environ.items() if k not in scrubbed_keys}
+            child_env.update(self._base_env)
             child_env.setdefault("AGY_ACP_STATE_DB", str(self._store.db_path))
             conn = _AcpSubprocessConnection(
                 bin_path=self.bin_path,
@@ -1141,6 +1174,7 @@ class AgyAcpClientProvider:
             raise AgyAcpRpcError(-32603, "session/new returned empty sessionId")
 
         conn.loaded_sessions.add(agy_sid)
+        conn.session_results[agy_sid] = dict(res)
         models_block = res.get("models")
         raw_avail = (
             models_block.get("availableModels") if isinstance(models_block, Mapping) else None
@@ -1155,6 +1189,7 @@ class AgyAcpClientProvider:
             effort=effort,
             available_models=models,
         )
+        conn.session_prefs[agy_sid] = (model or "", mode, effort or "")
         return {
             "agySessionId": agy_sid,
             "models": models,
@@ -1210,6 +1245,7 @@ class AgyAcpClientProvider:
             )
 
         conn.loaded_sessions.add(loaded_sid)
+        conn.session_results[loaded_sid] = dict(res)
         models_block = res.get("models")
         raw_avail = (
             models_block.get("availableModels") if isinstance(models_block, Mapping) else None
@@ -1224,6 +1260,7 @@ class AgyAcpClientProvider:
             effort=effort,
             available_models=models,
         )
+        conn.session_prefs[loaded_sid] = (model or "", mode, effort or "")
         return {
             "agySessionId": loaded_sid,
             "models": models,
@@ -1259,11 +1296,20 @@ class AgyAcpClientProvider:
         )
         return res
 
+    def evict_backend_session(self, agy_session_id: str) -> None:
+        """Synchronously drop `agy_session_id` from loaded session tracking."""
+        if not agy_session_id or self._conn is None:
+            return
+        self._conn.loaded_sessions.discard(agy_session_id)
+        self._conn.session_results.pop(agy_session_id, None)
+        self._conn.session_prefs.pop(agy_session_id, None)
+
     async def close_backend_session(self, agy_session_id: str) -> dict[str, Any]:
         """Close `agy_session_id` via `session/close` and evict from loaded session set."""
+        await anyio.sleep(0)
         if not agy_session_id or self._conn is None or self._conn.is_closed:
             return {}
-        self._conn.loaded_sessions.discard(agy_session_id)
+        self.evict_backend_session(agy_session_id)
         with contextlib.suppress(AgyAcpError, TimeoutError, OSError):
             return await self._conn.request(
                 "session/close",
@@ -1370,13 +1416,6 @@ class AgyAcpClientProvider:
         dec_event = anyio.Event()
         turn.decision_events[tc_id] = dec_event
         turn.announced_tools.add(tc_id)
-
-        async with turn.stream_lock:
-            flushed = turn.normalizer.flush_prose_before_boundary()
-            if flushed:
-                turn.collected_texts.append(flushed)
-                if turn.on_text is not None:
-                    await turn.on_text(flushed)
 
         tool_cb = turn.on_tool_call
         if tool_cb is None:
@@ -1560,11 +1599,9 @@ class AgyAcpClientProvider:
             if delta:
                 turn.emitted_any_signal = True
                 async with turn.stream_lock:
-                    piece = turn.normalizer.feed(delta)
-                    if piece:
-                        turn.collected_texts.append(piece)
-                        if turn.on_text is not None:
-                            await turn.on_text(piece)
+                    turn.collected_texts.append(delta)
+                    if turn.on_text is not None:
+                        await turn.on_text(delta)
             return
 
         if kind == "usage_update":
@@ -1773,6 +1810,24 @@ class AgyAcpClientProvider:
                                 backend_info.get("fallbackFromModel") or fallback_from_model
                             )
                             conn = await self._ensure_connection()
+                        else:
+                            desired_prefs = (model or "", mode, effort or "")
+                            if conn.session_prefs.get(resolved_agy_sid) != desired_prefs:
+                                avail = list(self._cached_models) or self._store.load_models()
+                                pref_model, pref_fb = await self._apply_session_preferences(
+                                    conn,
+                                    resolved_agy_sid,
+                                    session_result=conn.session_results.get(resolved_agy_sid, {}),
+                                    model=model,
+                                    mode=mode,
+                                    effort=effort,
+                                    available_models=avail,
+                                )
+                                conn.session_prefs[resolved_agy_sid] = desired_prefs
+                                if pref_model:
+                                    resolved_model = pref_model
+                                if pref_fb:
+                                    fallback_from_model = pref_fb
                     else:
                         backend_info = await self.create_backend_session(
                             cwd=cwd,
@@ -1794,7 +1849,6 @@ class AgyAcpClientProvider:
                     break
 
                 self._session_to_agy_sid[sid] = resolved_agy_sid
-                normalizer = CarouselStreamNormalizer()
                 turn_state = _ActiveTurnState(
                     session_id=sid,
                     agy_session_id=resolved_agy_sid,
@@ -1806,7 +1860,6 @@ class AgyAcpClientProvider:
                     on_tool_call=on_tool_call,
                     on_tool_update=on_tool_update,
                     on_usage=on_usage,
-                    normalizer=normalizer,
                     collected_texts=collected_texts,
                     usage=usage,
                 )
@@ -1832,6 +1885,7 @@ class AgyAcpClientProvider:
                     outcome_error = exc.rpc_message
                 finally:
                     with anyio.move_on_after(1.0):
+                        await conn.wait_idle()
                         await turn_state.drained_event.wait()
                     self._turn_states.pop(resolved_agy_sid, None)
 
@@ -1853,9 +1907,6 @@ class AgyAcpClientProvider:
                 self._cancelled_sessions.discard(sid)
 
                 if was_user_cancelled:
-                    flushed = normalizer.flush()
-                    if flushed:
-                        collected_texts.append(flushed)
                     return PromptOutcome(
                         conversation_id=resolved_agy_sid,
                         stop_reason="cancelled",
@@ -1865,13 +1916,6 @@ class AgyAcpClientProvider:
                         resolved_model=resolved_model,
                         fallback_from_model=fallback_from_model,
                     )
-
-                async with turn_state.stream_lock:
-                    flushed = normalizer.flush()
-                    if flushed:
-                        collected_texts.append(flushed)
-                        if on_text is not None:
-                            await on_text(flushed)
 
                 if self._steer_queues.get(sid):
                     entries = self._pop_queued_steers(sid)

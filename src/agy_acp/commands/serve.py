@@ -126,10 +126,14 @@ async def run_stdio_server(
         pending_events.pop(rpc_id, None)
         return pending_results.pop(rpc_id, {})
 
+    active_session_manager = session_manager or SessionManager(
+        save_dir=save_dir,
+        wire_adapter=wire_adapter,
+    )
     dispatcher = AcpDispatcher(
         notification_sink=_notification_sink,
         client_rpc_caller=_client_rpc_caller,
-        session_manager=session_manager,
+        session_manager=active_session_manager,
         auth_manager=auth_manager,
         quota_tracker=quota_tracker,
         wire_adapter=wire_adapter,
@@ -185,72 +189,78 @@ async def run_stdio_server(
                     }
                 )
 
-    async with anyio.create_task_group() as tg:
-        try:
-            while True:
-                try:
-                    raw_line = await readline_fn()
-                except io.UnsupportedOperation, OSError:
-                    log_acp_event("stdin.io_error", save_dir_or_db=save_dir)
-                    break
-                if not raw_line:
-                    log_acp_event("stdin.eof", save_dir_or_db=save_dir)
-                    break
-                line = raw_line.strip()
-                if not line:
-                    continue
-                try:
-                    parsed = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    log_acp_event(
-                        "stdin.json_decode_error",
-                        save_dir_or_db=save_dir,
-                        line_length=len(line),
-                        error=str(exc),
-                    )
-                    continue
-                if not isinstance(parsed, dict):
-                    log_acp_event(
-                        "stdin.invalid_request",
-                        save_dir_or_db=save_dir,
-                        payload_type=type(parsed).__name__,
-                    )
-                    await _write_payload(
-                        {
-                            "jsonrpc": "2.0",
-                            "id": None,
-                            "error": {"code": -32600, "message": "Invalid Request"},
-                        }
-                    )
-                    continue
-
-                log_acp_event("stdin.frame", save_dir_or_db=save_dir, payload=parsed)
-                if "method" not in parsed and ("result" in parsed or "error" in parsed):
-                    resp_id = parsed.get("id")
-                    if not _is_valid_rpc_id(resp_id) or resp_id not in pending_events:
+    try:
+        async with anyio.create_task_group() as tg:
+            try:
+                while True:
+                    try:
+                        raw_line = await readline_fn()
+                    except io.UnsupportedOperation, OSError:
+                        log_acp_event("stdin.io_error", save_dir_or_db=save_dir)
+                        break
+                    if not raw_line:
+                        log_acp_event("stdin.eof", save_dir_or_db=save_dir)
+                        break
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    try:
+                        parsed = json.loads(line)
+                    except json.JSONDecodeError as exc:
                         log_acp_event(
-                            "stdin.ignored_client_rpc_response",
+                            "stdin.json_decode_error",
                             save_dir_or_db=save_dir,
-                            has_valid_id=_is_valid_rpc_id(resp_id),
+                            line_length=len(line),
+                            error=str(exc),
                         )
                         continue
-                    result_obj = parsed.get("result")
-                    log_acp_event(
-                        "stdin.client_rpc_response",
-                        save_dir_or_db=save_dir,
-                        id=resp_id,
-                        payload=parsed,
-                    )
-                    pending_results[resp_id] = result_obj if isinstance(result_obj, dict) else {}
-                    pending_event = pending_events.get(resp_id)
-                    if pending_event is not None:
-                        pending_event.set()
-                    continue
+                    if not isinstance(parsed, dict):
+                        log_acp_event(
+                            "stdin.invalid_request",
+                            save_dir_or_db=save_dir,
+                            payload_type=type(parsed).__name__,
+                        )
+                        await _write_payload(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": None,
+                                "error": {"code": -32600, "message": "Invalid Request"},
+                            }
+                        )
+                        continue
 
-                msg_meta = ("id" in parsed, parsed.get("id"), parsed.get("method"))
-                tg.start_soon(_dispatch_line, line, msg_meta)
-        finally:
-            _wake_all_pending_rpcs()
+                    log_acp_event("stdin.frame", save_dir_or_db=save_dir, payload=parsed)
+                    if "method" not in parsed and ("result" in parsed or "error" in parsed):
+                        resp_id = parsed.get("id")
+                        if not _is_valid_rpc_id(resp_id) or resp_id not in pending_events:
+                            log_acp_event(
+                                "stdin.ignored_client_rpc_response",
+                                save_dir_or_db=save_dir,
+                                has_valid_id=_is_valid_rpc_id(resp_id),
+                            )
+                            continue
+                        result_obj = parsed.get("result")
+                        log_acp_event(
+                            "stdin.client_rpc_response",
+                            save_dir_or_db=save_dir,
+                            id=resp_id,
+                            payload=parsed,
+                        )
+                        pending_results[resp_id] = (
+                            result_obj if isinstance(result_obj, dict) else {}
+                        )
+                        pending_event = pending_events.get(resp_id)
+                        if pending_event is not None:
+                            pending_event.set()
+                        continue
+
+                    msg_meta = ("id" in parsed, parsed.get("id"), parsed.get("method"))
+                    tg.start_soon(_dispatch_line, line, msg_meta)
+            finally:
+                _wake_all_pending_rpcs()
+    finally:
+        with anyio.CancelScope(shield=True):
+            await active_session_manager.close()
 
     log_acp_event("serve.stop", save_dir_or_db=save_dir)
     return 0
