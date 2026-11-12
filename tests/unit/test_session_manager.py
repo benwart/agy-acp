@@ -1193,3 +1193,47 @@ async def test_session_manager_fork_steer_clear_context_knowledge_code_intel_and
     assert ci_status["status"]["initialized"] is True
     assert "python" in ci_status["status"]["languages"]
     assert "rust" in ci_status["status"]["languages"]
+
+
+async def test_create_session_refreshes_expired_models_cache(tmp_path: Path) -> None:
+    """Verify create_session re-discovers models when `models_cache` is older than 24h."""
+    from datetime import UTC, datetime, timedelta
+
+    from agy_acp.providers.agy_acp_client import AgyAcpClientProvider
+
+    class _DiscoveryCli(AgyAcpClientProvider):
+        async def discover_models(
+            self,
+            *,
+            cwd: str = ".",
+            refresh: bool = False,
+        ) -> list[dict[str, str]]:
+            _ = (cwd, refresh)
+            fresh = [
+                {
+                    "modelId": "gemini-4-carbon-medium",
+                    "name": "Gemini 4 Carbon (Medium)",
+                    "description": "Gemini 4 Carbon (Medium)",
+                }
+            ]
+            self.state_store.save_models(fresh)
+            return fresh
+
+    cli = _DiscoveryCli(save_dir=tmp_path)
+    cli.state_store.save_models(
+        [
+            {
+                "modelId": "gemini-4-argon-medium",
+                "name": "Gemini 4 Argon (Medium)",
+                "description": "Old",
+            }
+        ]
+    )
+    stale_ts = (datetime.now(UTC) - timedelta(days=1, seconds=10)).isoformat()
+    with cli.state_store._connect() as conn:
+        conn.execute("UPDATE models_cache SET updated_at = ?", (stale_ts,))
+
+    mgr = SessionManager(save_dir=tmp_path, cli_provider=cli)
+    desc = await mgr.create_session(cwd=str(tmp_path))
+    available = desc["models"]["availableModels"]
+    assert [m["modelId"] for m in available] == ["gemini-4-carbon-medium"]

@@ -1028,12 +1028,11 @@ class AgyAcpClientProvider:
     ) -> list[dict[str, str]]:
         """Return cached `availableModels` or probe via `session/new` + `session/close`."""
         if not refresh:
-            if self._cached_models:
-                return [dict(m) for m in self._cached_models]
             stored = self._store.load_models()
             if stored:
                 self._cached_models = stored
                 return [dict(m) for m in stored]
+            self._cached_models = []
 
         resolved_cwd = str(Path(cwd).resolve()) if cwd else str(Path.cwd())
         temp_sid = ""
@@ -1067,6 +1066,9 @@ class AgyAcpClientProvider:
                         timeout=5.0,
                     )
 
+        stale = self._store.load_models(max_age_seconds=None)
+        if stale:
+            return [dict(m) for m in stale]
         return [dict(m) for m in FALLBACK_MODELS]
 
     async def _apply_session_preferences(

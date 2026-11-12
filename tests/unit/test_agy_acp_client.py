@@ -1291,3 +1291,53 @@ def test_normalize_tool_arguments_populates_tool_use_purpose_and_task_commands()
         tool_name="send_command_input",
     )
     assert norm_input["command"] == "send_command_input cmd-9"
+
+
+async def test_discover_models_refreshes_when_cache_older_than_one_day(tmp_path: Path) -> None:
+    """Verify `discover_models` refreshes expired cache and falls back to stale rows on error."""
+    from datetime import UTC, datetime, timedelta
+
+    script, state_file = _make_mock_agy(tmp_path)
+    store = SqliteStateStoreProvider(tmp_path)
+    stale_models = [
+        {
+            "modelId": "gemini-4-argon-medium",
+            "name": "Gemini 4 Argon (Medium)",
+            "description": "Old",
+        }
+    ]
+    store.save_models(stale_models)
+    stale_ts = (datetime.now(UTC) - timedelta(days=1, seconds=5)).isoformat()
+
+    async with AgyAcpClientProvider(
+        bin_path=script,
+        state_store=store,
+        env={"MOCK_AGY_STATE_FILE": str(state_file)},
+    ) as provider:
+        # Warm in-memory cache while fresh, then age SQLite rows past 24h TTL
+        assert [m["modelId"] for m in await provider.discover_models(refresh=False)] == [
+            "gemini-4-argon-medium"
+        ]
+        with store._connect() as conn:
+            conn.execute("UPDATE models_cache SET updated_at = ?", (stale_ts,))
+
+        refreshed = await provider.discover_models(cwd=str(tmp_path), refresh=False)
+        assert [m["modelId"] for m in refreshed] == [
+            "gemini-4-carbon-medium",
+            "gemini-4-carbon-high",
+            "gemini-4-carbon-low",
+        ]
+        assert store.load_models() == refreshed
+
+    # When live discovery fails and cache expired, fall back to stale rows before FALLBACK_MODELS
+    store.save_models(stale_models)
+    with store._connect() as conn:
+        conn.execute("UPDATE models_cache SET updated_at = ?", (stale_ts,))
+
+    async with AgyAcpClientProvider(
+        bin_path=script,
+        state_store=store,
+        env={"MOCK_AGY_STATE_FILE": str(state_file), "MOCK_AGY_FAIL_INIT": "1"},
+    ) as failing_provider:
+        fallback = await failing_provider.discover_models(cwd=str(tmp_path), refresh=False)
+        assert fallback == stale_models
