@@ -190,7 +190,7 @@ async def run_stdio_server(
                 )
 
     try:
-        async with anyio.create_task_group() as tg:
+        async with active_session_manager.cli_provider, anyio.create_task_group() as tg:
             try:
                 while True:
                     try:

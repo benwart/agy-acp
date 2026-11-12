@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 from pathlib import Path
 from typing import Any
 
 import anyio
+import pytest
 
 from agy_acp.logic.tool_classifier import FALLBACK_MODELS, ToolCallEvent
 from agy_acp.providers.agy_acp_client import (
@@ -49,7 +51,14 @@ def send_frame(payload: dict) -> None:
         sys.stdout.flush()
 
 
-append_record({"type": "spawn", "pid": os.getpid(), "argv": sys.argv[1:]})
+append_record({
+    "type": "spawn",
+    "pid": os.getpid(),
+    "argv": sys.argv[1:],
+    "pythoninspect": os.environ.get("PYTHONINSPECT"),
+    "pythonstartup": os.environ.get("PYTHONSTARTUP"),
+    "stub_token": os.environ.get("KIROCREW_STUB_SESSION_TOKEN"),
+})
 
 if os.environ.get("MOCK_AGY_FAIL_INIT") == "1":
     sys.exit(1)
@@ -319,6 +328,153 @@ def handle_prompt(req_id, params: dict) -> None:
             "result": {
                 "stopReason": "end_turn",
                 "usage": {"inputTokens": 20, "outputTokens": 6, "totalTokens": 26},
+            },
+        })
+        return
+
+    if "EMPTY_THEN_ENV_PERM" in text:
+        tc_id = "call_env_1"
+        perm_id = f"perm_{uuid.uuid4().hex[:8]}"
+        ev = threading.Event()
+        pending_perm_events[perm_id] = ev
+        send_frame({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": tc_id,
+                    "name": "edit_file",
+                    "status": "in_progress",
+                    "kind": "edit",
+                    "title": "edit_file",
+                    "rawInput": {},
+                },
+            },
+        })
+        time.sleep(0.04)
+        send_frame({
+            "jsonrpc": "2.0",
+            "id": perm_id,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": sid,
+                "toolCall": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": tc_id,
+                    "name": "edit_file",
+                    "args": {"Path": ".env"},
+                    "status": "pending",
+                    "kind": "edit",
+                    "title": "edit_file",
+                    "rawInput": {"Path": ".env"},
+                },
+                "options": [
+                    {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+                    {"optionId": "deny", "name": "Deny", "kind": "reject_once"},
+                ],
+            },
+        })
+        ev.wait(timeout=5.0)
+        outcome = perm_outcomes.get(perm_id, {}).get("outcome", {})
+        append_record({"type": "perm_outcome", "tool": "edit_file_env", "outcome": outcome})
+        if "DANGLING_NO_UPDATE" not in text:
+            send_frame({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": sid,
+                    "update": {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": tc_id,
+                        "name": "edit_file",
+                        "args": {"Path": ".env"},
+                        "status": "completed",
+                        "kind": "edit",
+                        "rawOutput": {"output": "LEAKED_ENV_SECRET=hunter2"},
+                    },
+                },
+            })
+        send_frame({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "stopReason": "end_turn",
+                "usage": {"inputTokens": 15, "outputTokens": 3, "totalTokens": 18},
+            },
+        })
+        return
+
+    if "READ_DENY_BUFFERED_LEAK" in text:
+        send_frame({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call_ro_leak",
+                    "name": "read_file",
+                    "args": {"Path": "/etc/passwd"},
+                    "status": "in_progress",
+                    "kind": "read",
+                    "rawInput": {"Path": "/etc/passwd"},
+                },
+            },
+        })
+        send_frame({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call_ro_leak",
+                    "name": "read_file",
+                    "args": {"Path": "/etc/passwd"},
+                    "status": "completed",
+                    "kind": "read",
+                    "rawOutput": {"output": "root:x:0:0"},
+                },
+            },
+        })
+        send_frame({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": {"type": "text", "text": "LEAKED_THOUGHT"},
+                },
+            },
+        })
+        send_frame({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": sid,
+                "update": {"sessionUpdate": "usage_update", "used": 9999},
+            },
+        })
+        send_frame({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "LEAKED_TEXT"},
+                },
+            },
+        })
+        send_frame({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "stopReason": "end_turn",
+                "usage": {"inputTokens": 10, "outputTokens": 1, "totalTokens": 11},
             },
         })
         return
@@ -1341,3 +1497,155 @@ async def test_discover_models_refreshes_when_cache_older_than_one_day(tmp_path:
     ) as failing_provider:
         fallback = await failing_provider.discover_models(cwd=str(tmp_path), refresh=False)
         assert fallback == stale_models
+
+
+async def test_w4_reevaluate_populated_input_fail_closed_callbacks_and_shielded_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify `[H-1]`, `[H-2]`, `[H-4]`, `[M-1]`, and `[L-2]` in `AgyAcpClientProvider`."""
+    monkeypatch.setenv("PYTHONINSPECT", "1")
+    monkeypatch.setenv("PYTHONSTARTUP", "/tmp/evil_startup.py")
+    monkeypatch.setenv("KIROCREW_STUB_SESSION_TOKEN", "leaked-tok")
+
+    script, state_file = _make_mock_agy(tmp_path)
+    store = SqliteStateStoreProvider(tmp_path / "w4_state")
+
+    async with AgyAcpClientProvider(
+        bin_path=script,
+        state_store=store,
+        env={"MOCK_AGY_STATE_FILE": str(state_file)},
+    ) as client:
+        # 1. [H-1] + [M-1]: Empty rawInput={} -> allow, then permission {"Path": ".env"} -> deny
+        seen_tool_calls: list[ToolCallEvent] = []
+        seen_tool_updates: list[ToolCallEvent] = []
+
+        async def policy_deny_dotenv(ev: ToolCallEvent) -> bool:
+            seen_tool_calls.append(ev)
+            path_val = str(ev.raw_input.get("path") or ev.raw_input.get("Path") or "")
+            return ".env" not in path_val
+
+        async def collect_updates(ev: ToolCallEvent) -> None:
+            seen_tool_updates.append(ev)
+
+        res_env = await client.stream_prompt(
+            cwd=str(tmp_path),
+            session_id="s-w4",
+            prompt="EMPTY_THEN_ENV_PERM",
+            on_tool_call=policy_deny_dotenv,
+            on_tool_update=collect_updates,
+        )
+        initial_pid = client.worker_pid
+        assert initial_pid is not None
+        assert len(seen_tool_calls) == 2
+        assert len(seen_tool_updates) == 1
+        assert seen_tool_updates[0].status == "failed"
+        assert "LEAKED_ENV_SECRET" not in seen_tool_updates[0].output
+
+        # Dangling rejected tool card without server `tool_call_update` still closes with "failed"
+        seen_tool_updates.clear()
+        await client.stream_prompt(
+            cwd=str(tmp_path),
+            session_id="s-w4",
+            agy_session_id=res_env.conversation_id,
+            prompt="EMPTY_THEN_ENV_PERM DANGLING_NO_UPDATE",
+            on_tool_call=policy_deny_dotenv,
+            on_tool_update=collect_updates,
+        )
+        assert len(seen_tool_updates) == 1
+        assert seen_tool_updates[0].status == "failed"
+
+        # 2. [M-1]: Policy denial without `request_permission` drops post-denial chunks & output
+        leaked_thoughts: list[str] = []
+        leaked_texts: list[str] = []
+        leaked_usages: list[int] = []
+        ro_updates: list[ToolCallEvent] = []
+
+        async def deny_all(_ev: ToolCallEvent) -> bool:
+            return False
+
+        async def rec_thought(t: str) -> None:
+            leaked_thoughts.append(t)
+
+        async def rec_text(t: str) -> None:
+            leaked_texts.append(t)
+
+        async def rec_usage(u: int) -> None:
+            leaked_usages.append(u)
+
+        async def rec_ro_update(ev: ToolCallEvent) -> None:
+            ro_updates.append(ev)
+
+        res_ro = await client.stream_prompt(
+            cwd=str(tmp_path),
+            session_id="s-w4-ro",
+            prompt="READ_DENY_BUFFERED_LEAK",
+            on_tool_call=deny_all,
+            on_tool_update=rec_ro_update,
+            on_thought=rec_thought,
+            on_text=rec_text,
+            on_usage=rec_usage,
+        )
+        assert leaked_thoughts == []
+        assert leaked_usages == []
+        assert "LEAKED_TEXT" not in "".join(leaked_texts)
+        assert "LEAKED_TEXT" not in res_ro.response
+        assert "not permitted" in res_ro.response
+        assert len(ro_updates) == 1
+        assert ro_updates[0].status == "failed"
+        assert "root:x:0:0" not in ro_updates[0].output
+
+        # 3. [H-2]: Callback exception fails closed (`reject_once`) without killing shared process
+        async def exploding_tool_cb(_ev: ToolCallEvent) -> bool:
+            raise RuntimeError("boom in on_tool_call")
+
+        async def exploding_text_cb(_txt: str) -> None:
+            raise ValueError("boom in on_text")
+
+        await client.stream_prompt(
+            cwd=str(tmp_path),
+            session_id="s-w4",
+            agy_session_id=res_env.conversation_id,
+            prompt="RUN_COMMAND_PERM",
+            on_tool_call=exploding_tool_cb,
+            on_text=exploding_text_cb,
+        )
+        assert client.worker_pid == initial_pid
+
+        records = _read_mock_records(state_file)
+        spawns = [r for r in records if r["type"] == "spawn"]
+        assert len(spawns) == 1
+        assert spawns[0]["pythoninspect"] is None
+        assert spawns[0]["pythonstartup"] is None
+        assert spawns[0]["stub_token"] is None
+
+        perm_outcomes = [r for r in records if r["type"] == "perm_outcome"]
+        assert perm_outcomes[0]["outcome"] == {"outcome": "selected", "optionId": "deny"}
+        assert perm_outcomes[1]["outcome"] == {"outcome": "selected", "optionId": "deny"}
+        assert perm_outcomes[2]["outcome"] == {"outcome": "selected", "optionId": "deny"}
+
+    # 4. [H-4]: Shielded close() reaps subprocess even under active outer task cancellation
+    cancel_client = AgyAcpClientProvider(
+        bin_path=script,
+        state_store=store,
+        env={"MOCK_AGY_STATE_FILE": str(state_file)},
+    )
+    spawned_pid: int | None = None
+    with anyio.move_on_after(0.05):
+        try:
+            await cancel_client.discover_models(cwd=str(tmp_path), refresh=True)
+            spawned_pid = cancel_client.worker_pid
+            await anyio.sleep(10.0)
+        finally:
+            await cancel_client.close()
+
+    assert spawned_pid is not None
+    assert cancel_client.worker_pid is None
+    for _ in range(40):
+        try:
+            os.kill(spawned_pid, 0)
+        except ProcessLookupError:
+            break
+        await anyio.sleep(0.02)
+    with pytest.raises(ProcessLookupError):
+        os.kill(spawned_pid, 0)

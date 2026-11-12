@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import hashlib
 import json
@@ -17,7 +16,9 @@ from pathlib import Path
 from typing import Any, Self
 
 import anyio
+import anyio.abc
 import pytest
+from anyio.streams.buffered import BufferedByteReceiveStream
 
 from agy_acp.logic.tool_classifier import FALLBACK_MODELS, resolve_agy_binary
 from agy_acp.providers.agy_acp_client import AgyAcpClientProvider, format_acp_mcp_servers
@@ -191,7 +192,7 @@ def _build_session_mcp_servers(
 
 
 async def _write_http_response(
-    writer: asyncio.StreamWriter,
+    stream: anyio.abc.ByteStream,
     status: str,
     body: bytes = b"",
 ) -> None:
@@ -203,41 +204,43 @@ async def _write_http_response(
         f"Content-Length: {len(body)}\r\n"
         "Connection: close\r\n\r\n"
     ).encode("latin-1")
-    writer.write(header + body)
-    await writer.drain()
+    await stream.send(header + body)
 
 
 class _LocalHttpMcpStub:
     """Minimal loopback Streamable HTTP MCP endpoint for zero-network session isolation tests."""
 
     def __init__(self) -> None:
-        self._server: asyncio.AbstractServer | None = None
+        self._stack: contextlib.AsyncExitStack | None = None
+        self._serve_tg: anyio.abc.TaskGroup | None = None
         self.port: int = 0
         self.requests: list[tuple[str, dict[str, str]]] = []
 
     async def __aenter__(self) -> Self:
-        self._server = await asyncio.start_server(self._handle_client, "127.0.0.1", 0)
-        sockets = self._server.sockets or ()
-        assert sockets, "Expected bound loopback socket"
-        self.port = int(sockets[0].getsockname()[1])
+        self._stack = contextlib.AsyncExitStack()
+        listener = await self._stack.enter_async_context(
+            await anyio.create_tcp_listener(local_host="127.0.0.1", local_port=0)
+        )
+        self.port = int(listener.extra(anyio.abc.SocketAttribute.local_port))
+        self._serve_tg = await self._stack.enter_async_context(anyio.create_task_group())
+        self._serve_tg.start_soon(listener.serve, self._handle_client)
         return self
 
     async def __aexit__(self, *_: object) -> None:
-        if self._server is not None:
-            self._server.close()
-            await self._server.wait_closed()
+        if self._serve_tg is not None:
+            self._serve_tg.cancel_scope.cancel()
+        if self._stack is not None:
+            await self._stack.aclose()
 
     def url_for(self, slug: str) -> str:
         """Return loopback HTTP MCP endpoint URL for `slug`."""
         return f"http://127.0.0.1:{self.port}/mcp/{slug}"
 
-    async def _handle_client(
-        self,
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
-    ) -> None:
+    async def _handle_client(self, stream: anyio.abc.SocketStream) -> None:
+        buffered = BufferedByteReceiveStream(stream)
         try:
-            request_line = await asyncio.wait_for(reader.readline(), timeout=2.0)
+            with anyio.fail_after(2.0):
+                request_line = await buffered.receive_until(b"\n", 8192)
             if not request_line:
                 return
             parts = request_line.decode("latin-1").strip().split(" ")
@@ -246,30 +249,31 @@ class _LocalHttpMcpStub:
 
             headers: dict[str, str] = {}
             while True:
-                hdr_line = await asyncio.wait_for(reader.readline(), timeout=2.0)
-                if not hdr_line or hdr_line in {b"\r\n", b"\n"}:
-                    break
+                with anyio.fail_after(2.0):
+                    hdr_line = await buffered.receive_until(b"\n", 8192)
                 decoded = hdr_line.decode("latin-1").strip()
+                if not decoded:
+                    break
                 if ":" in decoded:
                     key, val = decoded.split(":", 1)
                     headers[key.strip().lower()] = val.strip()
 
             self.requests.append((req_path, headers))
             content_len = int(headers.get("content-length", "0") or "0")
-            body = (
-                await asyncio.wait_for(reader.readexactly(content_len), timeout=2.0)
-                if content_len > 0
-                else b""
-            )
+            if content_len > 0:
+                with anyio.fail_after(2.0):
+                    body = await buffered.receive_exactly(content_len)
+            else:
+                body = b""
 
             if http_method != "POST":
-                await _write_http_response(writer, "405 Method Not Allowed")
+                await _write_http_response(stream, "405 Method Not Allowed")
                 return
 
             payload: dict[str, Any] = json.loads(body.decode("utf-8")) if body else {}
             req_id = payload.get("id")
             if req_id is None:
-                await _write_http_response(writer, "202 Accepted")
+                await _write_http_response(stream, "202 Accepted")
                 return
 
             rpc_method = str(payload.get("method") or "")
@@ -287,13 +291,12 @@ class _LocalHttpMcpStub:
             resp_bytes = json.dumps({"jsonrpc": "2.0", "id": req_id, "result": result}).encode(
                 "utf-8"
             )
-            await _write_http_response(writer, "200 OK", resp_bytes)
+            await _write_http_response(stream, "200 OK", resp_bytes)
         except Exception:
             pass
         finally:
             with contextlib.suppress(Exception):
-                writer.close()
-                await writer.wait_closed()
+                await stream.aclose()
 
 
 async def test_live_agy_acp_initialize_and_discover_models(
@@ -373,23 +376,30 @@ async def test_live_agy_acp_per_session_mcp_isolation_without_touching_global_mc
         formatted_beta = format_acp_mcp_servers(mcp_beta, session_env=env_beta)
         assert formatted_alpha != formatted_beta
 
-        provider = AgyAcpClientProvider(bin_path=LIVE_AGY_BIN, save_dir=tmp_path)
         worker_pid: int | None = None
-        try:
-            session_alpha, session_beta = await asyncio.gather(
-                provider.create_backend_session(
-                    cwd=str(cwd_alpha),
-                    mcp_servers=mcp_alpha,
-                    system_prompt_append=mandate_alpha,
-                    session_env=env_alpha,
-                ),
-                provider.create_backend_session(
-                    cwd=str(cwd_beta),
-                    mcp_servers=mcp_beta,
-                    system_prompt_append=mandate_beta,
-                    session_env=env_beta,
-                ),
-            )
+        async with AgyAcpClientProvider(bin_path=LIVE_AGY_BIN, save_dir=tmp_path) as provider:
+            results: dict[str, dict[str, Any]] = {}
+
+            async def _create_one(
+                key: str,
+                ws: Path,
+                mcp: list[dict[str, Any]],
+                mandate: str,
+                s_env: dict[str, str],
+            ) -> None:
+                results[key] = await provider.create_backend_session(
+                    cwd=str(ws),
+                    mcp_servers=mcp,
+                    system_prompt_append=mandate,
+                    session_env=s_env,
+                )
+
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(_create_one, "alpha", cwd_alpha, mcp_alpha, mandate_alpha, env_alpha)
+                tg.start_soon(_create_one, "beta", cwd_beta, mcp_beta, mandate_beta, env_beta)
+
+            session_alpha = results["alpha"]
+            session_beta = results["beta"]
             worker_pid = provider.worker_pid
             assert worker_pid is not None and _is_pid_alive(worker_pid)
 
@@ -419,8 +429,6 @@ async def test_live_agy_acp_per_session_mcp_isolation_without_touching_global_mc
             if reloaded_sid != sid_alpha:
                 await provider.close_backend_session(sid_alpha)
             await provider.close_backend_session(sid_beta)
-        finally:
-            await provider.close()
 
         assert worker_pid is not None
         await _wait_for_process_group_exit(worker_pid)

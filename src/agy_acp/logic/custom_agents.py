@@ -8,6 +8,7 @@ import math
 import os
 import posixpath
 import re
+import stat
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -259,6 +260,61 @@ def parse_agent_spec_file(path: Path) -> dict[str, Any]:
     return _parse_agent_spec_text(path.read_text(encoding="utf-8"), path.suffix.lower())
 
 
+_MAX_PROMPT_FILE_BYTES = 1024 * 1024
+
+
+def read_contained_regular_bytes(
+    src_path: Path,
+    *,
+    root_dir: Path,
+    max_bytes: int,
+    allowed_suffixes: frozenset[str] | set[str] | None = None,
+) -> tuple[Path, bytes] | None:
+    """Atomically read a regular non-symlink file contained inside `root_dir` up to `max_bytes`."""
+    try:
+        resolved_root = root_dir.resolve()
+        candidate = src_path if src_path.is_absolute() else (resolved_root / src_path)
+        rel_check = (
+            resolved_root / src_path.relative_to(root_dir)
+            if src_path.is_absolute() and src_path.is_relative_to(root_dir)
+            else candidate
+        )
+        if candidate.is_symlink() or rel_check.is_symlink():
+            return None
+        resolved_target = candidate.resolve(strict=True)
+        if resolved_target == resolved_root or not resolved_target.is_relative_to(resolved_root):
+            return None
+        if allowed_suffixes is not None and resolved_target.suffix.lower() not in allowed_suffixes:
+            return None
+        if rel_check.is_relative_to(resolved_root) and any(
+            p.is_symlink()
+            for p in rel_check.parents
+            if p != resolved_root and p.is_relative_to(resolved_root)
+        ):
+            return None
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        fd = os.open(resolved_target, flags)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_size > max_bytes:
+                return None
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                buf = os.read(fd, min(65536, max_bytes + 1 - total))
+                if not buf:
+                    break
+                total += len(buf)
+                if total > max_bytes:
+                    return None
+                chunks.append(buf)
+        finally:
+            os.close(fd)
+        return resolved_target, b"".join(chunks)
+    except OSError, RuntimeError:
+        return None
+
+
 def resolve_contained_prompt_file(prompt_value: str, *, base_dir: Path) -> str:
     """Resolve a `file://` prompt strictly contained within `base_dir` (no `..` or symlinks out)."""
     if not prompt_value.startswith("file://"):
@@ -270,23 +326,21 @@ def resolve_contained_prompt_file(prompt_value: str, *, base_dir: Path) -> str:
             f"Refusing rooted or home-anchored file:// prompt reference: {prompt_value!r}"
         )
 
-    resolved_base = base_dir.resolve()
+    loaded = read_contained_regular_bytes(
+        Path(raw_ref),
+        root_dir=base_dir,
+        max_bytes=_MAX_PROMPT_FILE_BYTES,
+    )
+    if loaded is None:
+        raise CustomAgentSecurityError(
+            f"Refusing unsafe, missing, or oversized file:// prompt reference: {prompt_value!r}"
+        )
     try:
-        resolved_target = (resolved_base / raw_ref).resolve(strict=True)
-    except OSError as exc:
+        return loaded[1].decode("utf-8")
+    except UnicodeDecodeError as exc:
         raise CustomAgentSecurityError(
-            f"Prompt file reference could not be resolved inside {resolved_base}: {raw_ref!r}"
+            f"Prompt file reference is not valid UTF-8: {prompt_value!r}"
         ) from exc
-
-    if resolved_target == resolved_base or resolved_base not in resolved_target.parents:
-        raise CustomAgentSecurityError(
-            f"Refusing file:// prompt escaping {resolved_base}: {prompt_value!r}"
-        )
-    if not resolved_target.is_file():
-        raise CustomAgentSecurityError(
-            f"Prompt file reference is not a regular file: {prompt_value!r}"
-        )
-    return resolved_target.read_text(encoding="utf-8")
 
 
 def _resolve_spec_prompt_field(spec: dict[str, Any], *, base_dir: Path) -> None:
@@ -912,9 +966,8 @@ def load_kiro_agent_spec(
 
     search_dirs: list[tuple[Path, bool, Path]] = []
     safe_proj = _resolve_safe_project_agents_dir(cwd)
-    if safe_proj is not None and cwd:
-        with contextlib.suppress(OSError, RuntimeError):
-            search_dirs.append((safe_proj[0], True, Path(cwd).resolve()))
+    if safe_proj is not None:
+        search_dirs.append((safe_proj[0], True, safe_proj[1]))
 
     trusted_user_dir: Path | None = None
     if user_agents_dir is not None:
@@ -935,6 +988,8 @@ def load_kiro_agent_spec(
     disabled_names: list[str] = []
 
     for cand in candidates:
+        if "/" in cand or "\\" in cand or ".." in cand:
+            continue
         found_candidate = False
         for agents_dir, is_project_scope, containment_root in search_dirs:
             spec_path = agents_dir / f"{cand}.json"

@@ -19,6 +19,7 @@ from agy_acp.logic.custom_agents import (
     CustomAgentRegistry,
     CustomAgentSpec,
     load_kiro_agent_spec,
+    read_contained_regular_bytes,
 )
 from agy_acp.logic.mcp_catalog_prober import McpCatalogProber
 from agy_acp.logic.tool_classifier import (
@@ -226,26 +227,30 @@ def _format_remaining_turns_summary(turns: Sequence[Mapping[str, Any]]) -> str |
     return "\n\n".join(formatted_turns) if formatted_turns else None
 
 
+_MAX_INLINE_IMAGE_BYTES = 10 * 1024 * 1024
+
+
 def _read_contained_local_image_block(
     src_path: Path,
     *,
     cwd: str | None = None,
 ) -> dict[str, str] | None:
-    """Read a `cwd`-contained local image into an inline base64 ACP `image` content block."""
+    """Read a `cwd`-contained regular image (<= 10 MiB) into an inline base64 ACP `image` block."""
     if not cwd or not cwd.strip():
         return None
-    with contextlib.suppress(OSError, RuntimeError):
-        cwd_root = Path(cwd).resolve()
-        candidate = src_path if src_path.is_absolute() else (Path(cwd) / src_path)
-        resolved_src = candidate.resolve(strict=True)
-        if not resolved_src.is_relative_to(cwd_root) or not resolved_src.is_file():
-            return None
-        mime = _EXT_TO_MIME.get(resolved_src.suffix.lower())
-        if mime is None:
-            return None
-        encoded = base64.b64encode(resolved_src.read_bytes()).decode("ascii")
-        return {"type": "image", "data": encoded, "mimeType": mime}
-    return None
+    loaded = read_contained_regular_bytes(
+        src_path,
+        root_dir=Path(cwd),
+        max_bytes=_MAX_INLINE_IMAGE_BYTES,
+        allowed_suffixes=_IMAGE_EXTS,
+    )
+    if loaded is None:
+        return None
+    mime = _EXT_TO_MIME.get(loaded[0].suffix.lower())
+    if mime is None:
+        return None
+    encoded = base64.b64encode(loaded[1]).decode("ascii")
+    return {"type": "image", "data": encoded, "mimeType": mime}
 
 
 def _extract_markdown_local_image_blocks(
@@ -1088,6 +1093,7 @@ class SessionManager:
             draft_state["mcp_servers"] != state.get("mcp_servers")
             or draft_state.get("agentPrompt") != state.get("agentPrompt")
         ):
+            await self._cli.close_backend_session(old_agy_id)
             self._cli.evict_backend_session(old_agy_id)
 
         restored_state = self._store.upsert_session(draft_state)
@@ -1429,11 +1435,18 @@ class SessionManager:
                 prefix_sections.append(f"[Compacted Session Summary]\n{compacted_summary.strip()}")
                 consumed_compacted_summary = True
 
+            prefix_str = "\n\n".join(prefix_sections).strip()
             formatted_prompt, content_blocks = _build_acp_content_blocks(
                 prompt_blocks,
                 cwd=cwd,
-                prefix_text="\n\n".join(prefix_sections),
+                prefix_text=prefix_str,
             )
+            raw_user_text = (
+                formatted_prompt.removeprefix(prefix_str).lstrip()
+                if prefix_str
+                else formatted_prompt
+            )
+            dedup_user_text = "" if reinjected_prompt else raw_user_text
 
             outcome = None
             with self.turn_cancel_scope(session_id) as scope:
@@ -1453,7 +1466,7 @@ class SessionManager:
                     on_usage=on_usage,
                     on_steer_consumed=on_steer_consumed,
                     on_subagent_list=on_subagent_list,
-                    **self._session_stream_kwargs(session_id, session, user_text=formatted_prompt),
+                    **self._session_stream_kwargs(session_id, session, user_text=dedup_user_text),
                 )
 
             if (

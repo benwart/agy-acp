@@ -9,7 +9,7 @@ from typing import Any
 
 import anyio
 
-from agy_acp.logic.tool_classifier import resolve_agy_binary
+from agy_acp.logic.tool_classifier import build_scrubbed_subprocess_env, resolve_agy_binary
 
 
 async def run_agy_slash_json(
@@ -31,7 +31,7 @@ async def run_agy_slash_json(
     args.extend(["--output-format", "json", "-p", normalized])
 
     with anyio.fail_after(timeout):
-        result = await anyio.run_process(args, check=False)
+        result = await anyio.run_process(args, check=False, env=build_scrubbed_subprocess_env())
 
     stdout = result.stdout.decode("utf-8", errors="replace").strip()
     stderr = result.stderr.decode("utf-8", errors="replace").strip()

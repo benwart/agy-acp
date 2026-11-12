@@ -47,6 +47,21 @@ PER_SESSION_MCP_ENV_KEYS: frozenset[str] = frozenset(
     }
 )
 
+SCRUBBED_SUBPROCESS_ENV_KEYS: frozenset[str] = frozenset(
+    {
+        *PER_SESSION_MCP_ENV_KEYS,
+        "KIROCREW_ROUTE_SPAWN_RUN",
+        "PYTHONINSPECT",
+        "PYTHONSTARTUP",
+    }
+)
+
+
+def build_scrubbed_subprocess_env() -> dict[str, str]:
+    """Return `os.environ` without per-session MCP credentials or Python startup hooks."""
+    return {k: v for k, v in os.environ.items() if k not in SCRUBBED_SUBPROCESS_ENV_KEYS}
+
+
 PATH_ARGUMENT_KEYS: tuple[str, ...] = (
     "path",
     "Path",

@@ -785,11 +785,16 @@ class AcpDispatcher:
         self,
         session_id: str,
         event: ToolCallEvent,
+        *,
+        emit_start: bool = True,
     ) -> bool:
         session = self._session_manager.state_store.get_session(session_id) or {}
         known_mcp = self._session_manager.get_session_mcp_server_names(session_id)
         norm = _to_normalized_tool_event(event, known_mcp_servers=known_mcp)
-        await self._emit_notification(self._wire_adapter.build_tool_call_update(session_id, norm))
+        if emit_start:
+            await self._emit_notification(
+                self._wire_adapter.build_tool_call_update(session_id, norm)
+            )
         return await self._authorize_tool_call(
             session_id,
             session,
@@ -801,6 +806,8 @@ class AcpDispatcher:
         self,
         session_id: str,
         event: ToolCallEvent,
+        *,
+        emit_start: bool = True,
     ) -> bool:
         session = self._session_manager.state_store.get_session(session_id) or {}
         known_mcp = self._session_manager.get_session_mcp_server_names(session_id)
@@ -817,9 +824,10 @@ class AcpDispatcher:
             **({"locations": event.locations} if event.locations else {}),
             **({"content": event.diff_content} if event.diff_content else {}),
         }
-        await self._emit_notification(
-            _session_update_frame(session_id, {"sessionUpdate": "tool_call", **tool_descriptor})
-        )
+        if emit_start:
+            await self._emit_notification(
+                _session_update_frame(session_id, {"sessionUpdate": "tool_call", **tool_descriptor})
+            )
         return await self._authorize_tool_call(
             session_id,
             session,
@@ -1027,11 +1035,25 @@ class AcpDispatcher:
         async def _on_text(chunk: str) -> None:
             await _emit_message_piece(carousel_normalizer.feed(chunk))
 
+        announced_tool_ids: set[str] = set()
+        persisted_prompt_blocks: list[dict[str, Any]] = list(prompt_blocks)
+
         async def _on_tool_call(event: ToolCallEvent) -> bool:
-            await _emit_message_piece(carousel_normalizer.flush_prose_before_boundary())
+            first_announce = event.tool_call_id not in announced_tool_ids
+            announced_tool_ids.add(event.tool_call_id)
+            if first_announce:
+                await _emit_message_piece(carousel_normalizer.flush_prose_before_boundary())
             if self._wire_adapter.engine_id == "v3":
-                return await self._handle_v3_tool_call(session_id, event)
-            return await self._handle_v2_tool_call(session_id, event)
+                return await self._handle_v3_tool_call(
+                    session_id,
+                    event,
+                    emit_start=first_announce,
+                )
+            return await self._handle_v2_tool_call(
+                session_id,
+                event,
+                emit_start=first_announce,
+            )
 
         async def _on_tool_update(event: ToolCallEvent) -> None:
             allowed = event.status != "failed"
@@ -1082,6 +1104,8 @@ class AcpDispatcher:
                 await self._emit_notification(notif)
 
         async def _on_steer_consumed(raw_content: str) -> None:
+            if raw_content.strip():
+                persisted_prompt_blocks.append({"type": "text", "text": raw_content})
             await _emit_message_piece(carousel_normalizer.flush_prose_before_boundary())
             await self._emit_notification(
                 self._wire_adapter.build_steering_notification(
@@ -1137,7 +1161,7 @@ class AcpDispatcher:
             self._session_manager.state_store.append_session_turn(
                 session_id=session_id,
                 user_message_id=user_message_id,
-                prompt_blocks=prompt_blocks,
+                prompt_blocks=persisted_prompt_blocks,
                 assistant_text=assistant_text,
             )
 
@@ -1699,10 +1723,19 @@ class AcpDispatcher:
             )
             if session_id is None:
                 return err
+            steer_blocks = [b for b in raw_prompt if isinstance(b, dict)]
             queued = await self._session_manager.steer(
                 session_id=session_id,
-                prompt_blocks=[b for b in raw_prompt if isinstance(b, dict)],
+                prompt_blocks=steer_blocks,
             )
+            if queued:
+                await self._emit_notification(
+                    self._wire_adapter.build_steering_notification(
+                        session_id,
+                        "queued",
+                        self._extract_prompt_text(steer_blocks),
+                    )
+                )
             return (
                 _jsonrpc_result(message_id, {"outcome": "injected" if queued else "failed"})
                 if is_request

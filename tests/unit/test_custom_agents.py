@@ -689,3 +689,81 @@ def test_legacy_load_kiro_agent_spec_and_mcp_servers_in_custom_agents(tmp_path: 
     empty_spec = load_kiro_agent_spec("empty-tools", cwd=str(repo), include_home=False)
     assert empty_spec["tools"] == []
     assert empty_spec["read_only"] is True
+
+
+async def test_w4_prompt_file_atomic_regular_cap_and_agent_candidate_containment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify `[H-5]`, `[L-1]`, and `[L-2]` security hardening in custom_agents & quota_provider."""
+    import os
+
+    from agy_acp.logic.custom_agents import (
+        CustomAgentSecurityError,
+        load_kiro_agent_spec,
+        resolve_contained_prompt_file,
+    )
+    from agy_acp.providers.quota_provider import run_agy_slash_json
+
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    real_prompt = agents_dir / "real.md"
+    real_prompt.write_text("Valid prompt", encoding="utf-8")
+    assert resolve_contained_prompt_file("file://real.md", base_dir=agents_dir) == "Valid prompt"
+
+    # In-directory symlink must be rejected by O_NOFOLLOW / symlink check
+    in_dir_link = agents_dir / "link.md"
+    in_dir_link.symlink_to(real_prompt)
+    with pytest.raises(CustomAgentSecurityError):
+        resolve_contained_prompt_file("file://link.md", base_dir=agents_dir)
+
+    # Oversized prompt file (> 1 MiB) must be rejected
+    oversized = agents_dir / "oversized.md"
+    oversized.write_bytes(b"a" * (1024 * 1024 + 1))
+    with pytest.raises(CustomAgentSecurityError):
+        resolve_contained_prompt_file("file://oversized.md", base_dir=agents_dir)
+
+    # FIFO non-regular file must not block or succeed
+    if hasattr(os, "mkfifo"):
+        fifo_path = agents_dir / "pipe.md"
+        os.mkfifo(fifo_path)
+        with pytest.raises(CustomAgentSecurityError):
+            resolve_contained_prompt_file("file://pipe.md", base_dir=agents_dir)
+
+    # [L-1]: load_kiro_agent_spec must reject traversal out of .kiro/agents into <cwd>/*.json
+    repo = tmp_path / "repo"
+    (repo / ".kiro" / "agents").mkdir(parents=True)
+    (repo / "escaped.json").write_text(
+        json.dumps({"name": "escaped", "prompt": "ESCAPED_PROMPT"}),
+        encoding="utf-8",
+    )
+    escaped_spec = load_kiro_agent_spec(
+        "kirocrew/../../../repo/escaped",
+        cwd=str(repo),
+        include_home=False,
+    )
+    assert escaped_spec["prompt"] is None
+    escaped_rel = load_kiro_agent_spec("kirocrew/../../escaped", cwd=str(repo), include_home=False)
+    assert escaped_rel["prompt"] is None
+
+    # [L-2]: run_agy_slash_json scrubs PER_SESSION_MCP_ENV_KEYS + PYTHONINSPECT + PYTHONSTARTUP
+    env_dump_bin = tmp_path / "fake_agy_env.py"
+    env_dump_bin.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os\n"
+        "print(json.dumps({\n"
+        "  'token': os.environ.get('KIROCREW_STUB_SESSION_TOKEN'),\n"
+        "  'route': os.environ.get('KIROCREW_ROUTE_SPAWN_RUN'),\n"
+        "  'inspect': os.environ.get('PYTHONINSPECT'),\n"
+        "  'startup': os.environ.get('PYTHONSTARTUP'),\n"
+        "}))\n",
+        encoding="utf-8",
+    )
+    env_dump_bin.chmod(0o755)
+    monkeypatch.setenv("KIROCREW_STUB_SESSION_TOKEN", "secret-tok")
+    monkeypatch.setenv("KIROCREW_ROUTE_SPAWN_RUN", "1")
+    monkeypatch.setenv("PYTHONINSPECT", "1")
+    monkeypatch.setenv("PYTHONSTARTUP", "/tmp/evil.py")
+
+    dumped = await run_agy_slash_json("/usage", agy_bin=env_dump_bin)
+    assert dumped == {"token": None, "route": None, "inspect": None, "startup": None}

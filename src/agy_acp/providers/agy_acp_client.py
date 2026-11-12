@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import json
 import math
 import os
+import signal
 import subprocess
 from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -27,6 +27,7 @@ from agy_acp.logic.tool_classifier import (
     ToolCallEvent,
     _extract_first_str,
     _pairs_to_dict,
+    build_scrubbed_subprocess_env,
     classify_tool_call_step,
     resolve_agy_binary,
     resolve_model_for_effort,
@@ -74,6 +75,42 @@ def _unlink_temp_files(paths: Iterable[Path]) -> None:
     for tmp in paths:
         with contextlib.suppress(OSError):
             tmp.unlink(missing_ok=True)
+
+
+def _signal_process_group(proc: anyio.abc.Process, sig: int) -> None:
+    if hasattr(os, "killpg") and proc.pid is not None:
+        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+            os.killpg(proc.pid, sig)
+            return
+    with contextlib.suppress(ProcessLookupError, OSError):
+        (proc.terminate if sig == signal.SIGTERM else proc.kill)()
+
+
+def _is_pgroup_alive(pid: int | None) -> bool:
+    if not hasattr(os, "killpg") or pid is None:
+        return False
+    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+        os.killpg(pid, 0)
+        return True
+    return False
+
+
+async def _terminate_process_group(proc: anyio.abc.Process) -> None:
+    with anyio.CancelScope(shield=True):
+        if proc.stdin is not None:
+            with contextlib.suppress(Exception):
+                await proc.stdin.aclose()
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            if proc.returncode is not None and not _is_pgroup_alive(proc.pid):
+                break
+            _signal_process_group(proc, sig)
+            if proc.returncode is None:
+                with anyio.move_on_after(0.5), contextlib.suppress(Exception):
+                    await proc.wait()
+            elif sig == signal.SIGTERM and _is_pgroup_alive(proc.pid):
+                with anyio.move_on_after(0.2):
+                    while _is_pgroup_alive(proc.pid):
+                        await anyio.sleep(0.02)
 
 
 def _empty_usage() -> dict[str, int]:
@@ -485,6 +522,7 @@ class _ActiveTurnState:
     perm_arrived_events: dict[str, anyio.Event] = field(default_factory=dict)
     decision_events: dict[str, anyio.Event] = field(default_factory=dict)
     decisions: dict[str, bool] = field(default_factory=dict)
+    evaluated_inputs: dict[str, dict[str, Any]] = field(default_factory=dict)
     policy_denied_tools: list[str] = field(default_factory=list)
     last_context_tokens: int = 0
     emitted_any_signal: bool = False
@@ -556,6 +594,7 @@ class _AcpSubprocessConnection:
         self.session_results: dict[str, dict[str, Any]] = {}
         self.session_prefs: dict[str, tuple[str, str, str]] = {}
         self.initialized = False
+        self._tg_stack: contextlib.AsyncExitStack | None = None
 
     @property
     def is_closed(self) -> bool:
@@ -570,18 +609,37 @@ class _AcpSubprocessConnection:
         msg = f"{prefix}: {stderr_summary}" if stderr_summary else prefix
         return stderr_summary, AgyAcpTransportError(msg)
 
-    async def start(self) -> None:
-        """Spawn the supervisor actor task and await subprocess readiness."""
-        asyncio.get_running_loop().create_task(self._actor_main())
+    async def start(self, *, supervisor_tg: anyio.abc.TaskGroup | None = None) -> None:
+        """Spawn the supervisor actor task via `anyio` and await subprocess readiness."""
+        if supervisor_tg is not None:
+            supervisor_tg.start_soon(self._actor_main)
+        else:
+            self._tg_stack = contextlib.AsyncExitStack()
+            tg = await self._tg_stack.enter_async_context(anyio.create_task_group())
+            tg.start_soon(self._actor_main)
         await self._ready_event.wait()
         if self._spawn_error is not None:
+            await self.close()
             raise self._spawn_error
+
+    async def shutdown(self) -> None:
+        """Signal the supervisor actor task to terminate the child process group and wait."""
+        with anyio.CancelScope(shield=True):
+            self._shutdown_event.set()
+            self._fail_pending(AgyAcpTransportError("ACP connection closed"))
+            await self._closed_event.wait()
+
+    async def close_stack(self) -> None:
+        """Exit any connection-owned `AsyncExitStack` outside active shield scopes."""
+        if self._tg_stack is not None:
+            stack, self._tg_stack = self._tg_stack, None
+            with contextlib.suppress(BaseException):
+                await stack.aclose()
 
     async def close(self) -> None:
         """Signal the supervisor actor task to terminate the child process and wait."""
-        self._shutdown_event.set()
-        self._fail_pending(AgyAcpTransportError("ACP connection closed"))
-        await self._closed_event.wait()
+        await self.shutdown()
+        await self.close_stack()
 
     def _fail_pending(self, exc: BaseException) -> None:
         self._closed = True
@@ -694,6 +752,7 @@ class _AcpSubprocessConnection:
         except BaseException as exc:
             self._fail_pending(AgyAcpTransportError(f"agy acp transport crashed: {exc}"))
         finally:
+            await _terminate_process_group(proc)
             stderr_summary, exit_err = self._format_stderr_error(
                 f"agy acp exited (code={proc.returncode})"
             )
@@ -714,17 +773,7 @@ class _AcpSubprocessConnection:
         tg: anyio.abc.TaskGroup,
     ) -> None:
         await self._shutdown_event.wait()
-        if proc.stdin is not None:
-            with contextlib.suppress(Exception):
-                await proc.stdin.aclose()
-        if proc.returncode is None:
-            with contextlib.suppress(ProcessLookupError, OSError):
-                proc.terminate()
-            with anyio.move_on_after(0.5):
-                await proc.wait()
-            if proc.returncode is None:
-                with contextlib.suppress(ProcessLookupError, OSError):
-                    proc.kill()
+        await _terminate_process_group(proc)
         tg.cancel_scope.cancel()
 
     async def _stderr_reader(self, proc: anyio.abc.Process) -> None:
@@ -788,12 +837,24 @@ class _AcpSubprocessConnection:
             async for msg in self._notif_recv:
                 try:
                     await self._on_notification(self, msg)
+                except Exception as exc:
+                    log_acp_event(
+                        "agy_acp.notification_error",
+                        save_dir_or_db=self._save_dir_or_db,
+                        error=str(exc),
+                    )
                 finally:
                     self._finish_frame()
 
     async def _run_server_request(self, msg: dict[str, Any]) -> None:
         try:
             await self._on_server_request(self, msg)
+        except Exception as exc:
+            log_acp_event(
+                "agy_acp.server_request_unhandled",
+                save_dir_or_db=self._save_dir_or_db,
+                error=str(exc),
+            )
         finally:
             self._finish_frame()
 
@@ -840,6 +901,9 @@ class AgyAcpClientProvider:
 
         self._conn_lock = anyio.Lock()
         self._conn: _AcpSubprocessConnection | None = None
+        self._retired_conns: list[_AcpSubprocessConnection] = []
+        self._tg_stack: contextlib.AsyncExitStack | None = None
+        self._supervisor_tg: anyio.abc.TaskGroup | None = None
         self._cached_models: list[dict[str, str]] = []
 
         self._active_turns: set[str] = set()
@@ -874,17 +938,31 @@ class AgyAcpClientProvider:
         return self._conn.pid if self._conn is not None and not self._conn.is_closed else None
 
     async def __aenter__(self) -> Self:
+        if self._tg_stack is None:
+            self._tg_stack = contextlib.AsyncExitStack()
+            self._supervisor_tg = await self._tg_stack.enter_async_context(
+                anyio.create_task_group()
+            )
         return self
 
     async def __aexit__(self, *_: object) -> None:
         await self.close()
 
     async def close(self) -> None:
-        """Shut down the active `agy acp` subprocess cleanly."""
-        async with self._conn_lock:
-            conn, self._conn = self._conn, None
-        if conn is not None:
-            await conn.close()
+        """Shut down the active `agy acp` subprocess cleanly even under task cancellation."""
+        with anyio.CancelScope(shield=True):
+            async with self._conn_lock:
+                conns = [c for c in (self._conn, *reversed(self._retired_conns)) if c is not None]
+                self._conn = None
+                self._retired_conns.clear()
+            for c in conns:
+                await c.shutdown()
+        for c in conns:
+            await c.close_stack()
+        if self._tg_stack is not None:
+            stack, self._tg_stack, self._supervisor_tg = self._tg_stack, None, None
+            with contextlib.suppress(BaseException):
+                await stack.aclose()
 
     aclose = close
 
@@ -905,6 +983,8 @@ class AgyAcpClientProvider:
     def _on_connection_disconnect(self, conn: _AcpSubprocessConnection) -> None:
         if self._conn is conn:
             self._conn = None
+            if conn._tg_stack is not None:
+                self._retired_conns.append(conn)
 
     async def _ensure_connection(self) -> _AcpSubprocessConnection:
         """Lazily spawn and `initialize` `agy acp`, auto-restarting after exit or EOF."""
@@ -912,13 +992,14 @@ class AgyAcpClientProvider:
             if self._conn is not None and not self._conn.is_closed and self._conn.initialized:
                 return self._conn
 
-            stale, self._conn = self._conn, None
-            if stale is not None:
-                with contextlib.suppress(Exception):
-                    await stale.close()
+            for old_conn in (self._conn, *reversed(self._retired_conns)):
+                if old_conn is not None:
+                    with contextlib.suppress(Exception):
+                        await old_conn.close()
+            self._conn = None
+            self._retired_conns.clear()
 
-            scrubbed_keys = {*PER_SESSION_MCP_ENV_KEYS, "KIROCREW_ROUTE_SPAWN_RUN"}
-            child_env = {k: v for k, v in os.environ.items() if k not in scrubbed_keys}
+            child_env = build_scrubbed_subprocess_env()
             child_env.update(self._base_env)
             child_env.setdefault("AGY_ACP_STATE_DB", str(self._store.db_path))
             conn = _AcpSubprocessConnection(
@@ -929,7 +1010,7 @@ class AgyAcpClientProvider:
                 on_notification=self._handle_notification,
                 on_disconnect=self._on_connection_disconnect,
             )
-            await conn.start()
+            await conn.start(supervisor_tg=self._supervisor_tg)
             try:
                 await conn.request(
                     "initialize",
@@ -1311,13 +1392,21 @@ class AgyAcpClientProvider:
         tc_id: str,
         event: ToolCallEvent,
     ) -> tuple[bool, bool]:
-        """Evaluate `on_tool_call(event)` at most once per `tc_id`."""
+        """Evaluate `on_tool_call(event)`, re-checking if `raw_input` populates later."""
+        raw_input_snapshot = dict(event.raw_input)
         if tc_id in turn.decision_events:
             await turn.decision_events[tc_id].wait()
-            return turn.decisions.get(tc_id, False), turn.interrupt_event.is_set()
+            prev_allowed = turn.decisions.get(tc_id, False)
+            if (
+                not prev_allowed
+                or not raw_input_snapshot
+                or turn.evaluated_inputs.get(tc_id) == raw_input_snapshot
+            ):
+                return prev_allowed, turn.interrupt_event.is_set()
 
         dec_event = anyio.Event()
         turn.decision_events[tc_id] = dec_event
+        turn.evaluated_inputs[tc_id] = raw_input_snapshot
         turn.announced_tools.add(tc_id)
 
         tool_cb = turn.on_tool_call
@@ -1329,7 +1418,17 @@ class AgyAcpClientProvider:
         result_holder: dict[str, bool] = {"allowed": False, "interrupted": False}
 
         async def _run_callback(tg: anyio.abc.TaskGroup) -> None:
-            result_holder["allowed"] = await tool_cb(event)
+            try:
+                result_holder["allowed"] = bool(await tool_cb(event))
+            except Exception as exc:
+                log_acp_event(
+                    "agy_acp.tool_callback_error",
+                    save_dir_or_db=self._store.db_path,
+                    session_id=turn.session_id,
+                    tool_call_id=tc_id,
+                    error=str(exc),
+                )
+                result_holder["allowed"] = False
             tg.cancel_scope.cancel()
 
         async def _watch_interrupt(tg: anyio.abc.TaskGroup) -> None:
@@ -1426,6 +1525,19 @@ class AgyAcpClientProvider:
             await self._send_permission_outcome(conn, req_id, outcome)
         except AgyAcpError:
             pass
+        except Exception as exc:
+            log_acp_event(
+                "agy_acp.server_request_error",
+                save_dir_or_db=self._store.db_path,
+                error=str(exc),
+            )
+            reject_opt = _select_permission_option_id(options, allow=False)
+            with contextlib.suppress(AgyAcpError):
+                await self._send_permission_outcome(
+                    conn,
+                    req_id,
+                    {"outcome": "selected", "optionId": reject_opt},
+                )
         finally:
             turn.handler_exit()
 
@@ -1463,6 +1575,12 @@ class AgyAcpClientProvider:
         kind: str,
         update: Mapping[str, Any],
     ) -> None:
+        if (turn.interrupt_event.is_set() or turn.policy_denied_tools) and kind not in {
+            "tool_call",
+            "tool_call_update",
+        }:
+            return
+
         if kind in {"agent_thought_chunk", "agent_message_chunk"}:
             delta = _extract_chunk_text(update)
             if delta:
@@ -1535,35 +1653,51 @@ class AgyAcpClientProvider:
             return
 
         perm_ev = turn.perm_arrived_events.setdefault(tc_id, anyio.Event())
-        if raw_status == "pending":
-            perm_ev.set()
 
         allowed, interrupted = await self._evaluate_tool_call_once(
             turn,
             tc_id,
             replace(event, status="in_progress"),
         )
-        if interrupted:
+        if interrupted and allowed:
             return
 
-        if not allowed and not perm_ev.is_set():
-            if cls.acp_kind not in _READ_ONLY_ACP_KINDS:
-                with anyio.move_on_after(0.02):
+        if not allowed:
+            if not perm_ev.is_set() and (
+                cls.acp_kind not in _READ_ONLY_ACP_KINDS or raw_status == "pending"
+            ):
+                with anyio.move_on_after(0.05):
                     await perm_ev.wait()
             if not perm_ev.is_set():
                 label = raw_name or cls.kiro_tool_id or cls.v2_tool_name or cls.title
                 turn.policy_denied_tools.append(label)
+                turn.interrupt_event.set()
                 await self._send_agy_cancel(turn.agy_session_id)
-                await self._emit_terminal_tool_update(
-                    turn,
-                    tc_id,
-                    replace(event, status="failed", output="Tool execution rejected by policy."),
-                )
-                return
+            if not perm_ev.is_set() or raw_status in (_DONE_TOOL_STATUSES | _FAILED_TOOL_STATUSES):
+                await self._emit_rejected_tool_update(turn, tc_id, event)
+            return
 
         if raw_status in (_DONE_TOOL_STATUSES | _FAILED_TOOL_STATUSES):
             terminal = "failed" if raw_status in _FAILED_TOOL_STATUSES else "completed"
             await self._emit_terminal_tool_update(turn, tc_id, replace(event, status=terminal))
+
+    @classmethod
+    async def _emit_rejected_tool_update(
+        cls,
+        turn: _ActiveTurnState,
+        tc_id: str,
+        event: ToolCallEvent,
+    ) -> None:
+        await cls._emit_terminal_tool_update(
+            turn,
+            tc_id,
+            replace(
+                event,
+                status="failed",
+                output="Tool execution rejected by policy.",
+                diff_content=[],
+            ),
+        )
 
     @staticmethod
     async def _emit_terminal_tool_update(
@@ -1764,6 +1898,20 @@ class AgyAcpClientProvider:
                     with anyio.move_on_after(1.0):
                         await conn.wait_idle()
                         await turn_state.drained_event.wait()
+                    for dangling_id in list(
+                        turn_state.announced_tools - turn_state.completed_tools
+                    ):
+                        if turn_state.decisions.get(dangling_id) is False:
+                            _, _, dangling_ev = _build_tool_event_from_record(
+                                dangling_id,
+                                turn_state.tool_records.get(dangling_id, {}),
+                                known_mcp_servers=turn_state.known_mcp_servers,
+                                status_override="failed",
+                            )
+                            with contextlib.suppress(Exception):
+                                await self._emit_rejected_tool_update(
+                                    turn_state, dangling_id, dangling_ev
+                                )
                     self._turn_states.pop(resolved_agy_sid, None)
 
                 if transport_failed is not None:

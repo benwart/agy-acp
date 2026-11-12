@@ -1237,3 +1237,118 @@ async def test_create_session_refreshes_expired_models_cache(tmp_path: Path) -> 
     desc = await mgr.create_session(cwd=str(tmp_path))
     available = desc["models"]["availableModels"]
     assert [m["modelId"] for m in available] == ["gemini-4-carbon-medium"]
+
+
+async def test_w4_image_cap_compacted_mandate_reinjection_and_load_evict_close(
+    tmp_path: Path,
+) -> None:
+    """Verify `[H-5]`, `[M-2]`, and `[L-3]` in `SessionManager`."""
+    import os
+
+    from agy_acp.logic.session_manager import _read_contained_local_image_block
+    from agy_acp.logic.tool_classifier import PromptOutcome
+    from agy_acp.providers.agy_acp_client import AgyAcpClientProvider
+
+    # [H-5]: _read_contained_local_image_block rejects > 10 MiB, symlinks, and FIFOs
+    ok_img = tmp_path / "ok.png"
+    ok_img.write_bytes(b"\x89PNG\r\n\x1a\nsmall")
+    assert _read_contained_local_image_block(Path("ok.png"), cwd=str(tmp_path)) is not None
+
+    huge_img = tmp_path / "huge.png"
+    huge_img.write_bytes(b"x" * (10 * 1024 * 1024 + 1))
+    assert _read_contained_local_image_block(Path("huge.png"), cwd=str(tmp_path)) is None
+
+    sym_img = tmp_path / "sym.png"
+    sym_img.symlink_to(ok_img)
+    assert _read_contained_local_image_block(Path("sym.png"), cwd=str(tmp_path)) is None
+
+    if hasattr(os, "mkfifo"):
+        fifo_img = tmp_path / "pipe.png"
+        os.mkfifo(fifo_img)
+        assert _read_contained_local_image_block(Path("pipe.png"), cwd=str(tmp_path)) is None
+
+    # [M-2] & [L-3]: system_prompt_append preserved across fork/compact + load_session close
+    seen_calls: list[dict[str, Any]] = []
+    closed_ids: list[str] = []
+
+    class _TrackingCli(AgyAcpClientProvider):
+        async def stream_prompt(self, **kwargs: Any) -> PromptOutcome:
+            seen_calls.append(kwargs)
+            if kwargs.get("mode") == "read-only":
+                return PromptOutcome(
+                    conversation_id=str(kwargs.get("conversation_id") or "agy-orig"),
+                    stop_reason="end_turn",
+                    response=(
+                        "Summary quoting [AGENT SYSTEM PROMPT]\nMandate body\n"
+                        "[KIROCREW SUBAGENT ROUTING]"
+                    ),
+                    usage={"input_tokens": 5, "output_tokens": 5, "total_tokens": 10},
+                )
+            return PromptOutcome(
+                conversation_id="agy-next",
+                stop_reason="end_turn",
+                response="Done",
+                usage={"input_tokens": 10, "output_tokens": 4, "total_tokens": 14},
+            )
+
+        async def close_backend_session(self, agy_session_id: str) -> dict[str, Any]:
+            closed_ids.append(agy_session_id)
+            return {}
+
+    cli = _TrackingCli(save_dir=tmp_path)
+    mgr = SessionManager(save_dir=tmp_path, cli_provider=cli)
+    kirocrew_mcp = [{"name": "kirocrew-core", "command": "echo", "args": []}]
+    custom_agents = [
+        {"name": "worker-agent", "description": "Worker", "prompt": "Mandate body"},
+    ]
+    desc = await mgr.create_session(
+        cwd=str(tmp_path),
+        mcp_servers=kirocrew_mcp,
+        meta={"kiro": {"customAgents": custom_agents}},
+    )
+    sid = desc["sessionId"]
+    await mgr.set_mode(session_id=sid, mode_id="worker-agent")
+
+    # Seed Turn 1 containing both [AGENT SYSTEM PROMPT] and [KIROCREW SUBAGENT ROUTING]
+    turn1_seed = (
+        "[AGENT SYSTEM PROMPT]\nMandate body\n[END AGENT SYSTEM PROMPT]\n"
+        "[KIROCREW SUBAGENT ROUTING]\nInitial task"
+    )
+    await mgr.prompt(session_id=sid, prompt_blocks=[{"type": "text", "text": turn1_seed}])
+    mgr.state_store.append_session_turn(
+        session_id=sid,
+        user_message_id="m1",
+        prompt_blocks=[{"type": "text", "text": turn1_seed}],
+        assistant_text="Completed turn 1",
+    )
+
+    # Fork session -> compactedSummary embeds Turn 1's mandate/routing markers
+    fork_desc = await mgr.fork_session(sid, cwd=str(tmp_path))
+    fork_sid = fork_desc["sessionId"]
+    await mgr.prompt(
+        session_id=fork_sid,
+        prompt_blocks=[{"type": "text", "text": "Follow-up after fork"}],
+    )
+    fork_append = seen_calls[-1]["system_prompt_append"] or ""
+    assert "Mandate body" in fork_append
+    assert "[KIROCREW SUBAGENT ROUTING]" in fork_append
+
+    # Compact original session -> summary quotes both markers -> next prompt still sends append
+    compact_res = await mgr.compact_session(session_id=sid)
+    assert compact_res["status"] == "completed"
+    await mgr.prompt(
+        session_id=sid,
+        prompt_blocks=[{"type": "text", "text": "Follow-up after compact"}],
+    )
+    compact_append = seen_calls[-1]["system_prompt_append"] or ""
+    assert "Mandate body" in compact_append
+    assert "[KIROCREW SUBAGENT ROUTING]" in compact_append
+
+    # [L-3]: load_session with changed mcp_servers closes resident old_agy_id
+    closed_ids.clear()
+    await mgr.load_session(
+        session_id=sid,
+        cwd=str(tmp_path),
+        mcp_servers=[{"name": "other-mcp", "command": "echo", "args": []}],
+    )
+    assert closed_ids == ["agy-next"]

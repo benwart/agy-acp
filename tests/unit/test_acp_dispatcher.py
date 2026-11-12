@@ -3467,3 +3467,208 @@ async def test_acp_dispatcher_0121_fork_steer_clear_kas_rpcs_and_trailing_compac
     assert rev_resp is not None
     assert rev_resp["result"] == {"success": True}
     assert len(mgr.state_store.get_session_turns(sid)) == 1
+
+
+async def test_w4_kas_steering_queued_persisted_turns_and_tool_call_recheck_dedup(
+    tmp_path: Path,
+) -> None:
+    """Verify `[M-3]` `_session/steering` queued + persisted blocks and `[H-1]` wire dedup."""
+    import anyio
+
+    from agy_acp.logic.tool_classifier import PromptOutcome, ToolCallEvent
+    from agy_acp.logic.wire.v3_kas import V3KasWireAdapter
+
+    emitted: list[dict[str, Any]] = []
+    turn_started = anyio.Event()
+
+    async def emit_cb(frame: dict[str, Any]) -> None:
+        emitted.append(frame)
+
+    class _W4V3StubCli(_StubAgyAcpClientProvider):
+        async def stream_prompt(self, **kwargs: Any) -> PromptOutcome:
+            sid = str(kwargs.get("session_id") or "default")
+            on_tool_call = kwargs.get("on_tool_call")
+            on_tool_update = kwargs.get("on_tool_update")
+            on_steer_consumed = kwargs.get("on_steer_consumed")
+            on_text = kwargs.get("on_text")
+
+            self._active_turns.add(sid)
+            try:
+                turn_started.set()
+                for _ in range(50):
+                    if self._steer_queues.get(sid):
+                        break
+                    await anyio.sleep(0.01)
+
+                # [H-1]: First tool_call arrives with empty rawInput={}, then re-evaluated with .env
+                if on_tool_call is not None:
+                    first_allow = await on_tool_call(
+                        ToolCallEvent(
+                            tool_call_id="tc_env_1",
+                            title="edit_file",
+                            kind="edit",
+                            status="in_progress",
+                            kas_builtin_id="fs_write",
+                            v2_tool_name="fs_write",
+                            raw_input={},
+                        )
+                    )
+                    assert first_allow is True
+                    second_allow = await on_tool_call(
+                        ToolCallEvent(
+                            tool_call_id="tc_env_1",
+                            title="edit_file",
+                            kind="edit",
+                            status="in_progress",
+                            kas_builtin_id="fs_write",
+                            v2_tool_name="fs_write",
+                            raw_input={"Path": ".env", "path": ".env"},
+                        )
+                    )
+                    assert second_allow is False
+                    if on_tool_update is not None:
+                        await on_tool_update(
+                            ToolCallEvent(
+                                tool_call_id="tc_env_1",
+                                title="edit_file",
+                                kind="edit",
+                                status="failed",
+                                raw_input={"Path": ".env", "path": ".env"},
+                                output="Tool execution rejected by policy.",
+                            )
+                        )
+
+                entries = self._pop_queued_steers(sid)
+                if entries and on_steer_consumed is not None:
+                    await on_steer_consumed(
+                        "\n".join(e.steer.raw_message for e in entries if e.steer.raw_message)
+                    )
+                if on_text is not None:
+                    await on_text("Steered completion.")
+                return PromptOutcome(
+                    conversation_id="agy-w4",
+                    stop_reason="end_turn",
+                    response="Steered completion.",
+                    usage={"input_tokens": 12, "output_tokens": 6, "total_tokens": 18},
+                )
+            finally:
+                self._active_turns.discard(sid)
+
+    cli = _W4V3StubCli(save_dir=tmp_path)
+    mgr = SessionManager(save_dir=tmp_path, cli_provider=cli, wire_adapter=V3KasWireAdapter())
+    dispatcher = AcpDispatcher(
+        session_manager=mgr,
+        wire_adapter=V3KasWireAdapter(),
+        notification_sink=emit_cb,
+    )
+
+    await dispatcher.handle_message(
+        json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+    )
+    custom_agents = [
+        {
+            "id": "env-guard",
+            "name": "env-guard",
+            "description": "Deny .env edits",
+            "allowedTools": ["*"],
+            "permissions": {
+                "rules": [
+                    {
+                        "capability": "fs_write",
+                        "match": [".env", "**/.env"],
+                        "effect": "deny",
+                    }
+                ]
+            },
+        }
+    ]
+    new_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/new",
+                "params": {
+                    "cwd": str(tmp_path),
+                    "mcpServers": [],
+                    "_meta": {"kiro": {"customAgents": custom_agents}},
+                },
+            }
+        )
+    )
+    assert new_resp is not None
+    sid = new_resp["result"]["sessionId"]
+    await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "session/set_mode",
+                "params": {"sessionId": sid, "modeId": "env-guard"},
+            }
+        )
+    )
+    emitted.clear()
+
+    prompt_resp: dict[str, Any] | None = None
+
+    async def _drive_prompt() -> None:
+        nonlocal prompt_resp
+        prompt_resp = await dispatcher.handle_message(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "session/prompt",
+                    "params": {
+                        "sessionId": sid,
+                        "prompt": [{"type": "text", "text": "Initial instruction"}],
+                    },
+                }
+            )
+        )
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(_drive_prompt)
+        await turn_started.wait()
+        steer_resp = await dispatcher.handle_message(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "_session/steering",
+                    "params": {
+                        "sessionId": sid,
+                        "prompt": [{"type": "text", "text": "Focus on tests instead"}],
+                    },
+                }
+            )
+        )
+        assert steer_resp == {"jsonrpc": "2.0", "id": 5, "result": {"outcome": "injected"}}
+
+    assert prompt_resp is not None
+    updates = [n["params"]["update"] for n in emitted if n.get("method") == "session/update"]
+
+    # [H-1]: Only ONE wire `tool_call` start notification emitted for `tc_env_1`
+    tool_starts = [
+        u
+        for u in updates
+        if u.get("sessionUpdate") == "tool_call" and u.get("toolCallId") == "tc_env_1"
+    ]
+    assert len(tool_starts) == 1
+
+    # [M-3]: Both `steering_queued` and `steering_injected` emitted on KAS v3 `_session/steering`
+    info_kinds = [
+        u.get("_meta", {}).get("kiro", {}).get("kind")
+        for u in updates
+        if u.get("sessionUpdate") == "session_info_update"
+    ]
+    assert "steering_queued" in info_kinds
+    assert "steering_injected" in info_kinds
+
+    # [M-3]: Consumed steered user instruction persisted in `session_turns`
+    turns = mgr.state_store.get_session_turns(sid)
+    assert len(turns) == 1
+    saved_texts = [b.get("text", "") for b in turns[0]["prompt_blocks"] if b.get("type") == "text"]
+    assert "Initial instruction" in saved_texts
+    assert "Focus on tests instead" in saved_texts
