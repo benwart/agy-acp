@@ -1,6 +1,6 @@
 [project]
 site_name = "agy-acp Documentation"
-site_description = "Google Antigravity SDK wrapper exposing an Agent Client Protocol (ACP) server for KiroCrew."
+site_description = "Antigravity CLI (agy acp) full-duplex ACP harness and Cyclopts CLI for KiroCrew."
 site_url = "https://github.com/benwart/agy-acp"
 site_author = "Ben Wart"
 copyright = "Copyright &copy; 2026 Ben Wart"
@@ -20,7 +20,7 @@ nav = [
   ] },
   { "Design" = [
     { "Architecture & Component Design" = "design/architecture.md" },
-    { "ACP Protocol & SDK Bridge" = "design/acp-sdk-bridge.md" },
+    { "ACP Protocol & agy acp Bridge" = "design/acp-sdk-bridge.md" },
     { "Credential Hot-Reload & Quotas" = "design/auth-and-quotas.md" },
   ] },
   { "Guides" = [
