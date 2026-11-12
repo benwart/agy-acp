@@ -8,7 +8,7 @@ import json
 import math
 import os
 import subprocess
-from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Self
@@ -19,11 +19,14 @@ from anyio.streams.text import TextReceiveStream
 
 from agy_acp.logic.tool_classifier import (
     FALLBACK_MODELS,
+    PATH_ARGUMENT_KEYS,
     PER_SESSION_MCP_ENV_KEYS,
     PromptOutcome,
     QueuedSteer,
     ToolCallClassification,
     ToolCallEvent,
+    _extract_first_str,
+    _pairs_to_dict,
     classify_tool_call_step,
     resolve_agy_binary,
     resolve_model_for_effort,
@@ -34,30 +37,11 @@ from agy_acp.providers.acp_logger import log_acp_event
 from agy_acp.providers.state_store import SqliteStateStoreProvider
 
 _NATIVE_SUBAGENT_TOOLS: frozenset[str] = frozenset(
-    {
-        "invoke_subagent",
-        "define_subagent",
-        "manage_subagents",
-        "invoke_sub_agent",
-    }
+    {"invoke_subagent", "define_subagent", "manage_subagents", "invoke_sub_agent"}
 )
-
 _READ_ONLY_ACP_KINDS: frozenset[str] = frozenset({"read", "search", "fetch"})
-
-_PATH_ARGUMENT_KEYS: tuple[str, ...] = (
-    "path",
-    "Path",
-    "AbsolutePath",
-    "TargetFile",
-    "DirectoryPath",
-    "SearchPath",
-    "SearchDirectory",
-    "TargetDirectory",
-    "File",
-    "file_path",
-    "filePath",
-)
-
+_FAILED_TOOL_STATUSES: frozenset[str] = frozenset({"failed", "error", "cancelled", "canceled"})
+_DONE_TOOL_STATUSES: frozenset[str] = frozenset({"completed", "done", "succeeded"})
 _KIND_TO_FALLBACK_TOOL: dict[str, str] = {
     "execute": "run_command",
     "read": "read_file",
@@ -86,6 +70,23 @@ class AgyAcpRpcError(AgyAcpError):
         self.data = data
 
 
+def _unlink_temp_files(paths: Iterable[Path]) -> None:
+    for tmp in paths:
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
+
+
+def _empty_usage() -> dict[str, int]:
+    return {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "thinking_tokens": 0,
+        "cache_read_tokens": 0,
+        "total_tokens": 0,
+        "context_tokens": 0,
+    }
+
+
 def format_acp_mcp_servers(
     servers: Sequence[Mapping[str, Any]] | None,
     *,
@@ -101,29 +102,22 @@ def format_acp_mcp_servers(
         if not isinstance(raw_srv, Mapping) or raw_srv.get("disabled") is True:
             continue
         translated = translate_mcp_server(dict(raw_srv))
-        if translated.get("disabled") is True:
-            continue
         name = str(translated.get("name") or "").strip()
-        if not name or name in seen_names:
+        if translated.get("disabled") is True or not name or name in seen_names:
             continue
 
         if translated.get("type") == "http" or "url" in raw_srv or "serverUrl" in raw_srv:
             url = str(translated.get("url") or raw_srv.get("serverUrl") or "").strip()
             if not url:
                 continue
-            raw_headers = translated.get("headers")
-            headers_map = raw_headers if isinstance(raw_headers, Mapping) else {}
+            headers_map = _pairs_to_dict(translated.get("headers"))
             seen_names.add(name)
             formatted.append(
                 {
                     "type": "http",
                     "name": name,
                     "url": url,
-                    "headers": [
-                        {"name": str(k), "value": str(v)}
-                        for k, v in headers_map.items()
-                        if v is not None
-                    ],
+                    "headers": [{"name": k, "value": v} for k, v in headers_map.items()],
                 }
             )
             continue
@@ -131,12 +125,7 @@ def format_acp_mcp_servers(
         cmd = str(translated.get("command") or "").strip()
         if not cmd:
             continue
-        raw_env = translated.get("env")
-        env_map: dict[str, str] = (
-            {str(k): str(v) for k, v in raw_env.items() if v is not None}
-            if isinstance(raw_env, Mapping)
-            else {}
-        )
+        env_map = _pairs_to_dict(translated.get("env"))
         if session_env is not None:
             for env_key in (*PER_SESSION_MCP_ENV_KEYS, "KIROCREW_ROUTE_SPAWN_RUN"):
                 val = session_env.get(env_key)
@@ -152,7 +141,6 @@ def format_acp_mcp_servers(
                 "env": [{"name": k, "value": v} for k, v in env_map.items()],
             }
         )
-
     return formatted
 
 
@@ -178,22 +166,22 @@ def normalize_acp_content_blocks(
                 "data": str(block.get("data") or ""),
                 "mimeType": str(block.get("mimeType") or "image/png"),
             }
-            if "uri" in block and block["uri"] is not None:
+            if block.get("uri") is not None:
                 img_block["uri"] = str(block["uri"])
             normalized.append(img_block)
         elif btype == "resource":
             res_inner = block.get("resource")
-            if isinstance(res_inner, Mapping):
-                normalized.append({"type": "resource", "resource": dict(res_inner)})
-            else:
-                normalized.append(dict(block))
+            normalized.append(
+                {"type": "resource", "resource": dict(res_inner)}
+                if isinstance(res_inner, Mapping)
+                else dict(block)
+            )
         elif btype == "resource_link":
             uri = str(block.get("uri") or "")
             name = str(block.get("name") or uri)
             normalized.append({"type": "text", "text": f"[Resource: {name} ({uri})]"})
         else:
             normalized.append(dict(block))
-
     return normalized or [{"type": "text", "text": prompt}]
 
 
@@ -218,15 +206,17 @@ def _normalize_discovered_models(raw_models: Any) -> list[dict[str, str]]:
             continue
         seen.add(model_id)
         name = str(item.get("name") or model_id).strip()
-        description = str(item.get("description") or name).strip()
-        out.append({"modelId": model_id, "name": name, "description": description})
+        out.append(
+            {
+                "modelId": model_id,
+                "name": name,
+                "description": str(item.get("description") or name).strip(),
+            }
+        )
     return out
 
 
-def _resolve_supported_thought_level(
-    effort: str | None,
-    config_options: Any,
-) -> str | None:
+def _resolve_supported_thought_level(effort: str | None, config_options: Any) -> str | None:
     """Map `effort` onto `thought_level` options supported by `agy acp`."""
     if not effort or not effort.strip():
         return None
@@ -238,50 +228,35 @@ def _resolve_supported_thought_level(
                 continue
             raw_choices = opt.get("options")
             if isinstance(raw_choices, Sequence) and not isinstance(raw_choices, (str, bytes)):
-                valid_values = {
+                valid = {
                     str(c.get("value") or "").strip().lower()
                     for c in raw_choices
                     if isinstance(c, Mapping) and c.get("value")
                 }
-                if cleaned in valid_values:
-                    return cleaned
-                if mapped in valid_values:
-                    return mapped
-                return None
+                return cleaned if cleaned in valid else (mapped if mapped in valid else None)
     return mapped if mapped in {"low", "medium", "high"} else None
 
 
 def _select_permission_option_id(options: Any, *, allow: bool) -> str:
     """Select the `optionId` matching `allow_once` or `reject_once` from `params.options`."""
-    target_exact_kind = "allow_once" if allow else "reject_once"
-    target_keyword = "allow" if allow else "reject"
-    fallback_ids = ("allow_once", "allow") if allow else ("reject_once", "deny", "reject")
-
-    if isinstance(options, Sequence) and not isinstance(options, (str, bytes)):
-        for item in options:
-            if isinstance(item, Mapping) and str(item.get("kind") or "") == target_exact_kind:
-                opt_id = str(item.get("optionId") or "").strip()
-                if opt_id:
-                    return opt_id
-        for item in options:
-            if isinstance(item, Mapping) and target_keyword in str(item.get("kind") or "").lower():
-                opt_id = str(item.get("optionId") or "").strip()
-                if opt_id:
-                    return opt_id
-        for item in options:
-            if isinstance(item, Mapping):
-                opt_id = str(item.get("optionId") or "").strip()
-                if opt_id.lower() in fallback_ids:
-                    return opt_id
-    return "allow_once" if allow else "reject_once"
-
-
-def _extract_first_str(arguments: Mapping[str, Any], keys: tuple[str, ...]) -> str:
-    for key in keys:
-        val = arguments.get(key)
-        if isinstance(val, str) and val:
-            return val
-    return ""
+    exact_kind = "allow_once" if allow else "reject_once"
+    keyword = "allow" if allow else "reject"
+    fallbacks = ("allow_once", "allow") if allow else ("reject_once", "deny", "reject")
+    items = (
+        [i for i in options if isinstance(i, Mapping)]
+        if isinstance(options, Sequence) and not isinstance(options, (str, bytes))
+        else []
+    )
+    for predicate in (
+        lambda i: str(i.get("kind") or "") == exact_kind,
+        lambda i: keyword in str(i.get("kind") or "").lower(),
+        lambda i: str(i.get("optionId") or "").strip().lower() in fallbacks,
+    ):
+        for item in items:
+            opt_id = str(item.get("optionId") or "").strip()
+            if opt_id and predicate(item):
+                return opt_id
+    return exact_kind
 
 
 def _normalize_tool_arguments(
@@ -299,27 +274,24 @@ def _normalize_tool_arguments(
 
     normalized = dict(arguments)
     if "command" not in normalized:
-        cmd_val = _extract_first_str(
-            normalized,
-            ("CommandLine", "cmd", "Command"),
-        ) or synthesize_task_command(tool_name, normalized)
+        cmd_val = _extract_first_str(normalized, ("CommandLine", "cmd", "Command")) or (
+            synthesize_task_command(tool_name, normalized)
+        )
         if cmd_val:
             normalized["command"] = cmd_val
     if "path" not in normalized:
-        path_val = _extract_first_str(normalized, _PATH_ARGUMENT_KEYS)
+        path_val = _extract_first_str(normalized, PATH_ARGUMENT_KEYS)
         if path_val:
             normalized["path"] = path_val
-    summary = normalized.get("toolSummary")
-    if isinstance(summary, str) and summary.strip():
-        clean_summary = summary.strip()
-        normalized.setdefault("description", clean_summary)
-        normalized.setdefault("__toolUsePurpose", clean_summary)
-    elif tool_name.lower() == "invoke_subagent":
-        role = normalized.get("Role")
-        if isinstance(role, str) and role.strip():
-            clean_role = role.strip()
-            normalized.setdefault("description", clean_role)
-            normalized.setdefault("__toolUsePurpose", clean_role)
+
+    purpose = _extract_first_str(normalized, ("toolSummary",)).strip() or (
+        _extract_first_str(normalized, ("Role",)).strip()
+        if tool_name.lower() == "invoke_subagent"
+        else ""
+    )
+    if purpose:
+        normalized.setdefault("description", purpose)
+        normalized.setdefault("__toolUsePurpose", purpose)
     return normalized
 
 
@@ -327,16 +299,14 @@ def _extract_tool_output(record: Mapping[str, Any]) -> str:
     """Extract text output from a merged `tool_call` / `tool_call_update` state dict."""
     raw_output = record.get("rawOutput")
     if isinstance(raw_output, Mapping):
-        for key in ("output", "text", "error", "message"):
-            val = raw_output.get(key)
-            if isinstance(val, str) and val:
-                return val
+        found = _extract_first_str(raw_output, ("output", "text", "error", "message"))
+        if found:
+            return found
     elif isinstance(raw_output, str) and raw_output:
         return raw_output
 
-    direct_out = record.get("output")
-    if isinstance(direct_out, str) and direct_out:
-        return direct_out
+    if isinstance(record.get("output"), str) and record["output"]:
+        return record["output"]
 
     content = record.get("content")
     if isinstance(content, Sequence) and not isinstance(content, (str, bytes)):
@@ -370,38 +340,32 @@ def _merge_tool_record(existing: dict[str, Any], incoming: Mapping[str, Any]) ->
             merged_args.update(candidate)
     merged["raw_args"] = merged_args
 
-    locs = incoming.get("locations")
-    if isinstance(locs, list) and locs:
-        merged["locations"] = locs
-
-    content = incoming.get("content")
-    if isinstance(content, list) and content:
-        merged["content"] = content
-
-    if "rawOutput" in incoming and incoming["rawOutput"] is not None:
-        merged["rawOutput"] = incoming["rawOutput"]
-    if "output" in incoming and incoming["output"] is not None:
-        merged["output"] = incoming["output"]
-
+    for list_key in ("locations", "content"):
+        items = incoming.get(list_key)
+        if isinstance(items, list) and items:
+            merged[list_key] = items
+    for out_key in ("rawOutput", "output"):
+        if incoming.get(out_key) is not None:
+            merged[out_key] = incoming[out_key]
     return merged
 
 
 def _resolve_raw_tool_name(record: Mapping[str, Any], raw_args: Mapping[str, Any]) -> str:
     """Resolve raw `agy` tool identifier from merged ACP tool metadata."""
-    for key in ("name", "toolName"):
-        val = record.get(key)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
+    direct = _extract_first_str(record, ("name", "toolName")).strip()
+    if direct:
+        return direct
 
     meta = record.get("_meta")
     if isinstance(meta, Mapping):
         kiro_meta = meta.get("kiro")
-        if isinstance(kiro_meta, Mapping) and isinstance(kiro_meta.get("toolName"), str):
-            k_name = kiro_meta["toolName"].strip()
-            if k_name:
-                return k_name
-        if isinstance(meta.get("toolName"), str) and meta["toolName"].strip():
-            return meta["toolName"].strip()
+        meta_name = (
+            _extract_first_str(kiro_meta, ("toolName",)).strip()
+            if isinstance(kiro_meta, Mapping)
+            else ""
+        ) or _extract_first_str(meta, ("toolName",)).strip()
+        if meta_name:
+            return meta_name
 
     if "ServerName" in raw_args and "ToolName" in raw_args:
         return "call_mcp_tool"
@@ -416,9 +380,7 @@ def _resolve_raw_tool_name(record: Mapping[str, Any], raw_args: Mapping[str, Any
 
 def _is_native_subagent_tool(raw_tool_name: str, cls: ToolCallClassification) -> bool:
     """Return True when the tool call is a built-in `agy` subagent tool (never MCP `spawn_run`)."""
-    if cls.mcp_server:
-        return False
-    return (
+    return not cls.mcp_server and (
         raw_tool_name.strip().lower() in _NATIVE_SUBAGENT_TOOLS
         or cls.kas_builtin_id == "invoke_sub_agent"
     )
@@ -443,31 +405,29 @@ def _build_tool_event_from_record(
         raw_args,
         known_mcp_servers=known_mcp_servers,
     )
-    normalized_input = _normalize_tool_arguments(raw_args, tool_name=raw_tool_name)
     record_locs = record.get("locations")
     locations = cls.locations or (
         [dict(loc) for loc in record_locs if isinstance(loc, Mapping)]
         if isinstance(record_locs, list)
         else []
     )
-
-    diff_blocks = list(cls.diff_content)
-    if not diff_blocks and isinstance(record.get("content"), list):
-        diff_blocks = [
-            dict(b) for b in record["content"] if isinstance(b, Mapping) and b.get("type") == "diff"
-        ]
-
-    acp_kind = cls.acp_kind
-    if acp_kind == "other" and not cls.mcp_server and raw_kind in _KIND_TO_FALLBACK_TOOL:
-        acp_kind = raw_kind
-
-    status = status_override or str(record.get("status") or "in_progress")
+    raw_content = record.get("content")
+    diff_blocks = list(cls.diff_content) or [
+        dict(b)
+        for b in (raw_content if isinstance(raw_content, list) else [])
+        if isinstance(b, Mapping) and b.get("type") == "diff"
+    ]
+    acp_kind = (
+        raw_kind
+        if (cls.acp_kind == "other" and not cls.mcp_server and raw_kind in _KIND_TO_FALLBACK_TOOL)
+        else cls.acp_kind
+    )
     event = ToolCallEvent(
         tool_call_id=tc_id,
         title=cls.title,
         kind=acp_kind,
-        status=status,
-        raw_input=normalized_input,
+        status=status_override or str(record.get("status") or "in_progress"),
+        raw_input=_normalize_tool_arguments(raw_args, tool_name=raw_tool_name),
         output=_extract_tool_output(record),
         locations=locations,
         kiro_tool_name=cls.v2_tool_name,
@@ -483,6 +443,13 @@ def _build_tool_event_from_record(
         diff_content=diff_blocks,
     )
     return raw_tool_name, cls, event
+
+
+def _extract_chunk_text(update: Mapping[str, Any]) -> str:
+    content = update.get("content")
+    if isinstance(content, Mapping):
+        return str(content.get("text") or "")
+    return str(update.get("text") or "")
 
 
 @dataclass
@@ -592,20 +559,20 @@ class _AcpSubprocessConnection:
 
     @property
     def is_closed(self) -> bool:
-        if self._closed:
-            return True
-        if self._proc is not None and self._proc.returncode is not None:
-            return True
-        return False
+        return self._closed or (self._proc is not None and self._proc.returncode is not None)
 
     @property
     def pid(self) -> int | None:
         return self._proc.pid if self._proc is not None else None
 
+    def _format_stderr_error(self, prefix: str) -> tuple[str, AgyAcpTransportError]:
+        stderr_summary = "".join(self._stderr_tail[-20:]).strip()
+        msg = f"{prefix}: {stderr_summary}" if stderr_summary else prefix
+        return stderr_summary, AgyAcpTransportError(msg)
+
     async def start(self) -> None:
         """Spawn the supervisor actor task and await subprocess readiness."""
-        loop = asyncio.get_running_loop()
-        loop.create_task(self._actor_main())
+        asyncio.get_running_loop().create_task(self._actor_main())
         await self._ready_event.wait()
         if self._spawn_error is not None:
             raise self._spawn_error
@@ -640,9 +607,10 @@ class _AcpSubprocessConnection:
             anyio.ClosedResourceError,
             OSError,
         ) as exc:
-            self._fail_pending(AgyAcpTransportError(f"agy acp stdin write failed: {exc}"))
+            err = AgyAcpTransportError(f"agy acp stdin write failed: {exc}")
+            self._fail_pending(err)
             self._shutdown_event.set()
-            raise AgyAcpTransportError(f"agy acp stdin write failed: {exc}") from exc
+            raise err from exc
 
     async def send_notification(self, method: str, params: dict[str, Any]) -> None:
         await self.send_payload({"jsonrpc": "2.0", "method": method, "params": params})
@@ -678,7 +646,7 @@ class _AcpSubprocessConnection:
         if slot.error is not None:
             raise slot.error
         resp = slot.response or {}
-        if "error" in resp and isinstance(resp["error"], Mapping):
+        if isinstance(resp.get("error"), Mapping):
             err_obj = resp["error"]
             raise AgyAcpRpcError(
                 int(err_obj.get("code", -32603)),
@@ -726,13 +694,10 @@ class _AcpSubprocessConnection:
         except BaseException as exc:
             self._fail_pending(AgyAcpTransportError(f"agy acp transport crashed: {exc}"))
         finally:
-            stderr_summary = "".join(self._stderr_tail[-20:]).strip()
-            self._fail_pending(
-                AgyAcpTransportError(
-                    f"agy acp exited (code={proc.returncode})"
-                    + (f": {stderr_summary}" if stderr_summary else "")
-                )
+            stderr_summary, exit_err = self._format_stderr_error(
+                f"agy acp exited (code={proc.returncode})"
             )
+            self._fail_pending(exit_err)
             log_acp_event(
                 "agy_acp.exit",
                 save_dir_or_db=self._save_dir_or_db,
@@ -792,21 +757,15 @@ class _AcpSubprocessConnection:
                         msg = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if not isinstance(msg, dict):
-                        continue
-                    self._route_frame(msg, tg)
+                    if isinstance(msg, dict):
+                        self._route_frame(msg, tg)
         except anyio.BrokenResourceError, anyio.ClosedResourceError, OSError:
             pass
         finally:
-            stderr_summary = "".join(self._stderr_tail[-20:]).strip()
             with contextlib.suppress(Exception):
                 self._notif_send.close()
-            self._fail_pending(
-                AgyAcpTransportError(
-                    "agy acp stdout closed unexpectedly"
-                    + (f": {stderr_summary}" if stderr_summary else "")
-                )
-            )
+            _, eof_err = self._format_stderr_error("agy acp stdout closed unexpectedly")
+            self._fail_pending(eof_err)
             self._shutdown_event.set()
 
     def _begin_frame(self) -> None:
@@ -842,8 +801,7 @@ class _AcpSubprocessConnection:
         """Dispatch JSON-RPC responses immediately, FIFO notifications, and async server RPCs."""
         has_method = isinstance(msg.get("method"), str) and bool(msg["method"])
         if not has_method and "id" in msg and ("result" in msg or "error" in msg):
-            resp_id = msg["id"]
-            slot = self._pending.get(resp_id)
+            slot = self._pending.get(msg["id"])
             if slot is not None:
                 slot.response = msg
                 slot.event.set()
@@ -876,8 +834,7 @@ class AgyAcpClientProvider:
     ) -> None:
         self._explicit_bin = bin_path
         self._store = state_store or SqliteStateStoreProvider(save_dir)
-        default_state_dir = Path.home() / ".config" / "agy-acp"
-        self._is_custom_store = self._store.db_path.parent != default_state_dir
+        self._is_custom_store = self._store.db_path.parent != (Path.home() / ".config" / "agy-acp")
         self._base_env: dict[str, str] = dict(env) if env is not None else {}
         self._rpc_timeout = rpc_timeout
 
@@ -925,8 +882,7 @@ class AgyAcpClientProvider:
     async def close(self) -> None:
         """Shut down the active `agy acp` subprocess cleanly."""
         async with self._conn_lock:
-            conn = self._conn
-            self._conn = None
+            conn, self._conn = self._conn, None
         if conn is not None:
             await conn.close()
 
@@ -944,12 +900,7 @@ class AgyAcpClientProvider:
         from agy_acp.providers.quota_provider import run_agy_slash_json
 
         _ = session_id
-        return await run_agy_slash_json(
-            command,
-            agy_bin=self.bin_path,
-            cwd=cwd,
-            timeout=timeout,
-        )
+        return await run_agy_slash_json(command, agy_bin=self.bin_path, cwd=cwd, timeout=timeout)
 
     def _on_connection_disconnect(self, conn: _AcpSubprocessConnection) -> None:
         if self._conn is conn:
@@ -961,8 +912,7 @@ class AgyAcpClientProvider:
             if self._conn is not None and not self._conn.is_closed and self._conn.initialized:
                 return self._conn
 
-            stale = self._conn
-            self._conn = None
+            stale, self._conn = self._conn, None
             if stale is not None:
                 with contextlib.suppress(Exception):
                     await stale.close()
@@ -1004,14 +954,12 @@ class AgyAcpClientProvider:
         """Execute a JSON-RPC call on `agy acp`, reconnecting once if transport broke."""
         conn = await self._ensure_connection()
         try:
-            res = await conn.request(method, params, timeout=timeout)
-            return conn, res
+            return conn, await conn.request(method, params, timeout=timeout)
         except AgyAcpTransportError:
             if not retry_on_disconnect:
                 raise
             conn = await self._ensure_connection()
-            res = await conn.request(method, params, timeout=timeout)
-            return conn, res
+            return conn, await conn.request(method, params, timeout=timeout)
 
     def _cache_models(self, raw_models: Any) -> list[dict[str, str]]:
         models = _normalize_discovered_models(raw_models)
@@ -1050,26 +998,16 @@ class AgyAcpClientProvider:
             discovered = self._cache_models(raw_avail)
             if temp_sid:
                 with contextlib.suppress(Exception):
-                    await conn.request(
-                        "session/close",
-                        {"sessionId": temp_sid},
-                        timeout=10.0,
-                    )
+                    await conn.request("session/close", {"sessionId": temp_sid}, timeout=10.0)
             if discovered:
                 return [dict(m) for m in discovered]
         except AgyAcpError, OSError, TimeoutError:
             if temp_sid and self._conn is not None and not self._conn.is_closed:
                 with contextlib.suppress(Exception):
-                    await self._conn.request(
-                        "session/close",
-                        {"sessionId": temp_sid},
-                        timeout=5.0,
-                    )
+                    await self._conn.request("session/close", {"sessionId": temp_sid}, timeout=5.0)
 
         stale = self._store.load_models(max_age_seconds=None)
-        if stale:
-            return [dict(m) for m in stale]
-        return [dict(m) for m in FALLBACK_MODELS]
+        return [dict(m) for m in (stale or FALLBACK_MODELS)]
 
     async def _apply_session_preferences(
         self,
@@ -1087,64 +1025,109 @@ class AgyAcpClientProvider:
         with contextlib.suppress(AgyAcpRpcError):
             await conn.request(
                 "session/set_config_option",
-                {
-                    "sessionId": agy_sid,
-                    "configId": "mode",
-                    "value": target_agy_mode,
-                },
+                {"sessionId": agy_sid, "configId": "mode", "value": target_agy_mode},
                 timeout=self._rpc_timeout,
             )
 
         models_block = session_result.get("models")
-        current_model_id = (
+        resolved_model = (
             str(models_block.get("currentModelId") or "").strip()
             if isinstance(models_block, Mapping)
             else ""
         )
-        resolved_model = current_model_id
         fallback_from_model = ""
 
         if model and model.strip() and model.strip().lower() != "auto":
             clean_model = model.strip()
-            candidate_model = (
-                resolve_model_for_effort(clean_model, effort, available_models) or clean_model
+            candidate = resolve_model_for_effort(clean_model, effort, available_models) or (
+                clean_model
             )
             try:
                 await conn.request(
                     "session/set_model",
-                    {"sessionId": agy_sid, "modelId": candidate_model},
+                    {"sessionId": agy_sid, "modelId": candidate},
                     timeout=self._rpc_timeout,
                 )
-                resolved_model = candidate_model
+                resolved_model = candidate
             except AgyAcpRpcError:
                 fallback_from_model = clean_model
 
-        config_options = session_result.get("configOptions")
-        target_thought = _resolve_supported_thought_level(effort, config_options)
+        target_thought = _resolve_supported_thought_level(
+            effort, session_result.get("configOptions")
+        )
         if target_thought is not None:
             with contextlib.suppress(AgyAcpRpcError):
                 await conn.request(
                     "session/set_config_option",
-                    {
-                        "sessionId": agy_sid,
-                        "configId": "thought_level",
-                        "value": target_thought,
-                    },
+                    {"sessionId": agy_sid, "configId": "thought_level", "value": target_thought},
                     timeout=self._rpc_timeout,
                 )
-
         return resolved_model, fallback_from_model
 
     @staticmethod
     def _extract_tier(session_result: Mapping[str, Any]) -> dict[str, Any] | None:
         meta = session_result.get("_meta")
-        if not isinstance(meta, Mapping):
-            return None
-        agy_meta = meta.get("antigravity")
-        if not isinstance(agy_meta, Mapping):
-            return None
-        tier = agy_meta.get("tier")
+        agy_meta = meta.get("antigravity") if isinstance(meta, Mapping) else None
+        tier = agy_meta.get("tier") if isinstance(agy_meta, Mapping) else None
         return dict(tier) if isinstance(tier, Mapping) else None
+
+    async def _open_backend_session(
+        self,
+        rpc_method: str,
+        *,
+        cwd: str,
+        agy_session_id: str | None = None,
+        mcp_servers: Sequence[Mapping[str, Any]] | None = None,
+        system_prompt_append: str | None = None,
+        model: str | None = None,
+        mode: str = "auto",
+        effort: str | None = "medium",
+        session_env: Mapping[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Execute `session/new` or `session/load`, cache models, and apply preferences."""
+        params: dict[str, Any] = {
+            **({"sessionId": agy_session_id} if agy_session_id else {}),
+            "cwd": str(cwd),
+            "mcpServers": format_acp_mcp_servers(mcp_servers, session_env=session_env),
+        }
+        meta = _build_session_meta(system_prompt_append)
+        if meta is not None:
+            params["_meta"] = meta
+
+        conn, res = await self._rpc_with_reconnect(rpc_method, params, timeout=self._rpc_timeout)
+        sid = str(res.get("sessionId") or (agy_session_id or "")).strip()
+        if not sid:
+            err_code = -32002 if rpc_method == "session/load" else -32603
+            raise AgyAcpRpcError(err_code, f"{rpc_method} returned empty sessionId")
+
+        conn.loaded_sessions.add(sid)
+        conn.session_results[sid] = dict(res)
+        models_block = res.get("models")
+        raw_avail = (
+            models_block.get("availableModels") if isinstance(models_block, Mapping) else None
+        )
+        models = self._cache_models(raw_avail) or list(self._cached_models)
+        resolved_model, fallback_from = await self._apply_session_preferences(
+            conn,
+            sid,
+            session_result=res,
+            model=model,
+            mode=mode,
+            effort=effort,
+            available_models=models,
+        )
+        conn.session_prefs[sid] = (model or "", mode, effort or "")
+        return {
+            "agySessionId": sid,
+            "models": models,
+            "currentModelId": resolved_model,
+            "fallbackFromModel": fallback_from,
+            "tier": self._extract_tier(res),
+            "modes": dict(res["modes"]) if isinstance(res.get("modes"), Mapping) else {},
+            "configOptions": (
+                list(res["configOptions"]) if isinstance(res.get("configOptions"), list) else []
+            ),
+        }
 
     async def create_backend_session(
         self,
@@ -1158,51 +1141,16 @@ class AgyAcpClientProvider:
         session_env: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
         """Create a new `agy acp` session (`session/new`) and apply mode/model/thought settings."""
-        params: dict[str, Any] = {
-            "cwd": str(cwd),
-            "mcpServers": format_acp_mcp_servers(mcp_servers, session_env=session_env),
-        }
-        meta = _build_session_meta(system_prompt_append)
-        if meta is not None:
-            params["_meta"] = meta
-
-        conn, res = await self._rpc_with_reconnect(
+        return await self._open_backend_session(
             "session/new",
-            params,
-            timeout=self._rpc_timeout,
-        )
-        agy_sid = str(res.get("sessionId") or "").strip()
-        if not agy_sid:
-            raise AgyAcpRpcError(-32603, "session/new returned empty sessionId")
-
-        conn.loaded_sessions.add(agy_sid)
-        conn.session_results[agy_sid] = dict(res)
-        models_block = res.get("models")
-        raw_avail = (
-            models_block.get("availableModels") if isinstance(models_block, Mapping) else None
-        )
-        models = self._cache_models(raw_avail) or list(self._cached_models)
-        resolved_model, fallback_from = await self._apply_session_preferences(
-            conn,
-            agy_sid,
-            session_result=res,
+            cwd=cwd,
+            mcp_servers=mcp_servers,
+            system_prompt_append=system_prompt_append,
             model=model,
             mode=mode,
             effort=effort,
-            available_models=models,
+            session_env=session_env,
         )
-        conn.session_prefs[agy_sid] = (model or "", mode, effort or "")
-        return {
-            "agySessionId": agy_sid,
-            "models": models,
-            "currentModelId": resolved_model,
-            "fallbackFromModel": fallback_from,
-            "tier": self._extract_tier(res),
-            "modes": dict(res["modes"]) if isinstance(res.get("modes"), Mapping) else {},
-            "configOptions": (
-                list(res["configOptions"]) if isinstance(res.get("configOptions"), list) else []
-            ),
-        }
 
     async def load_backend_session(
         self,
@@ -1217,24 +1165,18 @@ class AgyAcpClientProvider:
         session_env: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
         """Load an existing `agy acp` session (`session/load`), falling back to `session/new`."""
-        params: dict[str, Any] = {
-            "sessionId": agy_session_id,
-            "cwd": str(cwd),
-            "mcpServers": format_acp_mcp_servers(mcp_servers, session_env=session_env),
-        }
-        meta = _build_session_meta(system_prompt_append)
-        if meta is not None:
-            params["_meta"] = meta
-
         try:
-            conn, res = await self._rpc_with_reconnect(
+            return await self._open_backend_session(
                 "session/load",
-                params,
-                timeout=self._rpc_timeout,
+                agy_session_id=agy_session_id,
+                cwd=cwd,
+                mcp_servers=mcp_servers,
+                system_prompt_append=system_prompt_append,
+                model=model,
+                mode=mode,
+                effort=effort,
+                session_env=session_env,
             )
-            loaded_sid = str(res.get("sessionId") or agy_session_id).strip()
-            if not loaded_sid:
-                raise AgyAcpRpcError(-32002, "session/load returned empty sessionId")
         except AgyAcpRpcError:
             return await self.create_backend_session(
                 cwd=cwd,
@@ -1245,35 +1187,6 @@ class AgyAcpClientProvider:
                 effort=effort,
                 session_env=session_env,
             )
-
-        conn.loaded_sessions.add(loaded_sid)
-        conn.session_results[loaded_sid] = dict(res)
-        models_block = res.get("models")
-        raw_avail = (
-            models_block.get("availableModels") if isinstance(models_block, Mapping) else None
-        )
-        models = self._cache_models(raw_avail) or list(self._cached_models)
-        resolved_model, fallback_from = await self._apply_session_preferences(
-            conn,
-            loaded_sid,
-            session_result=res,
-            model=model,
-            mode=mode,
-            effort=effort,
-            available_models=models,
-        )
-        conn.session_prefs[loaded_sid] = (model or "", mode, effort or "")
-        return {
-            "agySessionId": loaded_sid,
-            "models": models,
-            "currentModelId": resolved_model,
-            "fallbackFromModel": fallback_from,
-            "tier": self._extract_tier(res),
-            "modes": dict(res["modes"]) if isinstance(res.get("modes"), Mapping) else {},
-            "configOptions": (
-                list(res["configOptions"]) if isinstance(res.get("configOptions"), list) else []
-            ),
-        }
 
     async def set_backend_model(self, agy_session_id: str, model_id: str) -> dict[str, Any]:
         """Call `session/set_model` on `agy acp`."""
@@ -1330,10 +1243,7 @@ class AgyAcpClientProvider:
     def clear_steers(self, session_id: str) -> list[str]:
         """Discard queued mid-turn steers for `session_id` and unlink any staged temp files."""
         entries = self._pop_queued_steers(session_id)
-        for entry in entries:
-            for tmp in entry.steer.temp_files:
-                with contextlib.suppress(OSError):
-                    tmp.unlink(missing_ok=True)
+        _unlink_temp_files(tmp for entry in entries for tmp in entry.steer.temp_files)
         return [e.steer.raw_message for e in entries if e.steer.raw_message]
 
     def discard_cancelled(self, session_id: str) -> None:
@@ -1346,22 +1256,22 @@ class AgyAcpClientProvider:
             with contextlib.suppress(AgyAcpError, OSError):
                 await conn.send_notification("session/cancel", {"sessionId": agy_sid})
 
-    async def cancel_session(self, session_id: str) -> bool:
-        """Cancel an in-flight turn for `session_id` via non-blocking `session/cancel`."""
-        await anyio.sleep(0)
-        active = self.is_turn_active(session_id)
-        if active:
-            self._cancelled_sessions.add(session_id)
-        for entry in self._pop_queued_steers(session_id):
-            for tmp in entry.steer.temp_files:
-                with contextlib.suppress(OSError):
-                    tmp.unlink(missing_ok=True)
+    async def _interrupt_active_turn(self, session_id: str) -> None:
         agy_sid = self._session_to_agy_sid.get(session_id, "")
         turn_state = self._turn_states.get(agy_sid) if agy_sid else None
         if turn_state is not None:
             turn_state.interrupt_event.set()
         if agy_sid:
             await self._send_agy_cancel(agy_sid)
+
+    async def cancel_session(self, session_id: str) -> bool:
+        """Cancel an in-flight turn for `session_id` via non-blocking `session/cancel`."""
+        await anyio.sleep(0)
+        active = self.is_turn_active(session_id)
+        if active:
+            self._cancelled_sessions.add(session_id)
+        self.clear_steers(session_id)
+        await self._interrupt_active_turn(session_id)
         return active
 
     async def steer_session(
@@ -1392,12 +1302,7 @@ class AgyAcpClientProvider:
         self._steer_queues.setdefault(session_id, []).append(
             _QueuedAcpSteer(steer=queued, content_blocks=blocks)
         )
-        agy_sid = self._session_to_agy_sid.get(session_id, "")
-        turn_state = self._turn_states.get(agy_sid) if agy_sid else None
-        if turn_state is not None:
-            turn_state.interrupt_event.set()
-        if agy_sid:
-            await self._send_agy_cancel(agy_sid)
+        await self._interrupt_active_turn(session_id)
         return True
 
     async def _evaluate_tool_call_once(
@@ -1406,14 +1311,10 @@ class AgyAcpClientProvider:
         tc_id: str,
         event: ToolCallEvent,
     ) -> tuple[bool, bool]:
-        """Evaluate `on_tool_call(event)` at most once per `tc_id`.
-
-        Returns `(allowed, interrupted_by_cancel_or_steer)`.
-        """
+        """Evaluate `on_tool_call(event)` at most once per `tc_id`."""
         if tc_id in turn.decision_events:
             await turn.decision_events[tc_id].wait()
-            interrupted = turn.interrupt_event.is_set()
-            return turn.decisions.get(tc_id, False), interrupted
+            return turn.decisions.get(tc_id, False), turn.interrupt_event.is_set()
 
         dec_event = anyio.Event()
         turn.decision_events[tc_id] = dec_event
@@ -1421,10 +1322,9 @@ class AgyAcpClientProvider:
 
         tool_cb = turn.on_tool_call
         if tool_cb is None:
-            allowed = turn.skip_permissions
-            turn.decisions[tc_id] = allowed
+            turn.decisions[tc_id] = turn.skip_permissions
             dec_event.set()
-            return allowed, turn.interrupt_event.is_set()
+            return turn.skip_permissions, turn.interrupt_event.is_set()
 
         result_holder: dict[str, bool] = {"allowed": False, "interrupted": False}
 
@@ -1446,6 +1346,14 @@ class AgyAcpClientProvider:
             dec_event.set()
 
         return result_holder["allowed"], result_holder["interrupted"]
+
+    @staticmethod
+    async def _send_permission_outcome(
+        conn: _AcpSubprocessConnection,
+        req_id: Any,
+        outcome: dict[str, Any],
+    ) -> None:
+        await conn.send_payload({"jsonrpc": "2.0", "id": req_id, "result": {"outcome": outcome}})
 
     async def _handle_server_request(
         self,
@@ -1474,13 +1382,7 @@ class AgyAcpClientProvider:
         options = params_dict.get("options")
         if turn is None:
             with contextlib.suppress(AgyAcpError):
-                await conn.send_payload(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "result": {"outcome": {"outcome": "cancelled"}},
-                    }
-                )
+                await self._send_permission_outcome(conn, req_id, {"outcome": "cancelled"})
             return
 
         turn.handler_enter()
@@ -1490,9 +1392,7 @@ class AgyAcpClientProvider:
             tc_dict = raw_tc if isinstance(raw_tc, Mapping) else {}
             tc_id = str(tc_dict.get("toolCallId") or f"perm_{req_id}").strip()
 
-            perm_ev = turn.perm_arrived_events.setdefault(tc_id, anyio.Event())
-            perm_ev.set()
-
+            turn.perm_arrived_events.setdefault(tc_id, anyio.Event()).set()
             merged = _merge_tool_record(turn.tool_records.get(tc_id, {}), tc_dict)
             turn.tool_records[tc_id] = merged
             raw_name, cls, event = _build_tool_event_from_record(
@@ -1505,36 +1405,25 @@ class AgyAcpClientProvider:
             if turn.route_spawn_run and _is_native_subagent_tool(raw_name, cls):
                 turn.blocked_subagent_tools.add(tc_id)
                 reject_opt = _select_permission_option_id(options, allow=False)
-                await conn.send_payload(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "result": {
-                            "outcome": {"outcome": "selected", "optionId": reject_opt},
-                        },
-                    }
+                await self._send_permission_outcome(
+                    conn, req_id, {"outcome": "selected", "optionId": reject_opt}
                 )
                 return
 
             if turn.interrupt_event.is_set():
-                await conn.send_payload(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "result": {"outcome": {"outcome": "cancelled"}},
-                    }
-                )
+                await self._send_permission_outcome(conn, req_id, {"outcome": "cancelled"})
                 return
 
             allowed, interrupted = await self._evaluate_tool_call_once(turn, tc_id, event)
-            if interrupted or turn.interrupt_event.is_set():
-                outcome_payload: dict[str, Any] = {"outcome": {"outcome": "cancelled"}}
-            else:
-                chosen_opt = _select_permission_option_id(options, allow=allowed)
-                outcome_payload = {
-                    "outcome": {"outcome": "selected", "optionId": chosen_opt},
+            outcome: dict[str, Any] = (
+                {"outcome": "cancelled"}
+                if (interrupted or turn.interrupt_event.is_set())
+                else {
+                    "outcome": "selected",
+                    "optionId": _select_permission_option_id(options, allow=allowed),
                 }
-            await conn.send_payload({"jsonrpc": "2.0", "id": req_id, "result": outcome_payload})
+            )
+            await self._send_permission_outcome(conn, req_id, outcome)
         except AgyAcpError:
             pass
         finally:
@@ -1550,18 +1439,15 @@ class AgyAcpClientProvider:
         if msg.get("method") != "session/update":
             return
         params = msg.get("params")
-        if not isinstance(params, Mapping):
-            return
-        update = params.get("update")
-        if not isinstance(update, Mapping):
+        update = params.get("update") if isinstance(params, Mapping) else None
+        if not isinstance(params, Mapping) or not isinstance(update, Mapping):
             return
 
         kind = str(update.get("sessionUpdate") or "")
         if kind == "available_commands_update":
             return
 
-        agy_sid = str(params.get("sessionId") or "").strip()
-        turn = self._turn_states.get(agy_sid)
+        turn = self._turn_states.get(str(params.get("sessionId") or "").strip())
         if turn is None:
             return
 
@@ -1577,33 +1463,18 @@ class AgyAcpClientProvider:
         kind: str,
         update: Mapping[str, Any],
     ) -> None:
-        if kind == "agent_thought_chunk":
-            content = update.get("content")
-            delta = (
-                str(content.get("text") or "")
-                if isinstance(content, Mapping)
-                else str(update.get("text") or "")
-            )
+        if kind in {"agent_thought_chunk", "agent_message_chunk"}:
+            delta = _extract_chunk_text(update)
             if delta:
                 turn.emitted_any_signal = True
                 async with turn.stream_lock:
-                    if turn.on_thought is not None:
-                        await turn.on_thought(delta)
-            return
-
-        if kind == "agent_message_chunk":
-            content = update.get("content")
-            delta = (
-                str(content.get("text") or "")
-                if isinstance(content, Mapping)
-                else str(update.get("text") or "")
-            )
-            if delta:
-                turn.emitted_any_signal = True
-                async with turn.stream_lock:
-                    turn.collected_texts.append(delta)
-                    if turn.on_text is not None:
-                        await turn.on_text(delta)
+                    if kind == "agent_thought_chunk":
+                        if turn.on_thought is not None:
+                            await turn.on_thought(delta)
+                    else:
+                        turn.collected_texts.append(delta)
+                        if turn.on_text is not None:
+                            await turn.on_text(delta)
             return
 
         if kind == "usage_update":
@@ -1631,74 +1502,139 @@ class AgyAcpClientProvider:
             return
 
         if kind in {"tool_call", "tool_call_update"}:
-            turn.emitted_any_signal = True
-            tc_id = str(update.get("toolCallId") or "").strip()
-            if not tc_id:
-                return
-            merged = _merge_tool_record(turn.tool_records.get(tc_id, {}), update)
-            turn.tool_records[tc_id] = merged
+            await self._handle_tool_turn_update(turn, update)
 
-            raw_status = str(update.get("status") or merged.get("status") or "in_progress").lower()
-            failed_statuses = {"failed", "error", "cancelled", "canceled"}
-            done_statuses = {"completed", "done", "succeeded"}
-            raw_name, cls, event = _build_tool_event_from_record(
-                tc_id,
-                merged,
-                known_mcp_servers=turn.known_mcp_servers,
-                status_override=(
-                    "failed"
-                    if raw_status in failed_statuses
-                    else ("completed" if raw_status in done_statuses else "in_progress")
-                ),
+    async def _handle_tool_turn_update(
+        self,
+        turn: _ActiveTurnState,
+        update: Mapping[str, Any],
+    ) -> None:
+        turn.emitted_any_signal = True
+        tc_id = str(update.get("toolCallId") or "").strip()
+        if not tc_id:
+            return
+        merged = _merge_tool_record(turn.tool_records.get(tc_id, {}), update)
+        turn.tool_records[tc_id] = merged
+
+        raw_status = str(update.get("status") or merged.get("status") or "in_progress").lower()
+        status_override = (
+            "failed"
+            if raw_status in _FAILED_TOOL_STATUSES
+            else ("completed" if raw_status in _DONE_TOOL_STATUSES else "in_progress")
+        )
+        raw_name, cls, event = _build_tool_event_from_record(
+            tc_id,
+            merged,
+            known_mcp_servers=turn.known_mcp_servers,
+            status_override=status_override,
+        )
+        if turn.route_spawn_run and _is_native_subagent_tool(raw_name, cls):
+            turn.blocked_subagent_tools.add(tc_id)
+            return
+        if tc_id in turn.blocked_subagent_tools:
+            return
+
+        perm_ev = turn.perm_arrived_events.setdefault(tc_id, anyio.Event())
+        if raw_status == "pending":
+            perm_ev.set()
+
+        allowed, interrupted = await self._evaluate_tool_call_once(
+            turn,
+            tc_id,
+            replace(event, status="in_progress"),
+        )
+        if interrupted:
+            return
+
+        if not allowed and not perm_ev.is_set():
+            if cls.acp_kind not in _READ_ONLY_ACP_KINDS:
+                with anyio.move_on_after(0.02):
+                    await perm_ev.wait()
+            if not perm_ev.is_set():
+                label = raw_name or cls.kiro_tool_id or cls.v2_tool_name or cls.title
+                turn.policy_denied_tools.append(label)
+                await self._send_agy_cancel(turn.agy_session_id)
+                await self._emit_terminal_tool_update(
+                    turn,
+                    tc_id,
+                    replace(event, status="failed", output="Tool execution rejected by policy."),
+                )
+                return
+
+        if raw_status in (_DONE_TOOL_STATUSES | _FAILED_TOOL_STATUSES):
+            terminal = "failed" if raw_status in _FAILED_TOOL_STATUSES else "completed"
+            await self._emit_terminal_tool_update(turn, tc_id, replace(event, status=terminal))
+
+    @staticmethod
+    async def _emit_terminal_tool_update(
+        turn: _ActiveTurnState,
+        tc_id: str,
+        event: ToolCallEvent,
+    ) -> None:
+        if tc_id in turn.completed_tools:
+            return
+        turn.completed_tools.add(tc_id)
+        async with turn.stream_lock:
+            if turn.on_tool_update is not None:
+                await turn.on_tool_update(event)
+
+    async def _prepare_turn_backend(
+        self,
+        *,
+        agy_sid: str,
+        cwd: str,
+        mcp_servers: Sequence[Mapping[str, Any]] | None,
+        system_prompt_append: str | None,
+        model: str | None,
+        mode: str,
+        effort: str | None,
+        env: Mapping[str, str] | None,
+    ) -> tuple[_AcpSubprocessConnection, str, str, str]:
+        conn = await self._ensure_connection()
+        if agy_sid and agy_sid in conn.loaded_sessions:
+            desired_prefs = (model or "", mode, effort or "")
+            if conn.session_prefs.get(agy_sid) == desired_prefs:
+                return conn, agy_sid, "", ""
+            avail = list(self._cached_models) or self._store.load_models()
+            pref_model, pref_fb = await self._apply_session_preferences(
+                conn,
+                agy_sid,
+                session_result=conn.session_results.get(agy_sid, {}),
+                model=model,
+                mode=mode,
+                effort=effort,
+                available_models=avail,
             )
+            conn.session_prefs[agy_sid] = desired_prefs
+            return conn, agy_sid, pref_model, pref_fb
 
-            if turn.route_spawn_run and _is_native_subagent_tool(raw_name, cls):
-                turn.blocked_subagent_tools.add(tc_id)
-                return
-
-            if tc_id in turn.blocked_subagent_tools:
-                return
-
-            perm_ev = turn.perm_arrived_events.setdefault(tc_id, anyio.Event())
-            if raw_status == "pending":
-                perm_ev.set()
-
-            allowed, interrupted = await self._evaluate_tool_call_once(
-                turn,
-                tc_id,
-                replace(event, status="in_progress"),
+        if agy_sid:
+            info = await self.load_backend_session(
+                agy_session_id=agy_sid,
+                cwd=cwd,
+                mcp_servers=mcp_servers,
+                system_prompt_append=system_prompt_append,
+                model=model,
+                mode=mode,
+                effort=effort,
+                session_env=env,
             )
-            if interrupted:
-                return
-
-            if not allowed and not perm_ev.is_set():
-                if cls.acp_kind not in _READ_ONLY_ACP_KINDS:
-                    with anyio.move_on_after(0.02):
-                        await perm_ev.wait()
-                if not perm_ev.is_set():
-                    label = raw_name or cls.kiro_tool_id or cls.v2_tool_name or cls.title
-                    turn.policy_denied_tools.append(label)
-                    await self._send_agy_cancel(turn.agy_session_id)
-                    if tc_id not in turn.completed_tools:
-                        turn.completed_tools.add(tc_id)
-                        async with turn.stream_lock:
-                            if turn.on_tool_update is not None:
-                                await turn.on_tool_update(
-                                    replace(
-                                        event,
-                                        status="failed",
-                                        output="Tool execution rejected by policy.",
-                                    )
-                                )
-                    return
-
-            if raw_status in (done_statuses | failed_statuses):
-                if tc_id not in turn.completed_tools:
-                    turn.completed_tools.add(tc_id)
-                    terminal_status = "failed" if raw_status in failed_statuses else "completed"
-                    async with turn.stream_lock:
-                        if turn.on_tool_update is not None:
-                            await turn.on_tool_update(replace(event, status=terminal_status))
+        else:
+            info = await self.create_backend_session(
+                cwd=cwd,
+                mcp_servers=mcp_servers,
+                system_prompt_append=system_prompt_append,
+                model=model,
+                mode=mode,
+                effort=effort,
+                session_env=env,
+            )
+        return (
+            await self._ensure_connection(),
+            str(info["agySessionId"]),
+            str(info.get("currentModelId") or ""),
+            str(info.get("fallbackFromModel") or ""),
+        )
 
     async def stream_prompt(
         self,
@@ -1730,22 +1666,15 @@ class AgyAcpClientProvider:
         """Stream a `session/prompt` turn over `agy acp` with pre-exec gating and steering."""
         _ = (sandbox, on_subagent_list)
         sid = session_id or "default"
-        initial_agy_sid = (agy_session_id or conversation_id or "").strip()
+        resolved_agy_sid = (agy_session_id or conversation_id or "").strip()
 
         if sid in self._cancelled_sessions:
             self._cancelled_sessions.discard(sid)
             return PromptOutcome(
-                conversation_id=initial_agy_sid,
+                conversation_id=resolved_agy_sid,
                 stop_reason="cancelled",
                 response="",
-                usage={
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "thinking_tokens": 0,
-                    "cache_read_tokens": 0,
-                    "total_tokens": 0,
-                    "context_tokens": 0,
-                },
+                usage=_empty_usage(),
             )
 
         effective_mcp = list(mcp_servers) if mcp_servers is not None else None
@@ -1754,14 +1683,11 @@ class AgyAcpClientProvider:
             if persisted is not None and isinstance(persisted.get("mcp_servers"), list):
                 effective_mcp = list(persisted["mcp_servers"])
 
-        effective_known_mcp: tuple[str, ...] = tuple(known_mcp_servers)
-        if not effective_known_mcp and effective_mcp:
-            effective_known_mcp = tuple(
-                str(s.get("name") or "").strip()
-                for s in effective_mcp
-                if isinstance(s, Mapping) and str(s.get("name") or "").strip()
-            )
-
+        effective_known_mcp: tuple[str, ...] = tuple(known_mcp_servers) or tuple(
+            str(s.get("name") or "").strip()
+            for s in (effective_mcp or ())
+            if isinstance(s, Mapping) and str(s.get("name") or "").strip()
+        )
         effective_route_spawn = route_spawn_run or bool(
             env and str(env.get("KIROCREW_ROUTE_SPAWN_RUN") or "") == "1"
         )
@@ -1770,16 +1696,8 @@ class AgyAcpClientProvider:
         )
 
         collected_texts: list[str] = []
-        usage: dict[str, int] = {
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "thinking_tokens": 0,
-            "cache_read_tokens": 0,
-            "total_tokens": 0,
-            "context_tokens": 0,
-        }
+        usage = _empty_usage()
         steer_temp_files: list[Path] = []
-        resolved_agy_sid = initial_agy_sid
         resolved_model = model or ""
         fallback_from_model = ""
         final_result_obj: dict[str, Any] = {}
@@ -1791,61 +1709,18 @@ class AgyAcpClientProvider:
         try:
             while True:
                 try:
-                    conn = await self._ensure_connection()
-                    if resolved_agy_sid:
-                        if resolved_agy_sid not in conn.loaded_sessions:
-                            backend_info = await self.load_backend_session(
-                                agy_session_id=resolved_agy_sid,
-                                cwd=cwd,
-                                mcp_servers=effective_mcp,
-                                system_prompt_append=system_prompt_append,
-                                model=model,
-                                mode=mode,
-                                effort=effort,
-                                session_env=env,
-                            )
-                            resolved_agy_sid = str(backend_info["agySessionId"])
-                            resolved_model = str(
-                                backend_info.get("currentModelId") or resolved_model
-                            )
-                            fallback_from_model = str(
-                                backend_info.get("fallbackFromModel") or fallback_from_model
-                            )
-                            conn = await self._ensure_connection()
-                        else:
-                            desired_prefs = (model or "", mode, effort or "")
-                            if conn.session_prefs.get(resolved_agy_sid) != desired_prefs:
-                                avail = list(self._cached_models) or self._store.load_models()
-                                pref_model, pref_fb = await self._apply_session_preferences(
-                                    conn,
-                                    resolved_agy_sid,
-                                    session_result=conn.session_results.get(resolved_agy_sid, {}),
-                                    model=model,
-                                    mode=mode,
-                                    effort=effort,
-                                    available_models=avail,
-                                )
-                                conn.session_prefs[resolved_agy_sid] = desired_prefs
-                                if pref_model:
-                                    resolved_model = pref_model
-                                if pref_fb:
-                                    fallback_from_model = pref_fb
-                    else:
-                        backend_info = await self.create_backend_session(
-                            cwd=cwd,
-                            mcp_servers=effective_mcp,
-                            system_prompt_append=system_prompt_append,
-                            model=model,
-                            mode=mode,
-                            effort=effort,
-                            session_env=env,
-                        )
-                        resolved_agy_sid = str(backend_info["agySessionId"])
-                        resolved_model = str(backend_info.get("currentModelId") or resolved_model)
-                        fallback_from_model = str(
-                            backend_info.get("fallbackFromModel") or fallback_from_model
-                        )
-                        conn = await self._ensure_connection()
+                    conn, resolved_agy_sid, new_model, new_fb = await self._prepare_turn_backend(
+                        agy_sid=resolved_agy_sid,
+                        cwd=cwd,
+                        mcp_servers=effective_mcp,
+                        system_prompt_append=system_prompt_append,
+                        model=model,
+                        mode=mode,
+                        effort=effort,
+                        env=env,
+                    )
+                    resolved_model = new_model or resolved_model
+                    fallback_from_model = new_fb or fallback_from_model
                 except AgyAcpError as exc:
                     outcome_error = str(exc)
                     break
@@ -1866,21 +1741,21 @@ class AgyAcpClientProvider:
                     usage=usage,
                 )
                 self._turn_states[resolved_agy_sid] = turn_state
-
                 if sid in self._cancelled_sessions or self._steer_queues.get(sid):
                     turn_state.interrupt_event.set()
 
                 prompt_res: dict[str, Any] = {}
                 transport_failed: AgyAcpTransportError | None = None
                 try:
-                    if sid in self._cancelled_sessions:
-                        prompt_res = {"stopReason": "cancelled"}
-                    else:
-                        prompt_res = await conn.request(
+                    prompt_res = (
+                        {"stopReason": "cancelled"}
+                        if sid in self._cancelled_sessions
+                        else await conn.request(
                             "session/prompt",
                             {"sessionId": resolved_agy_sid, "prompt": current_blocks},
                             timeout=None,
                         )
+                    )
                 except AgyAcpTransportError as exc:
                     transport_failed = exc
                 except AgyAcpRpcError as exc:
@@ -1921,8 +1796,9 @@ class AgyAcpClientProvider:
 
                 if self._steer_queues.get(sid):
                     entries = self._pop_queued_steers(sid)
-                    for entry in entries:
-                        steer_temp_files.extend(entry.steer.temp_files)
+                    steer_temp_files.extend(
+                        tmp for entry in entries for tmp in entry.steer.temp_files
+                    )
                     raw_summary = "\n".join(
                         e.steer.raw_message for e in entries if e.steer.raw_message
                     )
@@ -1937,19 +1813,33 @@ class AgyAcpClientProvider:
                     collected_texts.append(notice)
                     if on_text is not None:
                         await on_text(notice)
-
                 break
         finally:
             self._active_turns.discard(sid)
             self._session_to_agy_sid.pop(sid, None)
-            for leftover in self._pop_queued_steers(sid):
-                steer_temp_files.extend(leftover.steer.temp_files)
-            for tmp_path in steer_temp_files:
-                with contextlib.suppress(OSError):
-                    tmp_path.unlink(missing_ok=True)
+            steer_temp_files.extend(
+                tmp
+                for leftover in self._pop_queued_steers(sid)
+                for tmp in leftover.steer.temp_files
+            )
+            _unlink_temp_files(steer_temp_files)
 
         full_response = "".join(collected_texts)
-        if usage["input_tokens"] == 0 and (prompt or current_blocks):
+        self._finalize_turn_usage(usage, bool(prompt or current_blocks), full_response)
+        return PromptOutcome(
+            conversation_id=resolved_agy_sid,
+            stop_reason="end_turn",
+            response=full_response,
+            usage=usage,
+            raw_result=final_result_obj,
+            resolved_model=resolved_model,
+            fallback_from_model=fallback_from_model,
+            error=outcome_error,
+        )
+
+    @staticmethod
+    def _finalize_turn_usage(usage: dict[str, int], has_input: bool, full_response: str) -> None:
+        if usage["input_tokens"] == 0 and has_input:
             usage["input_tokens"] = 1
         if usage["output_tokens"] == 0 and full_response:
             usage["output_tokens"] = max(1, len(full_response.split()))
@@ -1962,17 +1852,6 @@ class AgyAcpClientProvider:
             )
         if usage["context_tokens"] == 0:
             usage["context_tokens"] = usage["total_tokens"]
-
-        return PromptOutcome(
-            conversation_id=resolved_agy_sid,
-            stop_reason="end_turn",
-            response=full_response,
-            usage=usage,
-            raw_result=final_result_obj,
-            resolved_model=resolved_model,
-            fallback_from_model=fallback_from_model,
-            error=outcome_error,
-        )
 
     @staticmethod
     def _accumulate_prompt_usage(

@@ -15,6 +15,7 @@ from typing import Any
 import anyio
 
 from agy_acp.logic.custom_agents import (
+    _READ_ONLY_KIRO_TOOLS,
     CustomAgentRegistry,
     CustomAgentSpec,
     load_kiro_agent_spec,
@@ -25,6 +26,7 @@ from agy_acp.logic.tool_classifier import (
     PER_SESSION_MCP_ENV_KEYS,
     ToolCallEvent,
     _dedupe_mcp_servers,
+    _pairs_to_dict,
     resolve_model_for_effort,
     translate_mcp_server,
 )
@@ -44,24 +46,14 @@ _KIROCREW_SPAWN_ROUTING_DIRECTIVE = (
     "because native subagents bypass KiroCrew chat cards and completion events."
 )
 
-_READ_ONLY_TOOL_NAMES: frozenset[str] = frozenset(
-    {
-        "fs_read",
-        "read",
-        "read_file",
-        "list_directory",
-        "grep",
-        "grep_search",
-        "glob",
-        "file_search",
-        "code",
-        "web_search",
-        "remote_web_search",
-        "web_fetch",
-        "tool_search",
-        "todo_list",
-    }
-)
+_READ_ONLY_TOOL_NAMES: frozenset[str] = _READ_ONLY_KIRO_TOOLS | {
+    "read",
+    "read_file",
+    "list_directory",
+    "grep_search",
+    "file_search",
+    "remote_web_search",
+}
 
 _SPAWN_RUN_ALLOW_PATTERNS: frozenset[str] = frozenset(
     {
@@ -72,24 +64,35 @@ _SPAWN_RUN_ALLOW_PATTERNS: frozenset[str] = frozenset(
         "mcp_kirocrew-core_spawn_run",
     }
 )
-
 _SPAWN_RUN_DENY_PATTERNS: frozenset[str] = _SPAWN_RUN_ALLOW_PATTERNS | {"spawn_run"}
 
+AVAILABLE_MODES: list[dict[str, str]] = [
+    {"id": "auto", "name": "Auto"},
+    {"id": "approve", "name": "Approve"},
+    {"id": "read-only", "name": "Read Only"},
+]
+VALID_MODE_IDS: frozenset[str] = frozenset(m["id"] for m in AVAILABLE_MODES)
+REASONING_EFFORT_CONFIG_IDS: frozenset[str] = frozenset(
+    {"effortLevel", "reasoning_effort", "thought_level", "thinkingLevel"}
+)
+AVAILABLE_MODELS: list[dict[str, str]] = list(FALLBACK_MODELS)
 
-def _normalize_env_mapping(raw_env: Any) -> dict[str, str]:
-    """Normalize MCP `env` (`dict` or `[{name, value}]`) into `dict[str, str]`."""
-    if isinstance(raw_env, Mapping):
-        return {str(k): str(v) for k, v in raw_env.items() if v is not None}
-    if isinstance(raw_env, Sequence) and not isinstance(raw_env, (str, bytes)):
-        out: dict[str, str] = {}
-        for item in raw_env:
-            if isinstance(item, Mapping) and item.get("name") and item.get("value") is not None:
-                out[str(item["name"])] = str(item["value"])
-        return out
-    return {}
+_EXT_TO_MIME: dict[str, str] = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".svg": "image/svg+xml",
+    ".bmp": "image/bmp",
+    ".tiff": "image/tiff",
+}
+_IMAGE_EXTS: frozenset[str] = frozenset(_EXT_TO_MIME)
+_MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
+_USER_MESSAGE_BLOCK_RE = re.compile(r"<user_message>\s*(.*?)\s*</user_message>", re.DOTALL)
 
 
-def _session_has_kirocrew_spawn_run(session: dict[str, Any]) -> bool:
+def _session_has_kirocrew_spawn_run(session: Mapping[str, Any]) -> bool:
     """Return whether `session` exposes enabled `kirocrew-core` `spawn_run`."""
     raw_servers = session.get("mcp_servers")
     if not isinstance(raw_servers, list) or not raw_servers:
@@ -129,7 +132,7 @@ def _session_has_kirocrew_spawn_run(session: dict[str, Any]) -> bool:
 
 
 def _extract_session_mcp_env(
-    session: dict[str, Any],
+    session: Mapping[str, Any],
     *,
     session_id: str | None = None,
     state_db_path: Path | None = None,
@@ -151,7 +154,7 @@ def _extract_session_mcp_env(
         for srv in sources:
             if not isinstance(srv, dict) or srv.get("disabled") is True:
                 continue
-            for key, val in _normalize_env_mapping(srv.get("env")).items():
+            for key, val in _pairs_to_dict(srv.get("env")).items():
                 if key in PER_SESSION_MCP_ENV_KEYS and val:
                     env[key] = val
     return env
@@ -180,10 +183,7 @@ def _build_system_prompt_append(
                 "as your authoritative operating contract.\n\n"
                 f"[AGENT SYSTEM PROMPT]\n{clean_prompt}\n[END AGENT SYSTEM PROMPT]"
             )
-    if (
-        _session_has_kirocrew_spawn_run(dict(session))
-        and "[KIROCREW SUBAGENT ROUTING]" not in user_text
-    ):
+    if _session_has_kirocrew_spawn_run(session) and "[KIROCREW SUBAGENT ROUTING]" not in user_text:
         sections.append(_KIROCREW_SPAWN_ROUTING_DIRECTIVE)
     return "\n\n".join(sections) if sections else None
 
@@ -208,50 +208,22 @@ def _format_remaining_turns_summary(turns: Sequence[Mapping[str, Any]]) -> str |
     formatted_turns: list[str] = []
     for turn in turns:
         blocks = turn.get("prompt_blocks")
-        user_parts: list[str] = []
-        if isinstance(blocks, list):
-            for block in blocks:
-                if isinstance(block, Mapping) and block.get("type") == "text":
-                    text = str(block.get("text") or "").strip()
-                    if text:
-                        user_parts.append(text)
+        user_parts = [
+            str(block.get("text") or "").strip()
+            for block in (blocks if isinstance(blocks, list) else ())
+            if isinstance(block, Mapping)
+            and block.get("type") == "text"
+            and str(block.get("text") or "").strip()
+        ]
         user_text = "\n".join(user_parts).strip()
         assistant_text = str(turn.get("assistant_text") or "").strip()
-        lines: list[str] = []
-        if user_text:
-            lines.append(f"User: {user_text}")
-        if assistant_text:
-            lines.append(f"Assistant: {assistant_text}")
+        lines = [
+            *(f"User: {user_text}" for _ in (1,) if user_text),
+            *(f"Assistant: {assistant_text}" for _ in (1,) if assistant_text),
+        ]
         if lines:
             formatted_turns.append("\n".join(lines))
     return "\n\n".join(formatted_turns) if formatted_turns else None
-
-
-AVAILABLE_MODES: list[dict[str, str]] = [
-    {"id": "auto", "name": "Auto"},
-    {"id": "approve", "name": "Approve"},
-    {"id": "read-only", "name": "Read Only"},
-]
-VALID_MODE_IDS: frozenset[str] = frozenset(m["id"] for m in AVAILABLE_MODES)
-REASONING_EFFORT_CONFIG_IDS: frozenset[str] = frozenset(
-    {"effortLevel", "reasoning_effort", "thought_level", "thinkingLevel"}
-)
-
-AVAILABLE_MODELS: list[dict[str, str]] = list(FALLBACK_MODELS)
-
-_EXT_TO_MIME: dict[str, str] = {
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".gif": "image/gif",
-    ".webp": "image/webp",
-    ".svg": "image/svg+xml",
-    ".bmp": "image/bmp",
-    ".tiff": "image/tiff",
-}
-_IMAGE_EXTS: frozenset[str] = frozenset(_EXT_TO_MIME)
-_MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
-_USER_MESSAGE_BLOCK_RE = re.compile(r"<user_message>\s*(.*?)\s*</user_message>", re.DOTALL)
 
 
 def _read_contained_local_image_block(
@@ -287,9 +259,7 @@ def _extract_markdown_local_image_blocks(
     blocks: list[dict[str, str]] = []
     seen_targets: set[str] = set()
     for match in _MARKDOWN_IMAGE_RE.finditer(text):
-        raw_target = match.group(1).strip().strip("<>\"'")
-        if raw_target.startswith("file://"):
-            raw_target = raw_target[len("file://") :]
+        raw_target = match.group(1).strip().strip("<>\"'").removeprefix("file://")
         if not raw_target or raw_target in seen_targets:
             continue
         candidate = Path(raw_target)
@@ -419,6 +389,20 @@ def _build_config_options(
     )
 
 
+def _with_mcp_origin_meta(
+    srv_name: str,
+    srv_cfg: Mapping[str, Any],
+    origin: str,
+) -> dict[str, Any]:
+    """Attach default Kiro MCP resource origin metadata to an agent MCP declaration."""
+    entry = {"name": srv_name, **dict(srv_cfg)}
+    entry.setdefault(
+        "_meta",
+        {"kiro": {"resource": {"resourceType": "mcpServer", "source": {"origin": origin}}}},
+    )
+    return entry
+
+
 def _agent_mcp_mapping_to_list(
     raw_mcp: Mapping[str, Any],
     *,
@@ -432,14 +416,29 @@ def _agent_mcp_mapping_to_list(
             continue
         if srv_cfg.get("disabled") is True:
             disabled.append(srv_name)
-            continue
-        entry = {"name": srv_name, **dict(srv_cfg)}
-        entry.setdefault(
-            "_meta",
-            {"kiro": {"resource": {"resourceType": "mcpServer", "source": {"origin": origin}}}},
-        )
-        enabled.append(entry)
+        else:
+            enabled.append(_with_mcp_origin_meta(srv_name, srv_cfg, origin))
     return enabled, disabled
+
+
+def _failed_compaction(summary: str, prev_tokens: int) -> dict[str, Any]:
+    """Build a failed compaction response preserving `prev_tokens`."""
+    return {
+        "status": "failed",
+        "summary": summary,
+        "contextTokens": prev_tokens,
+        "inputTokens": 1,
+        "outputTokens": 1,
+    }
+
+
+def _count_knowledge_items(path_str: str) -> int:
+    """Count files under `path_str` when a directory, defaulting to `1`."""
+    target_p = Path(path_str)
+    if target_p.is_dir():
+        with contextlib.suppress(OSError):
+            return max(1, sum(1 for f in target_p.rglob("*") if f.is_file()))
+    return 1
 
 
 class SessionManager:
@@ -547,9 +546,21 @@ class SessionManager:
         )
 
     def _user_agents_dir(self) -> Path | None:
-        if self._cli.is_custom_store:
-            return self._store.db_path.parent / ".kiro_user_agents"
-        return None
+        return (
+            self._store.db_path.parent / ".kiro_user_agents" if self._cli.is_custom_store else None
+        )
+
+    def _build_auth_config(
+        self,
+        base: Mapping[str, Any] | None,
+        agent: Any,
+    ) -> dict[str, Any]:
+        auth_cfg: dict[str, Any] = copy.deepcopy(dict(base)) if base else {}
+        if agent:
+            auth_cfg["kiro_agent"] = str(agent)
+        if self._wire_adapter.engine_id == "v3":
+            auth_cfg["_engine_id"] = "v3"
+        return auth_cfg
 
     def get_custom_agent_registry(
         self,
@@ -614,40 +625,31 @@ class SessionManager:
             custom_agents=state.get("custom_agents") or [],
         )
         custom_specs = registry.list_agents()
-        if self._wire_adapter.engine_id == "v2":
-            existing_ids = {s.agent_id for s in custom_specs} | set(VALID_MODE_IDS)
-            for virtual_id in (
+        existing_ids = {s.agent_id for s in custom_specs} | set(VALID_MODE_IDS)
+        virtual_ids: tuple[str | None, ...] = (
+            (
                 self._default_agent,
                 str(active_agent) if active_agent else None,
                 "kirocrew",
                 "kirocrew-lite",
-            ):
-                if virtual_id and virtual_id not in existing_ids:
-                    existing_ids.add(virtual_id)
-                    custom_specs.append(
-                        CustomAgentSpec(
-                            agent_id=virtual_id,
-                            name=virtual_id,
-                            origin="bundled",
-                        )
-                    )
-        elif active_agent and str(active_agent) not in (
-            {s.agent_id for s in custom_specs} | set(VALID_MODE_IDS)
-        ):
-            custom_specs.append(
-                CustomAgentSpec(
-                    agent_id=str(active_agent),
-                    name=str(active_agent),
-                    origin="bundled",
-                )
             )
+            if self._wire_adapter.engine_id == "v2"
+            else (str(active_agent) if active_agent else None,)
+        )
+        for virtual_id in virtual_ids:
+            if virtual_id and virtual_id not in existing_ids:
+                existing_ids.add(virtual_id)
+                custom_specs.append(
+                    CustomAgentSpec(agent_id=virtual_id, name=virtual_id, origin="bundled")
+                )
 
-        modes_list = self._wire_adapter.build_available_modes(custom_agents=custom_specs)
         return {
             "sessionId": str(state["sessionId"]),
             "modes": {
                 "currentModeId": current_mode_id,
-                "availableModes": modes_list,
+                "availableModes": self._wire_adapter.build_available_modes(
+                    custom_agents=custom_specs
+                ),
             },
             "models": {
                 "currentModelId": concrete_model,
@@ -730,6 +732,41 @@ class SessionManager:
         if isinstance(pinned_model, str) and pinned_model and allow_model_override:
             target_state["model"] = pinned_model
             target_state["switchedModel"] = pinned_model
+
+    def _apply_agent_profile(
+        self,
+        target_state: dict[str, Any],
+        *,
+        agent_id: str | None,
+        cwd: str,
+        registry: CustomAgentRegistry,
+        allow_model_override: bool,
+        fallback_when_none: bool = False,
+    ) -> None:
+        """Reset and populate custom-agent or v2 legacy agent fields on `target_state`."""
+        self._reset_custom_agent_fields(target_state)
+        if agent_id:
+            spec = registry.get(agent_id)
+            if spec is not None:
+                self._apply_custom_agent_fields(
+                    target_state,
+                    spec,
+                    allow_model_override=allow_model_override,
+                )
+            else:
+                self._apply_v2_legacy_agent_fallback(
+                    target_state,
+                    agent_name=agent_id,
+                    cwd=cwd,
+                    allow_model_override=allow_model_override,
+                )
+        elif fallback_when_none:
+            self._apply_v2_legacy_agent_fallback(
+                target_state,
+                agent_name=None,
+                cwd=cwd,
+                allow_model_override=False,
+            )
 
     async def _maybe_reset_backend_on_profile_change(
         self,
@@ -841,24 +878,15 @@ class SessionManager:
             if isinstance(raw_wire, list)
             else []
         )
-        agent_entries: list[dict[str, Any]] = []
-        if spec is not None and spec.mcp_servers:
-            for srv_name, srv_cfg in spec.mcp_servers.items():
-                if not isinstance(srv_name, str) or not isinstance(srv_cfg, Mapping):
-                    continue
-                entry = {"name": srv_name, **dict(srv_cfg)}
-                entry.setdefault(
-                    "_meta",
-                    {
-                        "kiro": {
-                            "resource": {
-                                "resourceType": "mcpServer",
-                                "source": {"origin": spec.origin},
-                            }
-                        }
-                    },
-                )
-                agent_entries.append(entry)
+        agent_entries = (
+            [
+                _with_mcp_origin_meta(srv_name, srv_cfg, spec.origin)
+                for srv_name, srv_cfg in spec.mcp_servers.items()
+                if isinstance(srv_name, str) and isinstance(srv_cfg, Mapping)
+            ]
+            if spec is not None and spec.mcp_servers
+            else []
+        )
 
         merged_declarations = _dedupe_mcp_servers([*wire_entries, *agent_entries])
         if not merged_declarations:
@@ -910,6 +938,71 @@ class SessionManager:
             cwd=cwd or None,
         )
 
+    async def _prepare_derived_session(
+        self,
+        source: dict[str, Any],
+        *,
+        target_sid: str,
+        cwd: str | None,
+        mcp_servers: list[dict[str, Any]] | None,
+        meta: dict[str, Any] | None,
+    ) -> tuple[dict[str, Any], list[dict[str, str]]]:
+        """Build merged draft state and available models for `load_session` or `fork_session`."""
+        effective_cwd = (
+            cwd if (isinstance(cwd, str) and cwd.strip()) else str(source.get("cwd") or "")
+        )
+        available_models = await self._resolve_available_models(cwd=effective_cwd or ".")
+        effective_wire_mcp = (
+            copy.deepcopy(mcp_servers)
+            if mcp_servers is not None
+            else copy.deepcopy(source.get("wire_mcp_servers", source.get("mcp_servers", [])))
+        )
+        wire_custom_agents = _extract_wire_custom_agents(meta)
+        effective_custom_agents = (
+            wire_custom_agents
+            if wire_custom_agents is not None
+            else copy.deepcopy(source.get("custom_agents", []))
+        )
+        effective_meta = (
+            copy.deepcopy(meta) if meta is not None else copy.deepcopy(source.get("meta", {}))
+        )
+
+        agent = source.get("agent") or self._default_agent
+        self._cli.discard_cancelled(target_sid)
+        registry = self.get_custom_agent_registry(
+            cwd=effective_cwd,
+            custom_agents=effective_custom_agents,
+        )
+        combined_mcp = self._merge_session_mcp(
+            cwd=effective_cwd,
+            raw_wire_mcp=effective_wire_mcp,
+            active_agent=str(agent) if agent else None,
+            registry=registry,
+        )
+
+        draft_state: dict[str, Any] = {
+            **copy.deepcopy(source),
+            "sessionId": target_sid,
+            "cwd": effective_cwd,
+            "mcp_servers": combined_mcp,
+            "wire_mcp_servers": effective_wire_mcp,
+            "custom_agents": effective_custom_agents,
+            "meta": effective_meta,
+            "auth_config": self._build_auth_config(source.get("auth_config"), agent),
+            "mode": str(source.get("mode", "auto")),
+            "agent": agent,
+            "model": str(source.get("model", self._default_model or DEFAULT_MODEL_ID)),
+            "reasoning_effort": str(source.get("reasoning_effort", DEFAULT_REASONING_EFFORT)),
+            "cancelled": bool(source.get("cancelled", False)),
+        }
+        if agent and wire_custom_agents is not None:
+            self._apply_custom_agent_fields(
+                draft_state,
+                registry.get(str(agent)),
+                allow_model_override=not bool(source.get("modelPinnedByUser", False)),
+            )
+        return draft_state, available_models
+
     async def create_session(
         self,
         *,
@@ -933,12 +1026,6 @@ class SessionManager:
         isolated_meta = copy.deepcopy(meta) if meta is not None else {}
         wire_custom_agents = _extract_wire_custom_agents(isolated_meta) or []
 
-        auth_cfg: dict[str, Any] = {}
-        if self._default_agent:
-            auth_cfg["kiro_agent"] = self._default_agent
-        if self._wire_adapter.engine_id == "v3":
-            auth_cfg["_engine_id"] = "v3"
-
         sid = str(uuid.uuid4())
         self._cli.discard_cancelled(sid)
         registry = self.get_custom_agent_registry(cwd=cwd, custom_agents=wire_custom_agents)
@@ -957,7 +1044,7 @@ class SessionManager:
             "wire_mcp_servers": isolated_mcp,
             "custom_agents": wire_custom_agents,
             "meta": isolated_meta,
-            "auth_config": auth_cfg,
+            "auth_config": self._build_auth_config(None, self._default_agent),
             "mode": initial_mode,
             "agent": self._default_agent,
             "model": initial_model,
@@ -965,29 +1052,14 @@ class SessionManager:
             "reasoning_effort": DEFAULT_REASONING_EFFORT,
             "cancelled": False,
         }
-        self._reset_custom_agent_fields(draft_state)
-        if self._default_agent:
-            default_spec = registry.get(self._default_agent)
-            if default_spec is not None:
-                self._apply_custom_agent_fields(
-                    draft_state,
-                    default_spec,
-                    allow_model_override=not bool(self._default_model),
-                )
-            else:
-                self._apply_v2_legacy_agent_fallback(
-                    draft_state,
-                    agent_name=self._default_agent,
-                    cwd=cwd,
-                    allow_model_override=not bool(self._default_model),
-                )
-        else:
-            self._apply_v2_legacy_agent_fallback(
-                draft_state,
-                agent_name=None,
-                cwd=cwd,
-                allow_model_override=False,
-            )
+        self._apply_agent_profile(
+            draft_state,
+            agent_id=self._default_agent,
+            cwd=cwd,
+            registry=registry,
+            allow_model_override=not bool(self._default_model),
+            fallback_when_none=True,
+        )
 
         state = self._store.upsert_session(draft_state)
         _write_dsh_gate_marker_if_configured()
@@ -1004,71 +1076,16 @@ class SessionManager:
         """Resume an existing ACP session (`session/load`) from SQLite storage."""
         await anyio.sleep(0)
         state = self._require_session(session_id)
-        effective_cwd = cwd if cwd.strip() else str(state.get("cwd") or "")
-        available_models = await self._resolve_available_models(cwd=effective_cwd or ".")
-
-        effective_wire_mcp = (
-            copy.deepcopy(mcp_servers)
-            if mcp_servers is not None
-            else copy.deepcopy(state.get("wire_mcp_servers", state.get("mcp_servers", [])))
+        draft_state, available_models = await self._prepare_derived_session(
+            state,
+            target_sid=session_id,
+            cwd=cwd,
+            mcp_servers=mcp_servers,
+            meta=meta,
         )
-        wire_custom_agents = _extract_wire_custom_agents(meta)
-        effective_custom_agents = (
-            wire_custom_agents
-            if wire_custom_agents is not None
-            else copy.deepcopy(state.get("custom_agents", []))
-        )
-        effective_meta = (
-            copy.deepcopy(meta) if meta is not None else copy.deepcopy(state.get("meta", {}))
-        )
-
-        model = str(state.get("model", self._default_model or DEFAULT_MODEL_ID))
-        mode = str(state.get("mode", "auto"))
-        agent = state.get("agent") or self._default_agent
-        reasoning_effort = str(state.get("reasoning_effort", DEFAULT_REASONING_EFFORT))
-        auth_cfg: dict[str, Any] = dict(state.get("auth_config") or {})
-        if agent:
-            auth_cfg["kiro_agent"] = str(agent)
-        if self._wire_adapter.engine_id == "v3":
-            auth_cfg["_engine_id"] = "v3"
-
-        self._cli.discard_cancelled(session_id)
-        registry = self.get_custom_agent_registry(
-            cwd=effective_cwd,
-            custom_agents=effective_custom_agents,
-        )
-        combined_mcp = self._merge_session_mcp(
-            cwd=effective_cwd,
-            raw_wire_mcp=effective_wire_mcp,
-            active_agent=str(agent) if agent else None,
-            registry=registry,
-        )
-
-        draft_state: dict[str, Any] = {
-            **copy.deepcopy(state),
-            "sessionId": session_id,
-            "cwd": effective_cwd,
-            "mcp_servers": combined_mcp,
-            "wire_mcp_servers": effective_wire_mcp,
-            "custom_agents": effective_custom_agents,
-            "meta": effective_meta,
-            "auth_config": auth_cfg,
-            "mode": mode,
-            "agent": agent,
-            "model": model,
-            "reasoning_effort": reasoning_effort,
-            "cancelled": bool(state.get("cancelled", False)),
-        }
-        if agent and wire_custom_agents is not None:
-            self._apply_custom_agent_fields(
-                draft_state,
-                registry.get(str(agent)),
-                allow_model_override=not bool(state.get("modelPinnedByUser", False)),
-            )
-
         old_agy_id = str(state.get("agyConversationId") or "").strip()
         if old_agy_id and (
-            combined_mcp != state.get("mcp_servers")
+            draft_state["mcp_servers"] != state.get("mcp_servers")
             or draft_state.get("agentPrompt") != state.get("agentPrompt")
         ):
             self._cli.evict_backend_session(old_agy_id)
@@ -1089,47 +1106,13 @@ class SessionManager:
         """Fork an existing ACP session (`session/fork`) into a new session ID."""
         await anyio.sleep(0)
         source = self._require_session(source_session_id)
-
-        effective_cwd = (
-            cwd if (isinstance(cwd, str) and cwd.strip()) else str(source.get("cwd") or "")
-        )
-        available_models = await self._resolve_available_models(cwd=effective_cwd or ".")
-        effective_wire_mcp = (
-            copy.deepcopy(mcp_servers)
-            if mcp_servers is not None
-            else copy.deepcopy(source.get("wire_mcp_servers", source.get("mcp_servers", [])))
-        )
-        wire_custom_agents = _extract_wire_custom_agents(meta)
-        effective_custom_agents = (
-            wire_custom_agents
-            if wire_custom_agents is not None
-            else copy.deepcopy(source.get("custom_agents", []))
-        )
-        effective_meta = (
-            copy.deepcopy(meta) if meta is not None else copy.deepcopy(source.get("meta", {}))
-        )
-
-        model = str(source.get("model", self._default_model or DEFAULT_MODEL_ID))
-        mode = str(source.get("mode", "auto"))
-        agent = source.get("agent") or self._default_agent
-        reasoning_effort = str(source.get("reasoning_effort", DEFAULT_REASONING_EFFORT))
-        auth_cfg: dict[str, Any] = copy.deepcopy(source.get("auth_config") or {})
-        if agent:
-            auth_cfg["kiro_agent"] = str(agent)
-        if self._wire_adapter.engine_id == "v3":
-            auth_cfg["_engine_id"] = "v3"
-
         new_sid = str(uuid.uuid4())
-        self._cli.discard_cancelled(new_sid)
-        registry = self.get_custom_agent_registry(
-            cwd=effective_cwd,
-            custom_agents=effective_custom_agents,
-        )
-        combined_mcp = self._merge_session_mcp(
-            cwd=effective_cwd,
-            raw_wire_mcp=effective_wire_mcp,
-            active_agent=str(agent) if agent else None,
-            registry=registry,
+        draft_state, available_models = await self._prepare_derived_session(
+            source,
+            target_sid=new_sid,
+            cwd=cwd,
+            mcp_servers=mcp_servers,
+            meta=meta,
         )
 
         source_turns = self._store.get_session_turns(source_session_id)
@@ -1146,41 +1129,22 @@ class SessionManager:
             if matched_idx is not None:
                 turns_to_copy = source_turns[: matched_idx + 1]
 
-        compacted_summary = (
-            _format_remaining_turns_summary(turns_to_copy)
-            if turns_to_copy
-            else source.get("compactedSummary")
+        draft_state.update(
+            {
+                "agyConversationId": None,
+                "cancelled": False,
+                "contextPaths": copy.deepcopy(source.get("contextPaths", [])),
+                "knowledgeEntries": copy.deepcopy(source.get("knowledgeEntries", [])),
+                "compactedSummary": (
+                    _format_remaining_turns_summary(turns_to_copy)
+                    if turns_to_copy
+                    else source.get("compactedSummary")
+                ),
+                "reinjectAgentPrompt": (
+                    True if turns_to_copy else bool(source.get("reinjectAgentPrompt", False))
+                ),
+            }
         )
-        reinject_agent_prompt = (
-            True if turns_to_copy else bool(source.get("reinjectAgentPrompt", False))
-        )
-
-        draft_state: dict[str, Any] = {
-            **copy.deepcopy(source),
-            "sessionId": new_sid,
-            "agyConversationId": None,
-            "cwd": effective_cwd,
-            "mcp_servers": combined_mcp,
-            "wire_mcp_servers": effective_wire_mcp,
-            "custom_agents": effective_custom_agents,
-            "meta": effective_meta,
-            "auth_config": auth_cfg,
-            "mode": mode,
-            "agent": agent,
-            "model": model,
-            "reasoning_effort": reasoning_effort,
-            "cancelled": False,
-            "contextPaths": copy.deepcopy(source.get("contextPaths", [])),
-            "knowledgeEntries": copy.deepcopy(source.get("knowledgeEntries", [])),
-            "compactedSummary": compacted_summary,
-            "reinjectAgentPrompt": reinject_agent_prompt,
-        }
-        if agent and wire_custom_agents is not None:
-            self._apply_custom_agent_fields(
-                draft_state,
-                registry.get(str(agent)),
-                allow_model_override=not bool(source.get("modelPinnedByUser", False)),
-            )
 
         forked_state = self._store.upsert_session(draft_state)
         for idx, turn in enumerate(turns_to_copy):
@@ -1203,9 +1167,7 @@ class SessionManager:
         """Return whether `mode_id` resolves to a registered or virtual custom agent."""
         if not mode_id:
             return False
-        if registry.get(mode_id) is not None:
-            return True
-        if mode_id == self._default_agent:
+        if registry.get(mode_id) is not None or mode_id == self._default_agent:
             return True
         return self._wire_adapter.engine_id == "v2" and mode_id.startswith("kirocrew")
 
@@ -1228,50 +1190,27 @@ class SessionManager:
             session["mode"] = mode_id
             session["agent"] = None
             self._reset_custom_agent_fields(session)
-            raw_wire = session.get("wire_mcp_servers", [])
-            session["mcp_servers"] = self._merge_session_mcp(
-                cwd=cwd,
-                raw_wire_mcp=raw_wire if isinstance(raw_wire, list) else [],
-                active_agent=None,
-                registry=registry,
-            )
-            await self._maybe_reset_backend_on_profile_change(
+            active_agent: str | None = None
+        else:
+            if not self._is_valid_agent_mode(mode_id, registry=registry):
+                raise ValueError(f"Mode '{mode_id}' not found")
+            session["agent"] = mode_id
+            active_agent = mode_id
+            self._apply_agent_profile(
                 session,
-                prev_mcp=prev_mcp,
-                prev_prompt=prev_prompt,
-                old_agy_id=old_agy_id,
+                agent_id=mode_id,
+                cwd=cwd,
+                registry=registry,
+                allow_model_override=not bool(session.get("modelPinnedByUser", False)),
             )
-            self._store.upsert_session(session)
-            return {}
 
-        if not self._is_valid_agent_mode(mode_id, registry=registry):
-            raise ValueError(f"Mode '{mode_id}' not found")
-
-        session["agent"] = mode_id
-        self._reset_custom_agent_fields(session)
         raw_wire = session.get("wire_mcp_servers", [])
         session["mcp_servers"] = self._merge_session_mcp(
             cwd=cwd,
             raw_wire_mcp=raw_wire if isinstance(raw_wire, list) else [],
-            active_agent=mode_id,
+            active_agent=active_agent,
             registry=registry,
         )
-
-        model_pinned = bool(session.get("modelPinnedByUser", False))
-        if spec is not None:
-            self._apply_custom_agent_fields(
-                session,
-                spec,
-                allow_model_override=not model_pinned,
-            )
-        elif self._wire_adapter.engine_id == "v2":
-            self._apply_v2_legacy_agent_fallback(
-                session,
-                agent_name=mode_id,
-                cwd=cwd,
-                allow_model_override=not model_pinned,
-            )
-
         await self._maybe_reset_backend_on_profile_change(
             session,
             prev_mcp=prev_mcp,
@@ -1280,6 +1219,27 @@ class SessionManager:
         )
         self._store.upsert_session(session)
         return {}
+
+    def _session_stream_kwargs(
+        self,
+        session_id: str,
+        session: dict[str, Any],
+        *,
+        user_text: str,
+    ) -> dict[str, Any]:
+        """Build common `stream_prompt` keyword arguments for `session`."""
+        return {
+            "session_id": session_id,
+            "mcp_servers": session.get("mcp_servers"),
+            "system_prompt_append": _build_system_prompt_append(session, user_text=user_text),
+            "route_spawn_run": _session_has_kirocrew_spawn_run(session),
+            "known_mcp_servers": self.get_session_mcp_server_names(session_id),
+            "env": _extract_session_mcp_env(
+                session,
+                session_id=session_id,
+                state_db_path=self._store.db_path,
+            ),
+        }
 
     async def compact_session(
         self,
@@ -1326,54 +1286,26 @@ class SessionManager:
         if instructions.strip():
             compact_prompt = f"{compact_prompt}\n\nAdditional instructions: {instructions.strip()}"
 
-        cwd = str(session.get("cwd", ""))
         raw_model = str(session.get("model", DEFAULT_MODEL_ID))
         model = resolve_model_for_effort(raw_model, "low", self._store.load_models()) or raw_model
         try:
             outcome = await self._cli.stream_prompt(
-                cwd=cwd,
+                cwd=str(session.get("cwd", "")),
                 prompt=compact_prompt,
                 content_blocks=[{"type": "text", "text": compact_prompt}],
-                session_id=session_id,
                 conversation_id=str(agy_conv_id),
-                mcp_servers=session.get("mcp_servers"),
-                system_prompt_append=_build_system_prompt_append(session, user_text=compact_prompt),
                 model=model,
                 mode="read-only",
                 effort="low",
-                route_spawn_run=_session_has_kirocrew_spawn_run(session),
-                known_mcp_servers=self.get_session_mcp_server_names(session_id),
-                env=_extract_session_mcp_env(
-                    session,
-                    session_id=session_id,
-                    state_db_path=self._store.db_path,
-                ),
+                **self._session_stream_kwargs(session_id, session, user_text=compact_prompt),
             )
         except Exception as exc:
-            return {
-                "status": "failed",
-                "summary": str(exc) or "Compaction failed.",
-                "contextTokens": prev_tokens,
-                "inputTokens": 1,
-                "outputTokens": 1,
-            }
+            return _failed_compaction(str(exc) or "Compaction failed.", prev_tokens)
 
         if outcome.stop_reason == "cancelled":
-            return {
-                "status": "failed",
-                "summary": "Compaction cancelled.",
-                "contextTokens": prev_tokens,
-                "inputTokens": 1,
-                "outputTokens": 1,
-            }
+            return _failed_compaction("Compaction cancelled.", prev_tokens)
         if outcome.error:
-            return {
-                "status": "failed",
-                "summary": outcome.error,
-                "contextTokens": prev_tokens,
-                "inputTokens": 1,
-                "outputTokens": 1,
-            }
+            return _failed_compaction(outcome.error, prev_tokens)
 
         summary = (outcome.response or "").strip() or "Conversation context compacted."
         compacted_tokens = max(1, len(summary.split()) * 2)
@@ -1424,9 +1356,8 @@ class SessionManager:
                     f"Unsupported effort level '{value}' (expected one of: {supported})"
                 )
             session["reasoning_effort"] = value
-            current_model = str(session.get("model", DEFAULT_MODEL_ID))
             resolved_sibling = resolve_model_for_effort(
-                current_model,
+                str(session.get("model", DEFAULT_MODEL_ID)),
                 value,
                 self._store.load_models(),
             )
@@ -1503,15 +1434,6 @@ class SessionManager:
                 cwd=cwd,
                 prefix_text="\n\n".join(prefix_sections),
             )
-            system_prompt_append = _build_system_prompt_append(
-                session,
-                user_text=formatted_prompt,
-            )
-            session_env = _extract_session_mcp_env(
-                session,
-                session_id=session_id,
-                state_db_path=self._store.db_path,
-            )
 
             outcome = None
             with self.turn_cancel_scope(session_id) as scope:
@@ -1519,17 +1441,11 @@ class SessionManager:
                     cwd=cwd,
                     prompt=formatted_prompt,
                     content_blocks=content_blocks,
-                    session_id=session_id,
                     conversation_id=conversation_id,
-                    mcp_servers=session.get("mcp_servers"),
-                    system_prompt_append=system_prompt_append,
                     model=model,
                     mode=mode,
                     effort=effort,
                     skip_permissions=skip_permissions,
-                    route_spawn_run=_session_has_kirocrew_spawn_run(session),
-                    known_mcp_servers=self.get_session_mcp_server_names(session_id),
-                    env=session_env,
                     on_thought=on_thought,
                     on_text=on_text,
                     on_tool_call=on_tool_call,
@@ -1537,6 +1453,7 @@ class SessionManager:
                     on_usage=on_usage,
                     on_steer_consumed=on_steer_consumed,
                     on_subagent_list=on_subagent_list,
+                    **self._session_stream_kwargs(session_id, session, user_text=formatted_prompt),
                 )
 
             if (
@@ -1551,12 +1468,16 @@ class SessionManager:
             fallback_from = outcome.fallback_from_model
             effective_resolved_model = outcome.resolved_model
             if fallback_from and not effective_resolved_model:
-                cached_models = self._store.load_models() or []
                 effective_resolved_model = self._wire_adapter.resolve_concrete_model(
-                    cached_models,
+                    self._store.load_models() or [],
                     "",
                 )
 
+            has_fallback = bool(
+                fallback_from
+                and effective_resolved_model
+                and fallback_from != effective_resolved_model
+            )
             latest = self._store.get_session(session_id)
             if latest is not None and (
                 outcome.conversation_id
@@ -1571,11 +1492,7 @@ class SessionManager:
                     latest["compactedSummary"] = None
                 if reinjected_prompt:
                     latest["reinjectAgentPrompt"] = False
-                if (
-                    fallback_from
-                    and effective_resolved_model
-                    and fallback_from != effective_resolved_model
-                ):
+                if has_fallback:
                     latest["model"] = effective_resolved_model
                 elif (
                     effective_resolved_model
@@ -1593,11 +1510,7 @@ class SessionManager:
                 "usage": outcome.usage,
                 "conversationId": outcome.conversation_id,
             }
-            if (
-                fallback_from
-                and effective_resolved_model
-                and fallback_from != effective_resolved_model
-            ):
+            if has_fallback:
                 turn_payload["fallbackFromModel"] = fallback_from
                 turn_payload["resolvedModel"] = effective_resolved_model
             if outcome.error:
@@ -1613,8 +1526,7 @@ class SessionManager:
 
     def consume_cancellation(self, session_id: str) -> bool:
         """Clear and return whether `session_id` was marked cancelled in SQLite."""
-        was_cancelled = self.is_cancelled(session_id)
-        if not was_cancelled:
+        if not self.is_cancelled(session_id):
             return False
         session = self._store.get_session(session_id)
         if session is not None:
@@ -1672,11 +1584,10 @@ class SessionManager:
                 cwd=cwd,
             )
             raw_message = formatted_prompt
-            has_non_empty_block = any(
+            if not any(
                 block.get("type") != "text" or bool(str(block.get("text") or "").strip())
                 for block in content_blocks
-            )
-            if not has_non_empty_block:
+            ):
                 return False
 
         return await self._cli.steer_session(
@@ -1721,8 +1632,7 @@ class SessionManager:
                 return {"success": False, "message": "Path is required to remove context."}
             if clean_path not in context_paths:
                 return {"success": False, "message": f"Context path not found: {clean_path}"}
-            context_paths = [p for p in context_paths if p != clean_path]
-            state["contextPaths"] = context_paths
+            state["contextPaths"] = [p for p in context_paths if p != clean_path]
             self._store.upsert_session(state)
             return {"success": True, "message": f"Removed context path: {clean_path}"}
 
@@ -1755,53 +1665,54 @@ class SessionManager:
         ]
 
         if sub == "show":
-            normalized = [
-                {
-                    "name": str(
-                        e.get("name") or Path(str(e.get("path") or "")).name or "knowledge"
-                    ),
-                    "path": str(e.get("path") or ""),
-                    "item_count": int(e.get("item_count", 1)),
-                }
-                for e in entries
-            ]
-            return {"success": True, "entries": normalized}
+            return {
+                "success": True,
+                "entries": [
+                    {
+                        "name": str(
+                            e.get("name") or Path(str(e.get("path") or "")).name or "knowledge"
+                        ),
+                        "path": str(e.get("path") or ""),
+                        "item_count": int(e.get("item_count", 1)),
+                    }
+                    for e in entries
+                ],
+            }
 
         if sub == "add":
-            raw_path = merged.get("path")
-            raw_name = merged.get("name")
+            raw_path, raw_name = merged.get("path"), merged.get("name")
             path_str = str(raw_path).strip() if isinstance(raw_path, str) else ""
-            name_str = str(raw_name).strip() if isinstance(raw_name, str) else ""
             if not path_str:
                 return {"success": False, "message": "Path is required to add knowledge entry."}
-            if not name_str:
-                name_str = Path(path_str).name or path_str
-            if merged.get("item_count") is not None:
-                item_count = int(merged["item_count"])
-            else:
-                target_p = Path(path_str)
-                if target_p.is_dir():
-                    with contextlib.suppress(OSError):
-                        item_count = max(1, sum(1 for f in target_p.rglob("*") if f.is_file()))
-                    if "item_count" not in locals():
-                        item_count = 1
-                else:
-                    item_count = 1
+            name_str = (
+                str(raw_name).strip()
+                if isinstance(raw_name, str) and str(raw_name).strip()
+                else (Path(path_str).name or path_str)
+            )
+            item_count = (
+                int(merged["item_count"])
+                if merged.get("item_count") is not None
+                else _count_knowledge_items(path_str)
+            )
             new_entry = {"name": name_str, "path": path_str, "item_count": item_count}
-            replaced = False
-            for idx, existing in enumerate(entries):
-                if existing.get("name") == name_str or existing.get("path") == path_str:
-                    entries[idx] = new_entry
-                    replaced = True
-                    break
-            if not replaced:
+            match_idx = next(
+                (
+                    idx
+                    for idx, e in enumerate(entries)
+                    if e.get("name") == name_str or e.get("path") == path_str
+                ),
+                None,
+            )
+            if match_idx is not None:
+                entries[match_idx] = new_entry
+            else:
                 entries.append(new_entry)
             state["knowledgeEntries"] = entries
             self._store.upsert_session(state)
             return {"success": True, "message": f"Added knowledge entry '{name_str}'."}
 
+        target = str(merged.get("name") or merged.get("path") or merged.get("id") or "").strip()
         if sub == "remove":
-            target = str(merged.get("name") or merged.get("path") or merged.get("id") or "").strip()
             if not target:
                 return {
                     "success": False,
@@ -1815,7 +1726,6 @@ class SessionManager:
             return {"success": True, "message": f"Removed knowledge entry '{target}'."}
 
         if sub == "update":
-            target = str(merged.get("name") or merged.get("path") or merged.get("id") or "").strip()
             if not target:
                 if entries:
                     return {"success": True, "message": "Updated knowledge entries."}
@@ -1823,31 +1733,35 @@ class SessionManager:
                     "success": False,
                     "message": "Name or path is required to update knowledge entry.",
                 }
-            for idx, existing in enumerate(entries):
-                if existing.get("name") == target or existing.get("path") == target:
-                    updated_name = (
-                        str(merged["name"]).strip()
-                        if isinstance(merged.get("name"), str) and str(merged["name"]).strip()
-                        else str(existing.get("name") or target)
-                    )
-                    updated_path = (
-                        str(merged["path"]).strip()
-                        if isinstance(merged.get("path"), str) and str(merged["path"]).strip()
-                        else str(existing.get("path") or "")
-                    )
-                    updated_count = int(merged.get("item_count", existing.get("item_count", 1)))
-                    entries[idx] = {
-                        "name": updated_name,
-                        "path": updated_path,
-                        "item_count": updated_count,
-                    }
-                    state["knowledgeEntries"] = entries
-                    self._store.upsert_session(state)
-                    return {
-                        "success": True,
-                        "message": f"Updated knowledge entry '{updated_name}'.",
-                    }
-            return {"success": False, "message": f"Knowledge entry not found: {target}"}
+            match_idx = next(
+                (
+                    idx
+                    for idx, e in enumerate(entries)
+                    if e.get("name") == target or e.get("path") == target
+                ),
+                None,
+            )
+            if match_idx is None:
+                return {"success": False, "message": f"Knowledge entry not found: {target}"}
+            existing = entries[match_idx]
+            updated_name = (
+                str(merged["name"]).strip()
+                if isinstance(merged.get("name"), str) and str(merged["name"]).strip()
+                else str(existing.get("name") or target)
+            )
+            updated_path = (
+                str(merged["path"]).strip()
+                if isinstance(merged.get("path"), str) and str(merged["path"]).strip()
+                else str(existing.get("path") or "")
+            )
+            entries[match_idx] = {
+                "name": updated_name,
+                "path": updated_path,
+                "item_count": int(merged.get("item_count", existing.get("item_count", 1))),
+            }
+            state["knowledgeEntries"] = entries
+            self._store.upsert_session(state)
+            return {"success": True, "message": f"Updated knowledge entry '{updated_name}'."}
 
         if sub == "clear":
             state["knowledgeEntries"] = []
@@ -1881,19 +1795,19 @@ class SessionManager:
             languages: list[str] = []
             if cwd_str:
                 cwd_path = Path(cwd_str)
-                if (cwd_path / "pyproject.toml").exists():
-                    languages.append("python")
-                if (cwd_path / "tsconfig.json").exists() or (cwd_path / "package.json").exists():
-                    languages.append("typescript")
-                if (cwd_path / "Cargo.toml").exists():
-                    languages.append("rust")
-            if not languages:
-                languages = ["python"]
-            initialized = bool(meta.get("codeIntelligenceInitialized", False))
+                for marker, lang in (
+                    ("pyproject.toml", "python"),
+                    ("tsconfig.json", "typescript"),
+                    ("package.json", "typescript"),
+                    ("Cargo.toml", "rust"),
+                ):
+                    if lang not in languages and (cwd_path / marker).exists():
+                        languages.append(lang)
+            languages = languages or ["python"]
             return {
                 "success": True,
                 "status": {
-                    "initialized": initialized,
+                    "initialized": bool(meta.get("codeIntelligenceInitialized", False)),
                     "languages": languages,
                     "lspServers": [{"name": lang, "status": "ready"} for lang in languages],
                 },

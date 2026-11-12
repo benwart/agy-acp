@@ -46,15 +46,7 @@ CREW_ONLY_ENTRY_KEYS: frozenset[str] = frozenset(
 
 #: Reserved KAS built-in agent IDs that KiroCrew projects with `-crewmate` or `crew-`.
 KAS_RESERVED_AGENT_IDS: frozenset[str] = frozenset(
-    {
-        "default",
-        "vibe",
-        "spec",
-        "quick-spec",
-        "bug-fix",
-        "plan",
-        "autonomous",
-    }
+    {"default", "vibe", "spec", "quick-spec", "bug-fix", "plan", "autonomous"}
 )
 KAS_WIRE_ID_SUFFIX = "-crewmate"
 KAS_WIRE_ID_PREFIX = "crew-"
@@ -79,17 +71,8 @@ KAS_CAPABILITIES: frozenset[str] = frozenset(
         "all",
         "builtin",
         "filesystem",
-        "fs_read",
-        "fs_write",
-        "shell",
-        "web_fetch",
-        "web_search",
+        *_BUILTIN_CAPABILITIES,
         "mcp",
-        "subagent",
-        "skill",
-        "power",
-        "context",
-        "diagnostics",
         "sandbox_network",
     }
 )
@@ -104,37 +87,36 @@ _PATH_SCOPED_CAPABILITIES: frozenset[str] = frozenset({"fs_read", "fs_write", "m
 _COMPOUND_SHELL_TOKENS: tuple[str, ...] = (";", "|", "&", "`", "$(", "\n", "\r", ">", "<")
 
 _CAPABILITY_BY_TOOL_NAME: dict[str, str] = {
-    # KAS v3 built-in tool IDs
-    "read_file": "fs_read",
-    "list_directory": "fs_read",
-    "grep_search": "fs_read",
-    "file_search": "fs_read",
-    "fs_write": "fs_write",
-    "str_replace": "fs_write",
-    "fs_append": "fs_write",
-    "delete_file": "fs_write",
-    "run_command": "shell",
+    **dict.fromkeys(
+        (
+            "read_file",
+            "list_directory",
+            "grep_search",
+            "file_search",
+            "fs_read",
+            "read",
+            "grep",
+            "glob",
+        ),
+        "fs_read",
+    ),
+    **dict.fromkeys(
+        ("fs_write", "str_replace", "fs_append", "delete_file", "write", "edit"),
+        "fs_write",
+    ),
+    **dict.fromkeys(("run_command", "execute_bash", "shell", "bash"), "shell"),
     "web_fetch": "web_fetch",
-    "remote_web_search": "web_search",
-    "invoke_sub_agent": "subagent",
-    # Kiro v2 / Crew tool spellings
-    "fs_read": "fs_read",
-    "read": "fs_read",
-    "grep": "fs_read",
-    "glob": "fs_read",
-    "write": "fs_write",
-    "edit": "fs_write",
-    "execute_bash": "shell",
-    "shell": "shell",
-    "bash": "shell",
-    "web_search": "web_search",
-    "use_subagent": "subagent",
-    "subagent": "subagent",
+    **dict.fromkeys(("remote_web_search", "web_search"), "web_search"),
+    **dict.fromkeys(("invoke_sub_agent", "use_subagent", "subagent"), "subagent"),
     "skill": "skill",
     "power": "power",
     "context": "context",
     "diagnostics": "diagnostics",
 }
+
+_READ_ONLY_KIRO_TOOLS: frozenset[str] = frozenset(
+    {"fs_read", "grep", "glob", "code", "web_search", "web_fetch", "tool_search", "todo_list"}
+)
 
 
 class CustomAgentSecurityError(ValueError):
@@ -162,10 +144,7 @@ def _construct_timestamp_as_text(loader: yaml.SafeLoader, node: yaml.Node) -> st
     return str(loader.construct_scalar(node))  # type: ignore[arg-type]
 
 
-_FrontmatterSafeLoader.add_constructor(
-    "tag:yaml.org,2002:timestamp",
-    _construct_timestamp_as_text,
-)
+_FrontmatterSafeLoader.add_constructor("tag:yaml.org,2002:timestamp", _construct_timestamp_as_text)
 
 
 def _require_json_shape(value: Any, where: str) -> None:
@@ -193,27 +172,21 @@ def _require_json_shape(value: Any, where: str) -> None:
 
 def opens_frontmatter_fence(text: str) -> bool:
     """Return True if `text` starts with a `---` YAML frontmatter line (after optional BOM)."""
-    if text.startswith("\ufeff"):
-        text = text[1:]
-    return text.startswith(("---\n", "---\r\n"))
+    return text.removeprefix("\ufeff").startswith(("---\n", "---\r\n"))
 
 
 def split_markdown_spec(text: str) -> tuple[str, str] | None:
     """Split a markdown agent spec into `(frontmatter_yaml, body)`, or `None` if unfenced."""
     if not opens_frontmatter_fence(text):
         return None
-    if text.startswith("\ufeff"):
-        text = text[1:]
+    text = text.removeprefix("\ufeff")
     first_newline = text.index("\n")
     close = _FRONTMATTER_CLOSE_RE.search(text, first_newline + 1)
     if close is None:
         return None
     frontmatter = text[first_newline + 1 : close.start()]
     body = text[close.end() :]
-    if body.startswith("\r\n"):
-        body = body[2:]
-    elif body.startswith("\n"):
-        body = body[1:]
+    body = body[2:] if body.startswith("\r\n") else body.removeprefix("\n")
     return frontmatter, body
 
 
@@ -267,10 +240,7 @@ def _reject_nonfinite_json_constant(token: str) -> Any:
     raise ValueError(f"invalid non-finite JSON constant: {token}")
 
 
-def parse_agent_spec_file(path: Path) -> dict[str, Any]:
-    """Parse either a `.json` or `.md` agent specification file from disk."""
-    suffix = path.suffix.lower()
-    raw_text = path.read_text(encoding="utf-8")
+def _parse_agent_spec_text(raw_text: str, suffix: str) -> dict[str, Any]:
     if suffix == MARKDOWN_SUFFIX:
         return parse_markdown_agent_spec(raw_text)
     if suffix == JSON_SUFFIX:
@@ -281,7 +251,12 @@ def parse_agent_spec_file(path: Path) -> dict[str, Any]:
         if not isinstance(loaded, dict):
             raise ValueError("root must be a JSON object")
         return loaded
-    raise ValueError(f"unsupported agent spec file extension: {path.suffix!r}")
+    raise ValueError(f"unsupported agent spec file extension: {suffix!r}")
+
+
+def parse_agent_spec_file(path: Path) -> dict[str, Any]:
+    """Parse either a `.json` or `.md` agent specification file from disk."""
+    return _parse_agent_spec_text(path.read_text(encoding="utf-8"), path.suffix.lower())
 
 
 def resolve_contained_prompt_file(prompt_value: str, *, base_dir: Path) -> str:
@@ -296,9 +271,8 @@ def resolve_contained_prompt_file(prompt_value: str, *, base_dir: Path) -> str:
         )
 
     resolved_base = base_dir.resolve()
-    candidate = resolved_base / raw_ref
     try:
-        resolved_target = candidate.resolve(strict=True)
+        resolved_target = (resolved_base / raw_ref).resolve(strict=True)
     except OSError as exc:
         raise CustomAgentSecurityError(
             f"Prompt file reference could not be resolved inside {resolved_base}: {raw_ref!r}"
@@ -315,6 +289,12 @@ def resolve_contained_prompt_file(prompt_value: str, *, base_dir: Path) -> str:
     return resolved_target.read_text(encoding="utf-8")
 
 
+def _resolve_spec_prompt_field(spec: dict[str, Any], *, base_dir: Path) -> None:
+    prompt_val = spec.get("prompt")
+    if isinstance(prompt_val, str) and prompt_val.startswith("file://"):
+        spec["prompt"] = resolve_contained_prompt_file(prompt_val, base_dir=base_dir)
+
+
 def sanitize_project_agent_spec(
     spec: Mapping[str, Any],
     *,
@@ -324,10 +304,24 @@ def sanitize_project_agent_spec(
     sanitized: dict[str, Any] = {
         key: spec[key] for key in PROJECT_SPEC_HONOURED_KEYS if key in spec
     }
-    prompt_val = sanitized.get("prompt")
-    if isinstance(prompt_val, str) and prompt_val.startswith("file://"):
-        sanitized["prompt"] = resolve_contained_prompt_file(prompt_val, base_dir=agents_dir)
+    _resolve_spec_prompt_field(sanitized, base_dir=agents_dir)
     return sanitized
+
+
+def _resolve_safe_project_agents_dir(cwd: str | Path | None) -> tuple[Path, Path] | None:
+    """Return `(project_agents_dir, resolved_project_agents_dir)` when safe and non-symlinked."""
+    if not cwd:
+        return None
+    with contextlib.suppress(OSError, RuntimeError):
+        cwd_path = Path(cwd)
+        kiro_dir = cwd_path / ".kiro"
+        project_dir = kiro_dir / "agents"
+        if kiro_dir.is_symlink() or project_dir.is_symlink() or not project_dir.is_dir():
+            return None
+        resolved_proj = project_dir.resolve()
+        if resolved_proj.is_relative_to(cwd_path.resolve()):
+            return project_dir, resolved_proj
+    return None
 
 
 def _iter_live_spec_files(directory: Path) -> list[Path]:
@@ -336,21 +330,24 @@ def _iter_live_spec_files(directory: Path) -> list[Path]:
         return []
     try:
         with os.scandir(directory) as entries:
-            names = [entry.name for entry in entries if not entry.name.startswith(".")]
+            names = [
+                e.name for e in entries if not e.name.startswith((".", NATIVE_SKILL_ALIAS_PREFIX))
+            ]
     except OSError:
         return []
 
-    filtered = [n for n in names if not n.startswith(NATIVE_SKILL_ALIAS_PREFIX)]
-    json_files = [directory / n for n in filtered if n.lower().endswith(JSON_SUFFIX)]
-    md_files = [directory / n for n in filtered if n.lower().endswith(MARKDOWN_SUFFIX)]
+    json_files = [directory / n for n in names if n.lower().endswith(JSON_SUFFIX)]
+    md_files = [directory / n for n in names if n.lower().endswith(MARKDOWN_SUFFIX)]
     json_stems = {p.stem.lower() for p in json_files}
-    live = list(json_files)
-    for md_path in md_files:
-        if md_path.stem.lower() in json_stems:
-            continue
-        if (directory / f"{md_path.stem}{JSON_SUFFIX}").exists():
-            continue
-        live.append(md_path)
+    live = [
+        *json_files,
+        *(
+            md
+            for md in md_files
+            if md.stem.lower() not in json_stems
+            and not (directory / f"{md.stem}{JSON_SUFFIX}").exists()
+        ),
+    ]
     return sorted(live)
 
 
@@ -379,18 +376,9 @@ class CustomAgentSpec:
     mcp_servers: dict[str, Any] = field(default_factory=dict)
     raw_spec: dict[str, Any] = field(default_factory=dict)
 
-    def evaluate_permission(
-        self,
-        *,
-        capability: str,
-        resource: str = "",
-    ) -> PermissionDecision:
+    def evaluate_permission(self, *, capability: str, resource: str = "") -> PermissionDecision:
         """Evaluate KAS inline permissions for `(capability, resource)`."""
-        return evaluate_kas_permissions(
-            self.permissions,
-            capability=capability,
-            resource=resource,
-        )
+        return evaluate_kas_permissions(self.permissions, capability=capability, resource=resource)
 
     def evaluate_tool_call(
         self,
@@ -429,15 +417,7 @@ class CustomAgentSpec:
             "description": self.description or self.name or self.agent_id,
         }
         if v3_meta:
-            entry["_meta"] = {
-                "kiro": {
-                    "resource": {
-                        "source": {
-                            "origin": self.origin,
-                        }
-                    }
-                }
-            }
+            entry["_meta"] = {"kiro": {"resource": {"source": {"origin": self.origin}}}}
         return entry
 
 
@@ -455,43 +435,28 @@ def _spec_from_mapping(
     raw_name = cleaned.get("name")
     name = raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else agent_id
     desc_val = cleaned.get("description")
-    description = desc_val if isinstance(desc_val, str) else ""
-
-    prompt_val = cleaned.get("systemPrompt")
-    if not isinstance(prompt_val, str):
-        prompt_val = cleaned.get("prompt")
-    prompt = prompt_val if isinstance(prompt_val, str) else ""
-
+    prompt_val = (
+        cleaned["systemPrompt"]
+        if isinstance(cleaned.get("systemPrompt"), str)
+        else cleaned.get("prompt")
+    )
     model_val = cleaned.get("model")
-    model = model_val.strip() if isinstance(model_val, str) and model_val.strip() else None
-
     tools_raw = cleaned.get("tools")
-    tools: tuple[str, ...] | None = (
-        _normalize_str_tuple(tools_raw) if tools_raw is not None else None
-    )
-    excluded_tools = _normalize_str_tuple(cleaned.get("excludedTools"))
-    allowed_tools = _normalize_str_tuple(cleaned.get("allowedTools"))
-
     perms_raw = cleaned.get("permissions")
-    permissions: dict[str, Any] | list[Any] | None = (
-        perms_raw if isinstance(perms_raw, (dict, list)) else None
-    )
-
     mcp_raw = cleaned.get("mcpServers")
-    mcp_servers: dict[str, Any] = dict(mcp_raw) if isinstance(mcp_raw, dict) else {}
 
     return CustomAgentSpec(
         agent_id=agent_id,
         name=name,
-        description=description,
-        prompt=prompt,
+        description=desc_val if isinstance(desc_val, str) else "",
+        prompt=prompt_val if isinstance(prompt_val, str) else "",
         origin=origin,
-        model=model,
-        tools=tools,
-        excluded_tools=excluded_tools,
-        allowed_tools=allowed_tools,
-        permissions=permissions,
-        mcp_servers=mcp_servers,
+        model=model_val.strip() if isinstance(model_val, str) and model_val.strip() else None,
+        tools=_normalize_str_tuple(tools_raw) if tools_raw is not None else None,
+        excluded_tools=_normalize_str_tuple(cleaned.get("excludedTools")),
+        allowed_tools=_normalize_str_tuple(cleaned.get("allowedTools")),
+        permissions=perms_raw if isinstance(perms_raw, (dict, list)) else None,
+        mcp_servers=dict(mcp_raw) if isinstance(mcp_raw, dict) else {},
         raw_spec=cleaned,
     )
 
@@ -516,9 +481,7 @@ class CustomAgentRegistry:
     """Registry of custom agents merged across project, user, and client wire scopes."""
 
     def __init__(self, agents: Sequence[CustomAgentSpec] = ()) -> None:
-        self._by_id: dict[str, CustomAgentSpec] = {}
-        for spec in agents:
-            self._by_id[spec.agent_id] = spec
+        self._by_id: dict[str, CustomAgentSpec] = {spec.agent_id: spec for spec in agents}
 
     @classmethod
     def load(
@@ -532,34 +495,23 @@ class CustomAgentRegistry:
         merged: dict[str, CustomAgentSpec] = {}
 
         # 1. Lowest precedence: Project scope `<cwd>/.kiro/agents/*.{json,md}` (UNTRUSTED)
-        if cwd is not None:
-            cwd_path = Path(cwd)
-            kiro_dir = cwd_path / ".kiro"
-            project_dir = kiro_dir / "agents"
-            if cls._is_safe_project_agents_dir(cwd_path, kiro_dir, project_dir):
-                resolved_project_dir = project_dir.resolve()
-                for spec_path in _iter_live_spec_files(project_dir):
-                    if spec_path.is_symlink():
-                        continue
-                    try:
-                        if not spec_path.resolve().is_relative_to(resolved_project_dir):
-                            continue
-                    except OSError:
+        safe_proj = _resolve_safe_project_agents_dir(cwd)
+        if safe_proj is not None:
+            project_dir, resolved_project_dir = safe_proj
+            for spec_path in _iter_live_spec_files(project_dir):
+                if spec_path.is_symlink():
+                    continue
+                with contextlib.suppress(OSError, CustomAgentSecurityError):
+                    if not spec_path.resolve().is_relative_to(resolved_project_dir):
                         continue
                     loaded = cls._read_disk_spec(spec_path)
-                    if loaded is None:
-                        continue
-                    try:
+                    if loaded is not None:
                         sanitized = sanitize_project_agent_spec(loaded, agents_dir=project_dir)
-                    except CustomAgentSecurityError:
-                        continue
-                    agent = _spec_from_mapping(
-                        sanitized,
-                        origin="project",
-                        fallback_id=spec_path.stem,
-                    )
-                    if agent is not None:
-                        merged[agent.agent_id] = agent
+                        agent = _spec_from_mapping(
+                            sanitized, origin="project", fallback_id=spec_path.stem
+                        )
+                        if agent is not None:
+                            merged[agent.agent_id] = agent
 
         # 2. Middle precedence: User scope `~/.kiro/agents/*.{json,md}`
         resolved_user_dir = (
@@ -570,28 +522,17 @@ class CustomAgentRegistry:
             if loaded is None:
                 continue
             user_dict = dict(loaded)
-            prompt_val = user_dict.get("prompt")
-            if isinstance(prompt_val, str) and prompt_val.startswith("file://"):
-                try:
-                    user_dict["prompt"] = resolve_contained_prompt_file(
-                        prompt_val,
-                        base_dir=resolved_user_dir,
-                    )
-                except CustomAgentSecurityError:
-                    continue
-            agent = _spec_from_mapping(
-                user_dict,
-                origin="user",
-                fallback_id=spec_path.stem,
-            )
+            try:
+                _resolve_spec_prompt_field(user_dict, base_dir=resolved_user_dir)
+            except CustomAgentSecurityError:
+                continue
+            agent = _spec_from_mapping(user_dict, origin="user", fallback_id=spec_path.stem)
             if agent is not None:
                 merged[agent.agent_id] = agent
 
         # 3. Highest precedence: Wire `params._meta.kiro.customAgents` (`origin="client"`)
-        if wire_custom_agents:
-            for raw_entry in wire_custom_agents:
-                if not isinstance(raw_entry, Mapping):
-                    continue
+        for raw_entry in wire_custom_agents or ():
+            if isinstance(raw_entry, Mapping):
                 agent = _spec_from_mapping(raw_entry, origin="client")
                 if agent is not None:
                     merged[agent.agent_id] = agent
@@ -599,50 +540,26 @@ class CustomAgentRegistry:
         return cls(list(merged.values()))
 
     @staticmethod
-    def _is_safe_project_agents_dir(cwd_path: Path, kiro_dir: Path, project_dir: Path) -> bool:
-        if kiro_dir.is_symlink() or project_dir.is_symlink():
-            return False
-        if not project_dir.is_dir():
-            return False
-        try:
-            return project_dir.resolve().is_relative_to(cwd_path.resolve())
-        except OSError:
-            return False
-
-    @staticmethod
     def _read_disk_spec(path: Path) -> dict[str, Any] | None:
-        try:
+        with contextlib.suppress(OSError, ValueError):
             raw_text = path.read_text(encoding="utf-8")
-        except OSError:
-            return None
-        if path.suffix.lower() == MARKDOWN_SUFFIX and not opens_frontmatter_fence(raw_text):
-            return None
-        try:
-            if path.suffix.lower() == MARKDOWN_SUFFIX:
-                return parse_markdown_agent_spec(raw_text)
-            parsed = json.loads(raw_text, parse_constant=_reject_nonfinite_json_constant)
-            return parsed if isinstance(parsed, dict) else None
-        except ValueError, json.JSONDecodeError:
-            return None
+            suffix = path.suffix.lower()
+            if suffix == MARKDOWN_SUFFIX and not opens_frontmatter_fence(raw_text):
+                return None
+            return _parse_agent_spec_text(raw_text, suffix)
+        return None
 
     def get(self, agent_id: str) -> CustomAgentSpec | None:
         """Look up an agent by exact wire ID, stripped crewmate ID, or display name."""
-        direct = self._by_id.get(agent_id)
-        if direct is not None:
-            return direct
-        stripped = strip_kas_wire_agent_affix(agent_id)
-        if stripped != agent_id and stripped in self._by_id:
-            return self._by_id[stripped]
-        suffixed = f"{agent_id}{KAS_WIRE_ID_SUFFIX}"
-        if suffixed in self._by_id:
-            return self._by_id[suffixed]
-        prefixed = f"{KAS_WIRE_ID_PREFIX}{agent_id}"
-        if prefixed in self._by_id:
-            return self._by_id[prefixed]
-        for spec in self._by_id.values():
-            if spec.name == agent_id:
-                return spec
-        return None
+        for candidate in (
+            agent_id,
+            strip_kas_wire_agent_affix(agent_id),
+            f"{agent_id}{KAS_WIRE_ID_SUFFIX}",
+            f"{KAS_WIRE_ID_PREFIX}{agent_id}",
+        ):
+            if candidate in self._by_id:
+                return self._by_id[candidate]
+        return next((spec for spec in self._by_id.values() if spec.name == agent_id), None)
 
     def list_agents(self) -> list[CustomAgentSpec]:
         """Return all registered custom agents in insertion/precedence order."""
@@ -685,23 +602,18 @@ def _matches_any_pattern(patterns: Sequence[str], value: str, *, path_mode: bool
     return any(_compile_glob_regex(pat, path_mode=path_mode).match(value) for pat in patterns)
 
 
-def _expand_rule_capabilities(capability: str) -> tuple[str, ...]:
-    if capability in META_CAPABILITY_EXPANSION:
-        return META_CAPABILITY_EXPANSION[capability]
-    return (capability,)
+def _extract_non_empty_strs(raw: Any) -> list[str]:
+    if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+        return [str(p) for p in raw if isinstance(p, str) and p.strip()]
+    return []
 
 
 def _normalize_permission_rules(raw_permissions: Any) -> list[dict[str, Any]]:
     """Normalize `{"rules": [...]}` or `[...]` permission policies into canonical rules."""
-    if raw_permissions is None:
-        return []
-    if isinstance(raw_permissions, Mapping):
-        raw_list = raw_permissions.get("rules")
-        if not isinstance(raw_list, Sequence) or isinstance(raw_list, (str, bytes)):
-            return []
-    elif isinstance(raw_permissions, Sequence) and not isinstance(raw_permissions, (str, bytes)):
-        raw_list = raw_permissions
-    else:
+    raw_list = (
+        raw_permissions.get("rules") if isinstance(raw_permissions, Mapping) else raw_permissions
+    )
+    if not isinstance(raw_list, Sequence) or isinstance(raw_list, (str, bytes)):
         return []
 
     normalized: list[dict[str, Any]] = []
@@ -712,18 +624,9 @@ def _normalize_permission_rules(raw_permissions: Any) -> list[dict[str, Any]]:
         if not isinstance(effect, str) or effect not in ("allow", "ask", "deny"):
             continue
 
+        match_patterns = _extract_non_empty_strs(entry.get("match"))
+        exclude_patterns = _extract_non_empty_strs(entry.get("exclude"))
         capability = entry.get("capability")
-        match_patterns: list[str] = []
-        exclude_patterns: list[str] = []
-
-        raw_match = entry.get("match")
-        if isinstance(raw_match, Sequence) and not isinstance(raw_match, (str, bytes)):
-            match_patterns.extend(str(p) for p in raw_match if isinstance(p, str) and p.strip())
-
-        raw_exclude = entry.get("exclude")
-        if isinstance(raw_exclude, Sequence) and not isinstance(raw_exclude, (str, bytes)):
-            exclude_patterns.extend(str(p) for p in raw_exclude if isinstance(p, str) and p.strip())
-
         if isinstance(capability, str) and capability in KAS_CAPABILITIES:
             normalized.append(
                 {
@@ -735,50 +638,29 @@ def _normalize_permission_rules(raw_permissions: Any) -> list[dict[str, Any]]:
             )
             continue
 
-        # Support legacy/list `{tool, permission, commands?}` entries
         tool_ref = entry.get("tool")
         if not isinstance(tool_ref, str) or not tool_ref.strip():
             continue
         tool_ref = tool_ref.strip()
         if tool_ref == "*":
-            normalized.append(
-                {
-                    "capability": "all",
-                    "match": match_patterns,
-                    "exclude": exclude_patterns,
-                    "effect": effect,
-                }
-            )
-            continue
-        if tool_ref.startswith("@"):
-            mcp_target = tool_ref[1:]
-            if "/" not in mcp_target:
-                mcp_target = f"{mcp_target}/*"
-            normalized.append(
-                {
-                    "capability": "mcp",
-                    "match": [mcp_target, *match_patterns],
-                    "exclude": exclude_patterns,
-                    "effect": effect,
-                }
-            )
-            continue
-
-        mapped_cap = _CAPABILITY_BY_TOOL_NAME.get(tool_ref)
-        if mapped_cap is None:
-            continue
-        raw_commands = entry.get("commands")
-        if isinstance(raw_commands, Sequence) and not isinstance(raw_commands, (str, bytes)):
-            match_patterns.extend(str(c) for c in raw_commands if isinstance(c, str) and c.strip())
+            resolved_cap, resolved_match = "all", match_patterns
+        elif tool_ref.startswith("@"):
+            mcp_target = tool_ref[1:] if "/" in tool_ref[1:] else f"{tool_ref[1:]}/*"
+            resolved_cap, resolved_match = "mcp", [mcp_target, *match_patterns]
+        else:
+            mapped_cap = _CAPABILITY_BY_TOOL_NAME.get(tool_ref)
+            if mapped_cap is None:
+                continue
+            resolved_cap = mapped_cap
+            resolved_match = [*match_patterns, *_extract_non_empty_strs(entry.get("commands"))]
         normalized.append(
             {
-                "capability": mapped_cap,
-                "match": match_patterns,
+                "capability": resolved_cap,
+                "match": resolved_match,
                 "exclude": exclude_patterns,
                 "effect": effect,
             }
         )
-
     return normalized
 
 
@@ -795,11 +677,7 @@ def _normalize_fs_path_candidates(path: str, *, cwd: str = "") -> tuple[str, ...
     if cwd_clean:
         cwd_path = Path(cwd_clean).resolve(strict=False)
         raw_p = Path(raw_posix)
-        target_path = (
-            raw_p.resolve(strict=False)
-            if raw_p.is_absolute()
-            else (cwd_path / raw_p).resolve(strict=False)
-        )
+        target_path = (raw_p if raw_p.is_absolute() else (cwd_path / raw_p)).resolve(strict=False)
         candidates: list[str] = [target_path.as_posix()]
         if target_path == cwd_path:
             candidates.append(".")
@@ -810,9 +688,7 @@ def _normalize_fs_path_candidates(path: str, *, cwd: str = "") -> tuple[str, ...
         return tuple(candidates)
 
     norm = posixpath.normpath(raw_posix)
-    if norm.startswith("//"):
-        norm = "/" + norm.lstrip("/")
-    return (norm,)
+    return ("/" + norm.lstrip("/") if norm.startswith("//") else norm,)
 
 
 def _validate_str_list_field(value: Any, field_name: str) -> None:
@@ -829,29 +705,27 @@ def _validate_permission_rule_entry(entry: Any, index: int) -> None:
             f"permission rule at index {index} has invalid effect {effect!r}; "
             "expected 'allow', 'ask', or 'deny'"
         )
-    has_cap = "capability" in entry and entry["capability"] is not None
-    has_tool = "tool" in entry and entry["tool"] is not None
+    has_cap = entry.get("capability") is not None
+    has_tool = entry.get("tool") is not None
     if not has_cap and not has_tool:
         raise ValueError(f"permission rule at index {index} must specify 'capability' or 'tool'")
-    if has_cap:
-        cap = entry["capability"]
-        if not isinstance(cap, str) or cap not in KAS_CAPABILITIES:
-            raise ValueError(f"permission rule at index {index} has unknown capability {cap!r}")
-    if has_tool:
-        tool = entry["tool"]
-        if not isinstance(tool, str) or not tool.strip():
-            raise ValueError(f"permission rule at index {index} must have a non-empty 'tool'")
+    if has_cap and (
+        not isinstance(entry["capability"], str) or entry["capability"] not in KAS_CAPABILITIES
+    ):
+        raise ValueError(
+            f"permission rule at index {index} has unknown capability {entry['capability']!r}"
+        )
+    if has_tool and (not isinstance(entry["tool"], str) or not entry["tool"].strip()):
+        raise ValueError(f"permission rule at index {index} must have a non-empty 'tool'")
     for list_key in ("match", "exclude", "commands"):
-        if list_key in entry and entry[list_key] is not None:
+        if entry.get(list_key) is not None:
             _validate_str_list_field(entry[list_key], f"permissions[{index}].{list_key}")
 
 
 def _validate_permissions_structure(raw_permissions: Any) -> None:
-    if raw_permissions is None:
+    if raw_permissions is None or raw_permissions == {}:
         return
     if isinstance(raw_permissions, dict):
-        if not raw_permissions:
-            return
         if "rules" not in raw_permissions:
             raise ValueError("'permissions' object must contain a 'rules' list")
         unknown_keys = set(raw_permissions.keys()) - {"rules"}
@@ -860,14 +734,13 @@ def _validate_permissions_structure(raw_permissions: Any) -> None:
         rules = raw_permissions["rules"]
         if not isinstance(rules, list):
             raise ValueError("'permissions.rules' must be a list")
-        for idx, entry in enumerate(rules):
-            _validate_permission_rule_entry(entry, idx)
-        return
-    if isinstance(raw_permissions, list):
-        for idx, entry in enumerate(raw_permissions):
-            _validate_permission_rule_entry(entry, idx)
-        return
-    raise ValueError("'permissions' must be an object or list")
+    elif isinstance(raw_permissions, list):
+        rules = raw_permissions
+    else:
+        raise ValueError("'permissions' must be an object or list")
+
+    for idx, entry in enumerate(rules):
+        _validate_permission_rule_entry(entry, idx)
 
 
 def validate_agent_spec_file(path: Path) -> CustomAgentSpec:
@@ -876,7 +749,7 @@ def validate_agent_spec_file(path: Path) -> CustomAgentSpec:
     base_dir = path.parent
 
     for prompt_key in ("prompt", "systemPrompt"):
-        if prompt_key in loaded and loaded[prompt_key] is not None:
+        if loaded.get(prompt_key) is not None:
             val = loaded[prompt_key]
             if not isinstance(val, str):
                 raise ValueError(f"{prompt_key!r} must be a string")
@@ -885,12 +758,11 @@ def validate_agent_spec_file(path: Path) -> CustomAgentSpec:
 
     _validate_permissions_structure(loaded.get("permissions"))
 
-    if "mcpServers" in loaded and loaded["mcpServers"] is not None:
-        if not isinstance(loaded["mcpServers"], dict):
-            raise ValueError("'mcpServers' must be an object")
+    if loaded.get("mcpServers") is not None and not isinstance(loaded["mcpServers"], dict):
+        raise ValueError("'mcpServers' must be an object")
 
     for tool_list_key in ("tools", "excludedTools", "allowedTools"):
-        if tool_list_key in loaded and loaded[tool_list_key] is not None:
+        if loaded.get(tool_list_key) is not None:
             raw_tools = loaded[tool_list_key]
             if not isinstance(raw_tools, str) and (
                 not isinstance(raw_tools, list) or not all(isinstance(x, str) for x in raw_tools)
@@ -918,7 +790,7 @@ def _evaluate_kas_permissions_for_candidates(
     saw_allow = False
 
     for rule in rules:
-        expanded = _expand_rule_capabilities(rule["capability"])
+        expanded = META_CAPABILITY_EXPANSION.get(rule["capability"], (rule["capability"],))
         if capability not in expanded:
             continue
 
@@ -953,11 +825,7 @@ def _evaluate_kas_permissions_for_candidates(
         elif effect == "allow":
             saw_allow = True
 
-    if saw_ask:
-        return "ask"
-    if saw_allow:
-        return "allow"
-    return "ask"
+    return "ask" if saw_ask else ("allow" if saw_allow else "ask")
 
 
 def evaluate_kas_permissions(
@@ -970,10 +838,11 @@ def evaluate_kas_permissions(
 
     Unmatched requests resolve to `"ask"`.
     """
-    if capability in ("fs_read", "fs_write"):
-        candidates = _normalize_fs_path_candidates(resource, cwd="")
-    else:
-        candidates = (resource,)
+    candidates = (
+        _normalize_fs_path_candidates(resource, cwd="")
+        if capability in ("fs_read", "fs_write")
+        else (resource,)
+    )
     return _evaluate_kas_permissions_for_candidates(
         permissions,
         capability=capability,
@@ -1005,50 +874,26 @@ def evaluate_tool_call_permission(
 
     capability = _CAPABILITY_BY_TOOL_NAME.get(tool_id)
     if capability is None:
-        return evaluate_kas_permissions(
-            permissions,
-            capability="builtin",
-            resource=tool_id,
-        )
+        return evaluate_kas_permissions(permissions, capability="builtin", resource=tool_id)
 
     if capability in ("fs_read", "fs_write"):
-        candidates = _normalize_fs_path_candidates(path, cwd=cwd)
         return _evaluate_kas_permissions_for_candidates(
             permissions,
             capability=capability,
-            candidates=candidates,
+            candidates=_normalize_fs_path_candidates(path, cwd=cwd),
         )
 
-    if capability == "shell":
-        resource = command
-    elif capability == "web_fetch":
-        resource = url
-    elif capability == "web_search":
-        resource = query
-    elif capability == "subagent":
-        resource = subagent_target
-    else:
-        resource = ""
-
+    resource_by_cap = {
+        "shell": command,
+        "web_fetch": url,
+        "web_search": query,
+        "subagent": subagent_target,
+    }
     return evaluate_kas_permissions(
         permissions,
         capability=capability,
-        resource=resource,
+        resource=resource_by_cap.get(capability, ""),
     )
-
-
-_READ_ONLY_KIRO_TOOLS: frozenset[str] = frozenset(
-    {
-        "fs_read",
-        "grep",
-        "glob",
-        "code",
-        "web_search",
-        "web_fetch",
-        "tool_search",
-        "todo_list",
-    }
-)
 
 
 def load_kiro_agent_spec(
@@ -1065,21 +910,11 @@ def load_kiro_agent_spec(
     if "kirocrew" not in candidates:
         candidates.append("kirocrew")
 
-    # Each entry is (agents_dir, is_project_scope, containment_root)
     search_dirs: list[tuple[Path, bool, Path]] = []
-    if cwd:
+    safe_proj = _resolve_safe_project_agents_dir(cwd)
+    if safe_proj is not None and cwd:
         with contextlib.suppress(OSError, RuntimeError):
-            cwd_path = Path(cwd)
-            resolved_cwd = cwd_path.resolve()
-            kiro_dir = cwd_path / ".kiro"
-            proj_agents_dir = kiro_dir / "agents"
-            if (
-                not kiro_dir.is_symlink()
-                and not proj_agents_dir.is_symlink()
-                and proj_agents_dir.is_dir()
-                and proj_agents_dir.resolve().is_relative_to(resolved_cwd)
-            ):
-                search_dirs.append((proj_agents_dir, True, resolved_cwd))
+            search_dirs.append((safe_proj[0], True, Path(cwd).resolve()))
 
     trusted_user_dir: Path | None = None
     if user_agents_dir is not None:
@@ -1106,10 +941,7 @@ def load_kiro_agent_spec(
             if spec_path.is_symlink() or not spec_path.is_file():
                 continue
             with contextlib.suppress(
-                OSError,
-                json.JSONDecodeError,
-                CustomAgentSecurityError,
-                ValueError,
+                OSError, json.JSONDecodeError, CustomAgentSecurityError, ValueError
             ):
                 resolved_spec = spec_path.resolve(strict=True)
                 if not resolved_spec.is_relative_to(containment_root):
@@ -1121,12 +953,7 @@ def load_kiro_agent_spec(
                     raw_spec = sanitize_project_agent_spec(loaded_spec, agents_dir=agents_dir)
                 else:
                     raw_spec = dict(loaded_spec)
-                    prompt_ref = raw_spec.get("prompt")
-                    if isinstance(prompt_ref, str) and prompt_ref.startswith("file://"):
-                        raw_spec["prompt"] = resolve_contained_prompt_file(
-                            prompt_ref,
-                            base_dir=agents_dir,
-                        )
+                    _resolve_spec_prompt_field(raw_spec, base_dir=agents_dir)
                 found_candidate = True
                 raw_model = raw_spec.get("model")
                 if (
@@ -1144,37 +971,35 @@ def load_kiro_agent_spec(
                     agent_tools = [str(t).strip() for t in raw_tools if str(t).strip()]
                 if not is_project_scope:
                     raw_mcp = raw_spec.get("mcpServers")
-                    if isinstance(raw_mcp, dict):
-                        for srv_name, srv_cfg in raw_mcp.items():
-                            if not isinstance(srv_name, str) or not srv_name:
-                                continue
-                            if not isinstance(srv_cfg, dict):
-                                continue
-                            if srv_cfg.get("disabled"):
-                                if srv_name not in disabled_names:
-                                    disabled_names.append(srv_name)
-                            elif srv_name not in servers_by_name and srv_name not in disabled_names:
-                                servers_by_name[srv_name] = {"name": srv_name, **srv_cfg}
-                    elif isinstance(raw_mcp, list):
-                        for item in raw_mcp:
-                            if isinstance(item, dict) and item.get("name"):
-                                sname = str(item["name"])
-                                if item.get("disabled"):
-                                    if sname not in disabled_names:
-                                        disabled_names.append(sname)
-                                elif sname not in servers_by_name and sname not in disabled_names:
-                                    servers_by_name[sname] = dict(item)
+                    mcp_entries = (
+                        [
+                            {"name": k, **v}
+                            for k, v in raw_mcp.items()
+                            if isinstance(k, str) and k and isinstance(v, dict)
+                        ]
+                        if isinstance(raw_mcp, dict)
+                        else [
+                            dict(item)
+                            for item in (raw_mcp if isinstance(raw_mcp, list) else [])
+                            if isinstance(item, dict) and item.get("name")
+                        ]
+                    )
+                    for entry in mcp_entries:
+                        sname = str(entry["name"])
+                        if entry.get("disabled"):
+                            if sname not in disabled_names:
+                                disabled_names.append(sname)
+                        elif sname not in servers_by_name and sname not in disabled_names:
+                            servers_by_name[sname] = entry
         if found_candidate:
             break
 
-    is_read_only = agent_tools is not None and all(
-        tool in _READ_ONLY_KIRO_TOOLS for tool in agent_tools
-    )
     return {
         "model": pinned_model,
         "prompt": agent_prompt,
         "tools": agent_tools,
-        "read_only": is_read_only,
+        "read_only": agent_tools is not None
+        and all(t in _READ_ONLY_KIRO_TOOLS for t in agent_tools),
         "mcp_servers": list(servers_by_name.values()),
         "disabled_mcp_servers": disabled_names,
     }

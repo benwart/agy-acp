@@ -26,7 +26,12 @@ from agy_acp.logic.custom_agents import (
 )
 from agy_acp.logic.quota_tracker import QuotaTracker, TurnTelemetry
 from agy_acp.logic.session_manager import DEFAULT_MODEL_ID, SessionManager
-from agy_acp.logic.tool_classifier import ToolCallEvent
+from agy_acp.logic.tool_classifier import (
+    PATH_ARGUMENT_KEYS,
+    ToolCallEvent,
+    _extract_first_str,
+    match_mcp_server_prefix,
+)
 from agy_acp.logic.wire import (
     EngineWireAdapter,
     McpServerStatus,
@@ -102,47 +107,28 @@ def _coerce_tool_kind(raw_kind: str) -> ToolCallKind:
             return "other"
 
 
-def _resolve_mcp_server_and_tool(
-    after_prefix: str,
-    known_mcp_servers: Sequence[str],
-) -> tuple[str, str]:
-    """Match `<server>_<tool>` against longest known session MCP server name first."""
-    ordered = sorted(
-        (s for s in known_mcp_servers if isinstance(s, str) and s),
-        key=len,
-        reverse=True,
-    )
-    for srv in ordered:
-        prefix = f"{srv}_"
-        if after_prefix.startswith(prefix) and len(after_prefix) > len(prefix):
-            return srv, after_prefix[len(prefix) :]
-    srv, sep, tool = after_prefix.partition("_")
-    return srv, (tool if sep else after_prefix)
-
-
 def _resolve_event_mcp_identity(
     event: ToolCallEvent,
     known_mcp_servers: Sequence[str],
 ) -> tuple[str, str]:
     """Resolve `(mcp_server, mcp_tool)` for `event` using longest configured server prefix."""
     if event.mcp_server and event.mcp_tool:
-        combined = f"{event.mcp_server}_{event.mcp_tool}"
-        ordered = sorted(
-            (s for s in known_mcp_servers if isinstance(s, str) and s),
-            key=len,
-            reverse=True,
+        matched = match_mcp_server_prefix(
+            f"{event.mcp_server}_{event.mcp_tool}",
+            known_mcp_servers,
         )
-        for srv in ordered:
-            prefix = f"{srv}_"
-            if combined.startswith(prefix) and len(combined) > len(prefix):
-                return srv, combined[len(prefix) :]
-        return event.mcp_server, event.mcp_tool
+        return matched if matched != ("", "") else (event.mcp_server, event.mcp_tool)
 
     for raw_candidate in (event.kiro_tool_id, event.kiro_tool_name, event.title):
         if not isinstance(raw_candidate, str):
             continue
         if raw_candidate.startswith("mcp_") and len(raw_candidate) > 4:
-            return _resolve_mcp_server_and_tool(raw_candidate[4:], known_mcp_servers)
+            after_prefix = raw_candidate[4:]
+            matched = match_mcp_server_prefix(after_prefix, known_mcp_servers)
+            if matched != ("", ""):
+                return matched
+            srv, sep, tool = after_prefix.partition("_")
+            return srv, (tool if sep else after_prefix)
         if raw_candidate.startswith("@") and "/" in raw_candidate:
             srv, _, tool = raw_candidate[1:].partition("/")
             if srv and tool:
@@ -185,6 +171,22 @@ def _to_normalized_tool_event(
     )
 
 
+def _resolve_v2_tool_meta(
+    event: ToolCallEvent,
+    norm: NormalizedToolEvent,
+) -> tuple[str, str, str]:
+    """Resolve `(kiro_tool_name, mcp_server_name, kiro_tool_id)` for v2 wire payloads."""
+    if norm.is_mcp:
+        return norm.mcp_tool, norm.mcp_server, f"@{norm.mcp_server}/{norm.mcp_tool}"
+    kiro_tool_name = event.kiro_tool_name or (
+        "execute_bash" if event.kind == "execute" else event.title
+    )
+    kiro_tool_id = event.kiro_tool_id or (
+        "run_command" if event.kind == "execute" else kiro_tool_name
+    )
+    return kiro_tool_name, event.mcp_server_name, kiro_tool_id
+
+
 def _matches_agent_tool_list(
     patterns: Sequence[str],
     norm: NormalizedToolEvent,
@@ -218,20 +220,7 @@ def _extract_primary_path(norm: NormalizedToolEvent) -> str:
         loc_path = norm.locations[0].get("path")
         if isinstance(loc_path, str) and loc_path:
             return loc_path
-    for key in (
-        "Path",
-        "path",
-        "TargetFile",
-        "AbsolutePath",
-        "DirectoryPath",
-        "SearchDirectory",
-        "TargetDirectory",
-        "file_path",
-    ):
-        val = norm.raw_input.get(key)
-        if isinstance(val, str) and val:
-            return val
-    return ""
+    return _extract_first_str(norm.raw_input, PATH_ARGUMENT_KEYS)
 
 
 def _adapt_permissions_for_cwd(
@@ -305,17 +294,11 @@ def _evaluate_permissions_with_cwd(
             else ((cwd_resolved / raw_p) if cwd_resolved is not None else raw_p)
         )
         resolved = target.resolve(strict=False)
-        abs_posix = resolved.as_posix()
         cwd_posix = cwd_resolved.as_posix() if cwd_resolved is not None else ""
-        abs_perms = _adapt_permissions_for_cwd(
-            permissions,
-            cwd_posix=cwd_posix,
-            for_absolute=True,
-        )
         abs_dec = evaluate_tool_call_permission(
-            abs_perms,
+            _adapt_permissions_for_cwd(permissions, cwd_posix=cwd_posix, for_absolute=True),
             tool_id=norm.kas_tool_id,
-            path=abs_posix,
+            path=resolved.as_posix(),
             url=url,
             query=query,
             subagent_target=norm.subagent_target,
@@ -324,13 +307,8 @@ def _evaluate_permissions_with_cwd(
             rel_posix = (
                 "." if resolved == cwd_resolved else resolved.relative_to(cwd_resolved).as_posix()
             )
-            rel_perms = _adapt_permissions_for_cwd(
-                permissions,
-                cwd_posix=cwd_posix,
-                for_absolute=False,
-            )
             rel_dec = evaluate_tool_call_permission(
-                rel_perms,
+                _adapt_permissions_for_cwd(permissions, cwd_posix=cwd_posix, for_absolute=False),
                 tool_id=norm.kas_tool_id,
                 path=rel_posix,
                 url=url,
@@ -359,13 +337,13 @@ def _evaluate_permissions_with_cwd(
 
 
 def _stamp_replay_meta(frame: dict[str, Any]) -> dict[str, Any]:
-    """Ensure both `params._meta.kiro.replay` and `params.update._meta.kiro.replay` are True."""
+    """Ensure `params._meta.kiro.replay` is True on a replay notification frame."""
     params = dict(frame.get("params") or {})
     params_meta = dict(params.get("_meta") or {})
-    params_kiro = dict(params_meta.get("kiro") or {})
-    params_kiro["replay"] = True
-    params_meta["kiro"] = params_kiro
-    params["_meta"] = params_meta
+    params["_meta"] = {
+        **params_meta,
+        "kiro": {**dict(params_meta.get("kiro") or {}), "replay": True},
+    }
     return {**frame, "params": params}
 
 
@@ -379,15 +357,9 @@ def _stamp_ttft_meta(
     params = dict(frame.get("params") or {})
     update = dict(params.get("update") or {})
     update_meta = dict(update.get("_meta") or {})
-    update_kiro = dict(update_meta.get("kiro") or {})
-    update_kiro["ttft"] = {
-        "promptReceivedAt": prompt_received_ms,
-        "firstChunkEmittedAt": emitted_ms,
-    }
-    update_meta["kiro"] = update_kiro
-    update["_meta"] = update_meta
-    params["update"] = update
-    return {**frame, "params": params}
+    ttft = {"promptReceivedAt": prompt_received_ms, "firstChunkEmittedAt": emitted_ms}
+    update["_meta"] = {**update_meta, "kiro": {**dict(update_meta.get("kiro") or {}), "ttft": ttft}}
+    return {**frame, "params": {**params, "update": update}}
 
 
 def _to_wire_turn_telemetry(
@@ -396,13 +368,12 @@ def _to_wire_turn_telemetry(
     turn_id: str = "",
     context_breakdown: dict[str, Any] | None = None,
 ) -> WireTurnTelemetry:
-    meta_without_sid = {k: v for k, v in telemetry.metadata_params.items() if k != "sessionId"}
     return WireTurnTelemetry(
         context_used=telemetry.context_tokens,
         context_size=telemetry.context_window,
         context_usage_percentage=telemetry.context_usage_pct,
         delta_credits=telemetry.delta_credits,
-        metadata_payload=meta_without_sid,
+        metadata_payload={k: v for k, v in telemetry.metadata_params.items() if k != "sessionId"},
         rate_limited_message=telemetry.rate_limit_message,
         context_breakdown=context_breakdown,
         turn_id=turn_id,
@@ -411,9 +382,11 @@ def _to_wire_turn_telemetry(
 
 def _require_non_empty_str(params: dict[str, Any], key: str) -> str | None:
     val = params.get(key)
-    if isinstance(val, str) and bool(val.strip()):
-        return val
-    return None
+    return val if isinstance(val, str) and bool(val.strip()) else None
+
+
+def _jsonrpc_result(msg_id: Any, result: Any) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": msg_id, "result": result}
 
 
 def _jsonrpc_error(
@@ -427,6 +400,77 @@ def _jsonrpc_error(
     if data is not None:
         err["data"] = data
     return {"jsonrpc": "2.0", "id": msg_id, "error": err}
+
+
+def _prompt_turn_result(
+    msg_id: Any,
+    *,
+    stop_reason: str = "end_turn",
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cached_read_tokens: int = 0,
+) -> dict[str, Any]:
+    return _jsonrpc_result(
+        msg_id,
+        {
+            "stopReason": stop_reason,
+            "usage": {
+                "inputTokens": input_tokens,
+                "outputTokens": output_tokens,
+                "cachedReadTokens": cached_read_tokens,
+                "cachedWriteTokens": 0,
+            },
+        },
+    )
+
+
+def _session_update_frame(session_id: str, update: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {"sessionId": session_id, "update": update},
+    }
+
+
+def _parse_session_wire_options(
+    msg_id: Any,
+    params: dict[str, Any],
+) -> tuple[list[dict[str, Any]] | None, dict[str, Any] | None, dict[str, Any] | None]:
+    """Validate and extract `(mcp_servers, meta, error_response)` from session open params."""
+    raw_mcp = params.get("mcpServers")
+    if raw_mcp is not None and not isinstance(raw_mcp, list):
+        return (
+            None,
+            None,
+            _jsonrpc_error(msg_id, -32602, "Invalid params: 'mcpServers' must be a list"),
+        )
+    mcp_servers = [s for s in raw_mcp if isinstance(s, dict)] if isinstance(raw_mcp, list) else None
+    raw_meta = params.get("_meta")
+    if raw_meta is not None and not isinstance(raw_meta, dict):
+        return (
+            None,
+            None,
+            _jsonrpc_error(msg_id, -32602, "Invalid params: '_meta' must be an object"),
+        )
+    meta = dict(raw_meta) if isinstance(raw_meta, dict) else None
+    return mcp_servers, meta, None
+
+
+def _extract_fork_message_id(
+    meta: dict[str, Any] | None,
+    raw_top_msg_id: str | None,
+) -> str | None:
+    """Resolve optional fork `messageId` across JetBrains Air, Kiro `_meta`, or top-level params."""
+    if isinstance(meta, dict):
+        for path in (("jetbrains", "air", "fork"), ("kiro", "fork")):
+            node: Any = meta
+            for key in path:
+                node = node.get(key) if isinstance(node, dict) else None
+            if isinstance(node, dict) and isinstance(node.get("messageId"), str):
+                cleaned = node["messageId"].strip()
+                if cleaned:
+                    return cleaned
+    return raw_top_msg_id.strip() or None if isinstance(raw_top_msg_id, str) else None
 
 
 class AcpDispatcher:
@@ -492,38 +536,51 @@ class AcpDispatcher:
         if self._notification_sink is not None:
             await self._notification_sink(notification)
 
+    def _require_existing_session(
+        self,
+        msg_id: Any,
+        params: dict[str, Any],
+        *,
+        is_request: bool = True,
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        """Validate `sessionId` and verify session existence in SQLite."""
+        session_id = _require_non_empty_str(params, "sessionId")
+        if session_id is None:
+            return None, (_jsonrpc_error(msg_id, -32602, "Invalid params") if is_request else None)
+        try:
+            self._session_manager.get_session(session_id)
+        except KeyError as exc:
+            return None, (_jsonrpc_error(msg_id, -32002, str(exc)) if is_request else None)
+        return session_id, None
+
     def _resolve_session_model(self, session_id: str) -> str:
         """Return the active model ID for `session_id`, falling back to the default model."""
         try:
-            session_state = self._session_manager.get_session(session_id)
-            return str(session_state.get("model", DEFAULT_MODEL_ID))
+            return str(self._session_manager.get_session(session_id).get("model", DEFAULT_MODEL_ID))
         except KeyError:
             return DEFAULT_MODEL_ID
 
     def _resolve_session_mode(self, session_id: str) -> str:
         """Return the active mode ID for `session_id`, falling back to GOOSE_MODE or `auto`."""
         try:
-            session_state = self._session_manager.get_session(session_id)
-            return str(session_state.get("mode", "auto"))
+            return str(self._session_manager.get_session(session_id).get("mode", "auto"))
         except KeyError:
             return "approve" if os.environ.get("GOOSE_MODE") == "approve" else "auto"
 
     @staticmethod
     def _extract_prompt_text(prompt_blocks: list[dict[str, Any]]) -> str:
         """Extract concatenated text from ACP prompt content blocks."""
-        parts = [
-            str(block.get("text", ""))
+        return "\n".join(
+            str(block["text"])
             for block in prompt_blocks
-            if isinstance(block, dict) and block.get("type") == "text"
-        ]
-        return "\n".join(part for part in parts if part).strip()
+            if isinstance(block, dict) and block.get("type") == "text" and block.get("text")
+        ).strip()
 
     @staticmethod
     def _extract_user_tail(prompt_text: str) -> str:
         if not prompt_text:
             return ""
-        marker = "[CURRENT USER REQUEST"
-        idx = prompt_text.rfind(marker)
+        idx = prompt_text.rfind("[CURRENT USER REQUEST")
         if idx != -1:
             close_bracket = prompt_text.find("]", idx)
             if close_bracket != -1:
@@ -550,31 +607,18 @@ class AcpDispatcher:
         """Extract a slash command (`/quota`, `/usage`, `/credits`, `/clear`, `/reset`)."""
         if not prompt_text:
             return ""
+        all_slash = SLASH_QUOTA_COMMANDS | SLASH_RESET_COMMANDS
         tail = cls._extract_user_tail(prompt_text)
         first_line = tail.splitlines()[0].strip().lower() if tail else ""
-        if first_line in SLASH_QUOTA_COMMANDS or first_line in SLASH_RESET_COMMANDS:
+        if first_line in all_slash:
             return first_line
         last_line = prompt_text.splitlines()[-1].strip().lower()
-        if last_line in SLASH_QUOTA_COMMANDS or last_line in SLASH_RESET_COMMANDS:
-            return last_line
-        return ""
+        return last_line if last_line in all_slash else ""
 
     @staticmethod
     def _cancelled_prompt_response(message_id: Any) -> dict[str, Any]:
         """Build a JSON-RPC 2.0 `session/prompt` response with `stopReason == 'cancelled'`."""
-        return {
-            "jsonrpc": "2.0",
-            "id": message_id,
-            "result": {
-                "stopReason": "cancelled",
-                "usage": {
-                    "inputTokens": 0,
-                    "outputTokens": 0,
-                    "cachedReadTokens": 0,
-                    "cachedWriteTokens": 0,
-                },
-            },
-        }
+        return _prompt_turn_result(message_id, stop_reason="cancelled")
 
     def _evaluate_tool_permission(
         self,
@@ -585,8 +629,7 @@ class AcpDispatcher:
         session_mode: str,
     ) -> PermissionDecision:
         """Evaluate tool permissions in strict fail-closed order across both v2 and v3."""
-        agent_read_only = bool(session.get("agentReadOnly"))
-        if (session_mode == "read-only" or agent_read_only) and norm.kind in {
+        if (session_mode == "read-only" or bool(session.get("agentReadOnly"))) and norm.kind in {
             "execute",
             "edit",
             "delete",
@@ -646,11 +689,7 @@ class AcpDispatcher:
         )
         if _matches_agent_tool_list(allowed_tools, norm, for_allowlist=True):
             return "allow"
-
-        if perm_decision == "allow":
-            return "allow"
-
-        return "ask"
+        return "allow" if perm_decision == "allow" else "ask"
 
     async def _request_client_permission(
         self,
@@ -668,6 +707,26 @@ class AcpDispatcher:
             return False
         selected_option = outcome.get("optionId") if isinstance(outcome, dict) else None
         return selected_option in {"allow_once", "allow_always"}
+
+    async def _authorize_tool_call(
+        self,
+        session_id: str,
+        session: Mapping[str, Any],
+        norm: NormalizedToolEvent,
+        perm_params_factory: Callable[[], dict[str, Any]],
+    ) -> bool:
+        """Evaluate customAgent/session permissions and prompt client only on `ask`."""
+        decision = self._evaluate_tool_permission(
+            session=session,
+            spec=self._session_manager.get_active_custom_agent(session_id),
+            norm=norm,
+            session_mode=self._resolve_session_mode(session_id),
+        )
+        if decision == "allow":
+            return True
+        if decision == "deny":
+            return False
+        return await self._request_client_permission(session_id, perm_params_factory())
 
     async def _emit_turn_telemetry_frames(
         self,
@@ -731,21 +790,12 @@ class AcpDispatcher:
         known_mcp = self._session_manager.get_session_mcp_server_names(session_id)
         norm = _to_normalized_tool_event(event, known_mcp_servers=known_mcp)
         await self._emit_notification(self._wire_adapter.build_tool_call_update(session_id, norm))
-
-        spec = self._session_manager.get_active_custom_agent(session_id)
-        decision = self._evaluate_tool_permission(
-            session=session,
-            spec=spec,
-            norm=norm,
-            session_mode=self._resolve_session_mode(session_id),
+        return await self._authorize_tool_call(
+            session_id,
+            session,
+            norm,
+            lambda: self._wire_adapter.build_permission_request_params(session_id, norm),
         )
-        if decision == "allow":
-            return True
-        if decision == "deny":
-            return False
-
-        perm_params = self._wire_adapter.build_permission_request_params(session_id, norm)
-        return await self._request_client_permission(session_id, perm_params)
 
     async def _handle_v2_tool_call(
         self,
@@ -755,70 +805,32 @@ class AcpDispatcher:
         session = self._session_manager.state_store.get_session(session_id) or {}
         known_mcp = self._session_manager.get_session_mcp_server_names(session_id)
         norm = _to_normalized_tool_event(event, known_mcp_servers=known_mcp)
+        kiro_tool_name, mcp_server_name, kiro_tool_id = _resolve_v2_tool_meta(event, norm)
 
-        if norm.is_mcp:
-            kiro_tool_name = norm.mcp_tool
-            mcp_server_name = norm.mcp_server
-            kiro_tool_id = f"@{norm.mcp_server}/{norm.mcp_tool}"
-        else:
-            kiro_tool_name = event.kiro_tool_name or (
-                "execute_bash" if event.kind == "execute" else event.title
-            )
-            mcp_server_name = event.mcp_server_name
-            kiro_tool_id = event.kiro_tool_id or (
-                "run_command" if event.kind == "execute" else kiro_tool_name
-            )
         tool_descriptor: dict[str, Any] = {
             "toolCallId": event.tool_call_id,
             "title": event.title,
             "kind": event.kind,
             "status": "in_progress",
             "rawInput": event.raw_input,
-            "_meta": {
-                "kiro": {
-                    "toolName": kiro_tool_name,
-                    "mcpServerName": mcp_server_name,
-                }
-            },
+            "_meta": {"kiro": {"toolName": kiro_tool_name, "mcpServerName": mcp_server_name}},
+            **({"locations": event.locations} if event.locations else {}),
+            **({"content": event.diff_content} if event.diff_content else {}),
         }
-        if event.locations:
-            tool_descriptor["locations"] = event.locations
-        if event.diff_content:
-            tool_descriptor["content"] = event.diff_content
-
         await self._emit_notification(
-            {
-                "jsonrpc": "2.0",
-                "method": "session/update",
-                "params": {
-                    "sessionId": session_id,
-                    "update": {
-                        "sessionUpdate": "tool_call",
-                        **tool_descriptor,
-                    },
-                },
-            }
+            _session_update_frame(session_id, {"sessionUpdate": "tool_call", **tool_descriptor})
         )
-
-        spec = self._session_manager.get_active_custom_agent(session_id)
-        decision = self._evaluate_tool_permission(
-            session=session,
-            spec=spec,
-            norm=norm,
-            session_mode=self._resolve_session_mode(session_id),
+        return await self._authorize_tool_call(
+            session_id,
+            session,
+            norm,
+            lambda: {
+                "sessionId": session_id,
+                "toolCall": tool_descriptor,
+                "_meta": {"kiro": {"toolId": kiro_tool_id}},
+                "options": self._wire_adapter.build_permission_options(),
+            },
         )
-        if decision == "allow":
-            return True
-        if decision == "deny":
-            return False
-
-        perm_params = {
-            "sessionId": session_id,
-            "toolCall": tool_descriptor,
-            "_meta": {"kiro": {"toolId": kiro_tool_id}},
-            "options": self._wire_adapter.build_permission_options(),
-        }
-        return await self._request_client_permission(session_id, perm_params)
 
     async def _handle_inline_compact_slash(
         self,
@@ -853,42 +865,27 @@ class AcpDispatcher:
             await self._emit_notification(
                 self._wire_adapter.build_agent_message_chunk(session_id, summary_text)
             )
-        model_id = self._resolve_session_model(session_id)
         telemetry = await self._emit_turn_telemetry_frames(
             session_id=session_id,
-            model_id=model_id,
+            model_id=self._resolve_session_model(session_id),
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cached_read_tokens=0,
             context_tokens=compacted_ctx,
         )
         if self._wire_adapter.engine_id == "v2":
-            post_params = dict(telemetry.metadata_params)
-            post_params["meteringUsage"] = [
-                {"unit": "credit", "unitPlural": "credits", "value": 0.0}
-            ]
+            post_params = {
+                **telemetry.metadata_params,
+                "meteringUsage": [{"unit": "credit", "unitPlural": "credits", "value": 0.0}],
+            }
             self._queue_post_response_notifications(
-                [
-                    {
-                        "jsonrpc": "2.0",
-                        "method": "_kiro.dev/metadata",
-                        "params": post_params,
-                    }
-                ]
+                [{"jsonrpc": "2.0", "method": "_kiro.dev/metadata", "params": post_params}]
             )
-        return {
-            "jsonrpc": "2.0",
-            "id": message_id,
-            "result": {
-                "stopReason": "end_turn",
-                "usage": {
-                    "inputTokens": input_tokens,
-                    "outputTokens": output_tokens,
-                    "cachedReadTokens": 0,
-                    "cachedWriteTokens": 0,
-                },
-            },
-        }
+        return _prompt_turn_result(
+            message_id,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
 
     async def _handle_session_prompt(
         self,
@@ -942,53 +939,34 @@ class AcpDispatcher:
             await self._emit_notification(
                 self._wire_adapter.build_agent_message_chunk(session_id, "Conversation cleared.")
             )
-            return {
-                "jsonrpc": "2.0",
-                "id": message_id,
-                "result": {
-                    "stopReason": "end_turn",
-                    "usage": {
-                        "inputTokens": 1,
-                        "outputTokens": 1,
-                        "cachedReadTokens": 0,
-                        "cachedWriteTokens": 0,
-                    },
-                },
-            }
+            return _prompt_turn_result(message_id, input_tokens=1, output_tokens=1)
 
         if slash_cmd in SLASH_QUOTA_COMMANDS:
-            thought_text = f"Querying quota report for {slash_cmd}..."
             response_text = await self._quota_tracker.format_slash_command_response(slash_cmd)
             await self._emit_notification(
-                self._wire_adapter.build_agent_thought_chunk(session_id, thought_text)
+                self._wire_adapter.build_agent_thought_chunk(
+                    session_id,
+                    f"Querying quota report for {slash_cmd}...",
+                )
             )
             await self._emit_notification(
                 self._wire_adapter.build_agent_message_chunk(session_id, response_text)
             )
             input_tokens = max(1, len(prompt_text.split()))
             output_tokens = max(1, len(response_text.split()))
-            model_id = self._resolve_session_model(session_id)
             await self._emit_turn_telemetry_frames(
                 session_id=session_id,
-                model_id=model_id,
+                model_id=self._resolve_session_model(session_id),
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 cached_read_tokens=0,
                 context_tokens=self._quota_tracker.get_session_context_tokens(session_id),
             )
-            return {
-                "jsonrpc": "2.0",
-                "id": message_id,
-                "result": {
-                    "stopReason": "end_turn",
-                    "usage": {
-                        "inputTokens": input_tokens,
-                        "outputTokens": output_tokens,
-                        "cachedReadTokens": 0,
-                        "cachedWriteTokens": 0,
-                    },
-                },
-            }
+            return _prompt_turn_result(
+                message_id,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
 
         raw_meta = params.get("_meta")
         kiro_prompt_meta = (
@@ -1027,22 +1005,20 @@ class AcpDispatcher:
                 and chunk_text
             ):
                 first_displayed_chunk = False
-                emit_ms = max(prompt_received_ms, int(time.time() * 1000))
                 return _stamp_ttft_meta(
                     frame,
                     prompt_received_ms=prompt_received_ms,
-                    emitted_ms=emit_ms,
+                    emitted_ms=max(prompt_received_ms, int(time.time() * 1000)),
                 )
             return frame
 
         carousel_normalizer = CarouselStreamNormalizer()
 
         async def _emit_message_piece(piece: str) -> None:
-            if not piece:
-                return
-            collected_chunks.append(piece)
-            frame = self._wire_adapter.build_agent_message_chunk(session_id, piece)
-            await self._emit_notification(_maybe_attach_ttft(frame, piece))
+            if piece:
+                collected_chunks.append(piece)
+                frame = self._wire_adapter.build_agent_message_chunk(session_id, piece)
+                await self._emit_notification(_maybe_attach_ttft(frame, piece))
 
         async def _on_thought(chunk: str) -> None:
             frame = self._wire_adapter.build_agent_thought_chunk(session_id, chunk)
@@ -1060,10 +1036,7 @@ class AcpDispatcher:
         async def _on_tool_update(event: ToolCallEvent) -> None:
             allowed = event.status != "failed"
             content_blocks = list(event.diff_content) or [
-                {
-                    "type": "content",
-                    "content": {"type": "text", "text": event.output},
-                }
+                {"type": "content", "content": {"type": "text", "text": event.output}}
             ]
             if self._wire_adapter.engine_id == "v3":
                 await self._emit_notification(
@@ -1079,37 +1052,25 @@ class AcpDispatcher:
 
             known_mcp = self._session_manager.get_session_mcp_server_names(session_id)
             norm = _to_normalized_tool_event(event, known_mcp_servers=known_mcp)
-            kiro_tool_name = (
-                norm.mcp_tool
-                if norm.is_mcp
-                else (
-                    event.kiro_tool_name
-                    or ("execute_bash" if event.kind == "execute" else event.title)
-                )
-            )
-            mcp_server_name = norm.mcp_server if norm.is_mcp else event.mcp_server_name
+            kiro_tool_name, mcp_server_name, _ = _resolve_v2_tool_meta(event, norm)
             await self._emit_notification(
-                {
-                    "jsonrpc": "2.0",
-                    "method": "session/update",
-                    "params": {
-                        "sessionId": session_id,
-                        "update": {
-                            "sessionUpdate": "tool_call_update",
-                            "toolCallId": event.tool_call_id,
-                            "status": event.status,
-                            "kind": event.kind,
-                            "content": content_blocks,
-                            "rawOutput": {"output": event.output, "allowed": allowed},
-                            "_meta": {
-                                "kiro": {
-                                    "toolName": kiro_tool_name,
-                                    "mcpServerName": mcp_server_name,
-                                }
-                            },
+                _session_update_frame(
+                    session_id,
+                    {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": event.tool_call_id,
+                        "status": event.status,
+                        "kind": event.kind,
+                        "content": content_blocks,
+                        "rawOutput": {"output": event.output, "allowed": allowed},
+                        "_meta": {
+                            "kiro": {
+                                "toolName": kiro_tool_name,
+                                "mcpServerName": mcp_server_name,
+                            }
                         },
                     },
-                }
+                )
             )
 
         async def _on_usage(ctx_tokens: int) -> None:
@@ -1193,10 +1154,9 @@ class AcpDispatcher:
         if want_context_breakdown and self._wire_adapter.engine_id == "v3":
             system_chars = len(agent_prompt_str)
             history_chars = len(prompt_text) + len(assistant_text)
-            total_chars = system_chars + history_chars
             context_breakdown = {
                 "schema": 1,
-                "totalChars": total_chars,
+                "totalChars": system_chars + history_chars,
                 "modelCalls": 1,
                 "categories": {
                     "system": {"chars": system_chars},
@@ -1205,10 +1165,9 @@ class AcpDispatcher:
                 **({"compacted": True} if was_compacted else {}),
             }
 
-        model_id = self._resolve_session_model(session_id)
         await self._emit_turn_telemetry_frames(
             session_id=session_id,
-            model_id=model_id,
+            model_id=self._resolve_session_model(session_id),
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cached_read_tokens=cached_read_tokens,
@@ -1221,19 +1180,13 @@ class AcpDispatcher:
         if turn_error:
             return _jsonrpc_error(message_id, -32603, turn_error)
 
-        return {
-            "jsonrpc": "2.0",
-            "id": message_id,
-            "result": {
-                "stopReason": stop_reason,
-                "usage": {
-                    "inputTokens": input_tokens,
-                    "outputTokens": output_tokens,
-                    "cachedReadTokens": cached_read_tokens,
-                    "cachedWriteTokens": 0,
-                },
-            },
-        }
+        return _prompt_turn_result(
+            message_id,
+            stop_reason=stop_reason,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_read_tokens=cached_read_tokens,
+        )
 
     async def _emit_persisted_usage_update(
         self,
@@ -1254,17 +1207,13 @@ class AcpDispatcher:
     async def _emit_available_commands_update(self, session_id: str) -> None:
         """Emit the `available_commands_update` notification for a session."""
         await self._emit_notification(
-            {
-                "jsonrpc": "2.0",
-                "method": "session/update",
-                "params": {
-                    "sessionId": session_id,
-                    "update": {
-                        "sessionUpdate": "available_commands_update",
-                        "availableCommands": list(AVAILABLE_SLASH_COMMANDS),
-                    },
+            _session_update_frame(
+                session_id,
+                {
+                    "sessionUpdate": "available_commands_update",
+                    "availableCommands": list(AVAILABLE_SLASH_COMMANDS),
                 },
-            }
+            )
         )
 
     async def _emit_mcp_servers_initialized(self, session_id: str) -> None:
@@ -1274,10 +1223,7 @@ class AcpDispatcher:
                 {
                     "jsonrpc": "2.0",
                     "method": "_kiro.dev/mcp/server_initialized",
-                    "params": {
-                        "sessionId": session_id,
-                        "serverName": server_name,
-                    },
+                    "params": {"sessionId": session_id, "serverName": server_name},
                 }
             )
 
@@ -1289,65 +1235,75 @@ class AcpDispatcher:
         server_filter: str | None = None,
     ) -> None:
         """Emit full-snapshot MCP readiness frames (`_kiro/mcp/status` + `didChange` on v3)."""
-        if self._wire_adapter.engine_id == "v3":
-            if server_filter is None:
-                statuses = await self._session_manager.probe_session_mcp_servers(
-                    session_id,
-                    server_filter=None,
-                )
-                self._mcp_status_cache[session_id] = {s.name: s for s in statuses}
-            else:
-                ordered_names = self._session_manager.get_session_probe_server_names(session_id)
-                cache = self._mcp_status_cache.setdefault(session_id, {})
-                for stale_name in list(cache):
-                    if stale_name not in ordered_names:
-                        cache.pop(stale_name, None)
-                if server_filter in ordered_names:
-                    refreshed = await self._session_manager.probe_session_mcp_servers(
-                        session_id,
-                        server_filter=server_filter,
-                    )
-                    for item in refreshed:
-                        cache[item.name] = item
-                for peer_name in ordered_names:
-                    if peer_name not in cache:
-                        peer_statuses = await self._session_manager.probe_session_mcp_servers(
-                            session_id,
-                            server_filter=peer_name,
-                        )
-                        for item in peer_statuses:
-                            cache[item.name] = item
-                statuses = [cache[name] for name in ordered_names if name in cache]
-
-            frames = self._wire_adapter.build_mcp_readiness_notifications(session_id, statuses)
-            if post_response:
-                self._queue_post_response_notifications(frames)
-            else:
-                for frame in frames:
-                    await self._emit_notification(frame)
+        if self._wire_adapter.engine_id != "v3":
+            await self._emit_mcp_servers_initialized(session_id)
             return
 
-        await self._emit_mcp_servers_initialized(session_id)
+        if server_filter is None:
+            statuses = await self._session_manager.probe_session_mcp_servers(
+                session_id,
+                server_filter=None,
+            )
+            self._mcp_status_cache[session_id] = {s.name: s for s in statuses}
+        else:
+            ordered_names = self._session_manager.get_session_probe_server_names(session_id)
+            cache = self._mcp_status_cache.setdefault(session_id, {})
+            for stale_name in list(cache):
+                if stale_name not in ordered_names:
+                    cache.pop(stale_name, None)
+            targets = [
+                *([server_filter] if server_filter in ordered_names else []),
+                *[name for name in ordered_names if name not in cache and name != server_filter],
+            ]
+            for target_name in targets:
+                for item in await self._session_manager.probe_session_mcp_servers(
+                    session_id,
+                    server_filter=target_name,
+                ):
+                    cache[item.name] = item
+            statuses = [cache[name] for name in ordered_names if name in cache]
+
+        frames = self._wire_adapter.build_mcp_readiness_notifications(session_id, statuses)
+        if post_response:
+            self._queue_post_response_notifications(frames)
+        else:
+            for frame in frames:
+                await self._emit_notification(frame)
+
+    async def _emit_post_session_open(
+        self,
+        session_id: str,
+        *,
+        include_persisted_usage: bool = True,
+    ) -> None:
+        """Emit available commands, MCP readiness, and optional persisted usage on session open."""
+        if self._wire_adapter.engine_id == "v2":
+            await self._emit_available_commands_update(session_id)
+        await self._emit_or_queue_mcp_readiness(
+            session_id,
+            post_response=(self._wire_adapter.engine_id == "v3"),
+        )
+        if include_persisted_usage:
+            persisted_ctx = self._quota_tracker.get_session_context_tokens(session_id)
+            if persisted_ctx is not None and persisted_ctx > 0:
+                await self._emit_persisted_usage_update(session_id, persisted_ctx)
 
     async def _emit_session_replay(self, session_id: str) -> None:
         """Replay stored turns (`_meta.kiro.replay == True`) before `session/load` returns."""
-        turns = self._session_manager.state_store.get_session_turns(session_id)
-        for turn in turns:
+        for turn in self._session_manager.state_store.get_session_turns(session_id):
             msg_id = str(turn.get("user_message_id") or turn.get("userMessageId") or "")
             blocks = turn.get("prompt_blocks")
             if blocks is None:
                 blocks = turn.get("promptBlocks")
-            block_list = blocks if isinstance(blocks, list) and blocks else []
-            for block in block_list:
-                if not isinstance(block, dict):
-                    continue
-                frame = self._wire_adapter.build_user_message_chunk(
-                    session_id,
-                    block,
-                    user_message_id=msg_id,
-                    replay=True,
-                )
-                await self._emit_notification(_stamp_replay_meta(frame))
+            for block in blocks if isinstance(blocks, list) else ():
+                if isinstance(block, dict):
+                    frame = self._wire_adapter.build_user_message_chunk(
+                        session_id,
+                        block,
+                        user_message_id=msg_id,
+                        replay=True,
+                    )
+                    await self._emit_notification(_stamp_replay_meta(frame))
             assistant_text = normalize_carousel_markdown(
                 str(turn.get("assistant_text") or turn.get("assistantText") or "")
             )
@@ -1368,36 +1324,16 @@ class AcpDispatcher:
         cwd = _require_non_empty_str(params, "cwd")
         if cwd is None:
             return _jsonrpc_error(message_id, -32602, "Invalid params: 'cwd' must be non-empty")
-        raw_mcp = params.get("mcpServers")
-        if raw_mcp is not None and not isinstance(raw_mcp, list):
-            return _jsonrpc_error(message_id, -32602, "Invalid params: 'mcpServers' must be a list")
-        mcp_servers: list[dict[str, Any]] | None = (
-            [s for s in raw_mcp if isinstance(s, dict)] if isinstance(raw_mcp, list) else None
-        )
-        raw_meta = params.get("_meta")
-        if raw_meta is not None and not isinstance(raw_meta, dict):
-            return _jsonrpc_error(message_id, -32602, "Invalid params: '_meta' must be an object")
-        meta: dict[str, Any] | None = dict(raw_meta) if isinstance(raw_meta, dict) else None
+        mcp_servers, meta, err = _parse_session_wire_options(message_id, params)
+        if err is not None:
+            return err
         desc = await self._session_manager.create_session(
             cwd=cwd,
             mcp_servers=mcp_servers,
             meta=meta,
         )
-        sid = desc["sessionId"]
-        if self._wire_adapter.engine_id == "v2":
-            await self._emit_available_commands_update(sid)
-        await self._emit_or_queue_mcp_readiness(
-            sid,
-            post_response=(self._wire_adapter.engine_id == "v3"),
-        )
-        persisted_ctx = self._quota_tracker.get_session_context_tokens(sid)
-        if persisted_ctx is not None and persisted_ctx > 0:
-            await self._emit_persisted_usage_update(sid, persisted_ctx)
-        return {
-            "jsonrpc": "2.0",
-            "id": message_id,
-            "result": desc,
-        }
+        await self._emit_post_session_open(desc["sessionId"], include_persisted_usage=True)
+        return _jsonrpc_result(message_id, desc)
 
     async def _handle_session_load(
         self,
@@ -1410,28 +1346,20 @@ class AcpDispatcher:
         session_id = _require_non_empty_str(params, "sessionId")
         if session_id is None:
             return _jsonrpc_error(message_id, -32602, "Invalid params: 'sessionId' is required")
-        raw_cwd = params.get("cwd")
         if require_cwd:
             cwd = _require_non_empty_str(params, "cwd")
             if cwd is None:
                 return _jsonrpc_error(message_id, -32602, "Invalid params: 'cwd' is required")
-        elif raw_cwd is None:
+        elif params.get("cwd") is None:
             cwd = ""
         else:
             cwd = _require_non_empty_str(params, "cwd") or ""
             if not cwd:
                 return _jsonrpc_error(message_id, -32602, "Invalid params: 'cwd' must be non-empty")
 
-        raw_mcp = params.get("mcpServers")
-        if raw_mcp is not None and not isinstance(raw_mcp, list):
-            return _jsonrpc_error(message_id, -32602, "Invalid params: 'mcpServers' must be a list")
-        mcp_servers: list[dict[str, Any]] | None = (
-            [s for s in raw_mcp if isinstance(s, dict)] if isinstance(raw_mcp, list) else None
-        )
-        raw_meta = params.get("_meta")
-        if raw_meta is not None and not isinstance(raw_meta, dict):
-            return _jsonrpc_error(message_id, -32602, "Invalid params: '_meta' must be an object")
-        meta: dict[str, Any] | None = dict(raw_meta) if isinstance(raw_meta, dict) else None
+        mcp_servers, meta, err = _parse_session_wire_options(message_id, params)
+        if err is not None:
+            return err
         try:
             desc = await self._session_manager.load_session(
                 session_id=session_id,
@@ -1444,20 +1372,8 @@ class AcpDispatcher:
 
         sid = desc["sessionId"]
         await self._emit_session_replay(sid)
-        if self._wire_adapter.engine_id == "v2":
-            await self._emit_available_commands_update(sid)
-        await self._emit_or_queue_mcp_readiness(
-            sid,
-            post_response=(self._wire_adapter.engine_id == "v3"),
-        )
-        persisted_ctx = self._quota_tracker.get_session_context_tokens(sid)
-        if persisted_ctx is not None and persisted_ctx > 0:
-            await self._emit_persisted_usage_update(sid, persisted_ctx)
-        return {
-            "jsonrpc": "2.0",
-            "id": message_id,
-            "result": desc,
-        }
+        await self._emit_post_session_open(sid, include_persisted_usage=True)
+        return _jsonrpc_result(message_id, desc)
 
     async def _handle_session_fork(
         self,
@@ -1474,16 +1390,9 @@ class AcpDispatcher:
             if not isinstance(raw_cwd, str) or not raw_cwd.strip():
                 return _jsonrpc_error(message_id, -32602, "Invalid params: 'cwd' must be non-empty")
             cwd = raw_cwd.strip()
-        raw_mcp = params.get("mcpServers")
-        if raw_mcp is not None and not isinstance(raw_mcp, list):
-            return _jsonrpc_error(message_id, -32602, "Invalid params: 'mcpServers' must be a list")
-        mcp_servers: list[dict[str, Any]] | None = (
-            [s for s in raw_mcp if isinstance(s, dict)] if isinstance(raw_mcp, list) else None
-        )
-        raw_meta = params.get("_meta")
-        if raw_meta is not None and not isinstance(raw_meta, dict):
-            return _jsonrpc_error(message_id, -32602, "Invalid params: '_meta' must be an object")
-        meta: dict[str, Any] | None = dict(raw_meta) if isinstance(raw_meta, dict) else None
+        mcp_servers, meta, err = _parse_session_wire_options(message_id, params)
+        if err is not None:
+            return err
 
         raw_top_msg_id = params.get("messageId")
         if raw_top_msg_id is not None and not isinstance(raw_top_msg_id, str):
@@ -1492,24 +1401,7 @@ class AcpDispatcher:
                 -32602,
                 "Invalid params: 'messageId' must be a string",
             )
-        fork_msg_id: str | None = None
-        if isinstance(raw_meta, dict):
-            jb = raw_meta.get("jetbrains")
-            if isinstance(jb, dict):
-                air = jb.get("air")
-                if isinstance(air, dict):
-                    fork_obj = air.get("fork")
-                    if isinstance(fork_obj, dict) and isinstance(fork_obj.get("messageId"), str):
-                        fork_msg_id = fork_obj["messageId"].strip() or None
-            if fork_msg_id is None:
-                kiro_m = raw_meta.get("kiro")
-                if isinstance(kiro_m, dict):
-                    fork_obj = kiro_m.get("fork")
-                    if isinstance(fork_obj, dict) and isinstance(fork_obj.get("messageId"), str):
-                        fork_msg_id = fork_obj["messageId"].strip() or None
-        if fork_msg_id is None and isinstance(raw_top_msg_id, str):
-            fork_msg_id = raw_top_msg_id.strip() or None
-
+        fork_msg_id = _extract_fork_message_id(meta, raw_top_msg_id)
         try:
             desc = await self._session_manager.fork_session(
                 source_session_id=source_session_id,
@@ -1521,18 +1413,8 @@ class AcpDispatcher:
         except KeyError as exc:
             return _jsonrpc_error(message_id, -32002, str(exc))
 
-        sid = desc["sessionId"]
-        if self._wire_adapter.engine_id == "v2":
-            await self._emit_available_commands_update(sid)
-        await self._emit_or_queue_mcp_readiness(
-            sid,
-            post_response=(self._wire_adapter.engine_id == "v3"),
-        )
-        return {
-            "jsonrpc": "2.0",
-            "id": message_id,
-            "result": desc,
-        }
+        await self._emit_post_session_open(desc["sessionId"], include_persisted_usage=False)
+        return _jsonrpc_result(message_id, desc)
 
     async def _handle_session_set_mode(
         self,
@@ -1555,28 +1437,24 @@ class AcpDispatcher:
             return _jsonrpc_error(message_id, -32602, "Invalid params", data=str(exc))
 
         if self._wire_adapter.engine_id == "v3":
-            for frame in self._wire_adapter.build_mode_switched_notifications(
-                session_id,
-                mode_id,
-            ):
+            for frame in self._wire_adapter.build_mode_switched_notifications(session_id, mode_id):
                 await self._emit_notification(frame)
             await self._emit_or_queue_mcp_readiness(session_id, post_response=True)
-            return {
-                "jsonrpc": "2.0",
-                "id": message_id,
-                "result": res,
-            }
+            return _jsonrpc_result(message_id, res)
 
         session_state = self._session_manager.get_session(session_id)
         is_custom_agent = bool(session_state.get("agent"))
         if is_custom_agent:
+            switched_model = session_state.get("switchedModel")
             switched_params: dict[str, Any] = {
                 "sessionId": session_id,
                 "agentName": mode_id,
+                **(
+                    {"model": switched_model}
+                    if isinstance(switched_model, str) and switched_model
+                    else {}
+                ),
             }
-            switched_model = session_state.get("switchedModel")
-            if isinstance(switched_model, str) and switched_model:
-                switched_params["model"] = switched_model
             await self._emit_notification(
                 {
                     "jsonrpc": "2.0",
@@ -1585,25 +1463,14 @@ class AcpDispatcher:
                 }
             )
         await self._emit_notification(
-            {
-                "jsonrpc": "2.0",
-                "method": "session/update",
-                "params": {
-                    "sessionId": session_id,
-                    "update": {
-                        "sessionUpdate": "current_mode_update",
-                        "currentModeId": mode_id,
-                    },
-                },
-            }
+            _session_update_frame(
+                session_id,
+                {"sessionUpdate": "current_mode_update", "currentModeId": mode_id},
+            )
         )
         if is_custom_agent:
             await self._emit_mcp_servers_initialized(session_id)
-        return {
-            "jsonrpc": "2.0",
-            "id": message_id,
-            "result": res,
-        }
+        return _jsonrpc_result(message_id, res)
 
     async def _handle_session_set_model(
         self,
@@ -1624,11 +1491,7 @@ class AcpDispatcher:
             return _jsonrpc_error(message_id, -32002, str(exc))
         except ValueError as exc:
             return _jsonrpc_error(message_id, -32602, "Invalid params", data=str(exc))
-        return {
-            "jsonrpc": "2.0",
-            "id": message_id,
-            "result": res,
-        }
+        return _jsonrpc_result(message_id, res)
 
     async def _handle_kas_session_compact(
         self,
@@ -1636,17 +1499,12 @@ class AcpDispatcher:
         params: dict[str, Any],
     ) -> dict[str, Any]:
         """Handle `_kiro/session/compact` extension RPC."""
-        session_id = _require_non_empty_str(params, "sessionId")
-        if session_id is None:
-            return _jsonrpc_error(message_id, -32602, "Invalid params")
         raw_instructions = params.get("instructions")
         if raw_instructions is not None and not isinstance(raw_instructions, str):
             return _jsonrpc_error(message_id, -32602, "Invalid params")
-        instructions = raw_instructions or ""
-        try:
-            self._session_manager.get_session(session_id)
-        except KeyError as exc:
-            return _jsonrpc_error(message_id, -32002, str(exc))
+        session_id, err = self._require_existing_session(message_id, params)
+        if err is not None or session_id is None:
+            return err or _jsonrpc_error(message_id, -32602, "Invalid params")
 
         await self._emit_notification(
             self._wire_adapter.build_compaction_notification(session_id, "started")
@@ -1654,7 +1512,7 @@ class AcpDispatcher:
         try:
             compact_res = await self._session_manager.compact_session(
                 session_id=session_id,
-                instructions=instructions,
+                instructions=raw_instructions or "",
             )
         except KeyError as exc:
             return _jsonrpc_error(message_id, -32002, str(exc))
@@ -1669,11 +1527,7 @@ class AcpDispatcher:
                     error=summary_text or "Compaction failed",
                 )
             )
-            return {
-                "jsonrpc": "2.0",
-                "id": message_id,
-                "result": {"success": False},
-            }
+            return _jsonrpc_result(message_id, {"success": False})
 
         await self._emit_notification(
             self._wire_adapter.build_compaction_notification(
@@ -1682,43 +1536,31 @@ class AcpDispatcher:
                 summary=summary_text,
             )
         )
-        compacted_ctx = int(compact_res.get("contextTokens", 0))
-        input_tokens = max(1, int(compact_res.get("inputTokens", 1)))
-        output_tokens = max(1, int(compact_res.get("outputTokens", 1)))
-        model_id = self._resolve_session_model(session_id)
         telemetry = await self._quota_tracker.build_turn_telemetry(
             session_id=session_id,
-            model_id=model_id,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
+            model_id=self._resolve_session_model(session_id),
+            input_tokens=max(1, int(compact_res.get("inputTokens", 1))),
+            output_tokens=max(1, int(compact_res.get("outputTokens", 1))),
             cached_read_tokens=0,
-            context_tokens=compacted_ctx,
+            context_tokens=int(compact_res.get("contextTokens", 0)),
         )
         await self._emit_notification(telemetry.usage_update_notification)
         if self._wire_adapter.engine_id == "v3":
             await self._emit_notification(
-                {
-                    "jsonrpc": "2.0",
-                    "method": "session/update",
-                    "params": {
-                        "sessionId": session_id,
-                        "update": {
-                            "sessionUpdate": "session_info_update",
-                            "_meta": {
-                                "kiro": {
-                                    "kind": "context_usage",
-                                    "usagePercentage": telemetry.context_usage_pct,
-                                }
-                            },
+                _session_update_frame(
+                    session_id,
+                    {
+                        "sessionUpdate": "session_info_update",
+                        "_meta": {
+                            "kiro": {
+                                "kind": "context_usage",
+                                "usagePercentage": telemetry.context_usage_pct,
+                            }
                         },
                     },
-                }
+                )
             )
-        return {
-            "jsonrpc": "2.0",
-            "id": message_id,
-            "result": {"success": True},
-        }
+        return _jsonrpc_result(message_id, {"success": True})
 
     async def _handle_kas_mcp_reset_server(
         self,
@@ -1726,17 +1568,15 @@ class AcpDispatcher:
         params: dict[str, Any],
     ) -> dict[str, Any]:
         """Handle `_kiro/mcp/resetServer` by re-probing target server and emitting full roster."""
-        session_id = _require_non_empty_str(params, "sessionId")
         server_name = _require_non_empty_str(params, "serverName")
         raw_start_oauth = params.get("startOAuth")
-        if session_id is None or server_name is None:
+        if server_name is None or (
+            raw_start_oauth is not None and not isinstance(raw_start_oauth, bool)
+        ):
             return _jsonrpc_error(message_id, -32602, "Invalid params")
-        if raw_start_oauth is not None and not isinstance(raw_start_oauth, bool):
-            return _jsonrpc_error(message_id, -32602, "Invalid params")
-        try:
-            self._session_manager.get_session(session_id)
-        except KeyError as exc:
-            return _jsonrpc_error(message_id, -32002, str(exc))
+        session_id, err = self._require_existing_session(message_id, params)
+        if err is not None or session_id is None:
+            return err or _jsonrpc_error(message_id, -32602, "Invalid params")
 
         clean_server_name = server_name.strip()
         await self._emit_or_queue_mcp_readiness(
@@ -1753,11 +1593,7 @@ class AcpDispatcher:
             auth_url = target_status.auth_url if target_status is not None else None
             if isinstance(auth_url, str) and auth_url.startswith(("http://", "https://")):
                 await self._client_rpc_caller("_kiro/openExternalUrl", {"url": auth_url})
-        return {
-            "jsonrpc": "2.0",
-            "id": message_id,
-            "result": {},
-        }
+        return _jsonrpc_result(message_id, {})
 
     async def _handle_commands_execute(
         self,
@@ -1772,26 +1608,19 @@ class AcpDispatcher:
                 "Method '_kiro.dev/commands/execute' is not supported on KAS v3",
             )
 
-        raw_sid = params.get("sessionId")
         session_id = ""
-        if raw_sid is not None:
-            validated_sid = _require_non_empty_str(params, "sessionId")
-            if validated_sid is None:
-                return _jsonrpc_error(message_id, -32602, "Invalid params")
-            try:
-                self._session_manager.get_session(validated_sid)
-            except KeyError as exc:
-                return _jsonrpc_error(message_id, -32002, str(exc))
+        if params.get("sessionId") is not None:
+            validated_sid, err = self._require_existing_session(message_id, params)
+            if err is not None or validated_sid is None:
+                return err or _jsonrpc_error(message_id, -32602, "Invalid params")
             session_id = validated_sid
 
         raw_cmd = params.get("command")
-        cmd_name = ""
         cmd_args: dict[str, Any] = {}
         if isinstance(raw_cmd, dict):
             cmd_name = str(raw_cmd.get("command", "")).strip().lstrip("/").lower()
-            raw_args = raw_cmd.get("args")
-            if isinstance(raw_args, dict):
-                cmd_args = dict(raw_args)
+            if isinstance(raw_cmd.get("args"), dict):
+                cmd_args = dict(raw_cmd["args"])
         elif isinstance(raw_cmd, str):
             parts = raw_cmd.strip().split(None, 1)
             cmd_name = parts[0].lstrip("/").lower() if parts else ""
@@ -1806,15 +1635,9 @@ class AcpDispatcher:
                 persisted_ctx = self._quota_tracker.get_session_context_tokens(session_id)
                 if persisted_ctx is not None and persisted_ctx > 0:
                     await self._emit_persisted_usage_update(session_id, persisted_ctx)
-            return {
-                "jsonrpc": "2.0",
-                "id": message_id,
-                "result": {
-                    "message": md,
-                    "text": md,
-                    "stopReason": "end_turn",
-                },
-            }
+            return _jsonrpc_result(
+                message_id, {"message": md, "text": md, "stopReason": "end_turn"}
+            )
         if cmd_name == "effort":
             level = str(cmd_args.get("level") or cmd_args.get("value") or "medium").strip().lower()
             if session_id:
@@ -1827,59 +1650,32 @@ class AcpDispatcher:
                 except KeyError, ValueError:
                     pass
             msg = f"Reasoning effort set to {level}"
-            return {
-                "jsonrpc": "2.0",
-                "id": message_id,
-                "result": {
-                    "message": msg,
-                    "text": msg,
-                    "stopReason": "end_turn",
-                },
-            }
-        if cmd_name == "mcp":
+            return _jsonrpc_result(
+                message_id, {"message": msg, "text": msg, "stopReason": "end_turn"}
+            )
+        if cmd_name in {"mcp", "tools"}:
             server_names = (
                 self._session_manager.get_session_mcp_server_names(session_id) if session_id else []
             )
-            return {
-                "jsonrpc": "2.0",
-                "id": message_id,
-                "result": {
-                    "message": "MCP servers",
-                    "data": {
-                        "servers": [
-                            {"name": name, "status": "running", "toolCount": 1}
-                            for name in server_names
-                        ]
-                    },
-                    "stopReason": "end_turn",
-                },
-            }
-        if cmd_name == "tools":
-            server_names = (
-                self._session_manager.get_session_mcp_server_names(session_id) if session_id else []
+            if cmd_name == "mcp":
+                data: dict[str, Any] = {
+                    "servers": [
+                        {"name": name, "status": "running", "toolCount": 1} for name in server_names
+                    ]
+                }
+                label = "MCP servers"
+            else:
+                data = {
+                    "tools": [
+                        {"name": f"@{name}", "source": f"mcp:{name}"} for name in server_names
+                    ]
+                }
+                label = "Tools"
+            return _jsonrpc_result(
+                message_id,
+                {"message": label, "data": data, "stopReason": "end_turn"},
             )
-            return {
-                "jsonrpc": "2.0",
-                "id": message_id,
-                "result": {
-                    "message": "Tools",
-                    "data": {
-                        "tools": [
-                            {"name": f"@{name}", "source": f"mcp:{name}"} for name in server_names
-                        ]
-                    },
-                    "stopReason": "end_turn",
-                },
-            }
-        return {
-            "jsonrpc": "2.0",
-            "id": message_id,
-            "result": {
-                "message": "",
-                "text": "",
-                "stopReason": "end_turn",
-            },
-        }
+        return _jsonrpc_result(message_id, {"message": "", "text": "", "stopReason": "end_turn"})
 
     async def _handle_session_steer(
         self,
@@ -1890,58 +1686,42 @@ class AcpDispatcher:
         is_request: bool = True,
     ) -> dict[str, Any] | None:
         """Handle `_session/steer` and `_session/steering` during an active turn."""
-        session_id = _require_non_empty_str(params, "sessionId")
-        if session_id is None:
-            return _jsonrpc_error(message_id, -32602, "Invalid params") if is_request else None
-
         if method == "_session/steering":
             raw_prompt = params.get("prompt")
-            if not isinstance(raw_prompt, list) or not raw_prompt:
+            if (
+                not isinstance(raw_prompt, list)
+                or not raw_prompt
+                or _require_non_empty_str(params, "sessionId") is None
+            ):
                 return _jsonrpc_error(message_id, -32602, "Invalid params") if is_request else None
-            try:
-                self._session_manager.get_session(session_id)
-            except KeyError as exc:
-                return _jsonrpc_error(message_id, -32002, str(exc)) if is_request else None
-            prompt_blocks: list[dict[str, Any]] = [b for b in raw_prompt if isinstance(b, dict)]
+            session_id, err = self._require_existing_session(
+                message_id, params, is_request=is_request
+            )
+            if session_id is None:
+                return err
             queued = await self._session_manager.steer(
                 session_id=session_id,
-                prompt_blocks=prompt_blocks,
+                prompt_blocks=[b for b in raw_prompt if isinstance(b, dict)],
             )
-            if not is_request:
-                return None
-            return {
-                "jsonrpc": "2.0",
-                "id": message_id,
-                "result": {"outcome": "injected" if queued else "failed"},
-            }
+            return (
+                _jsonrpc_result(message_id, {"outcome": "injected" if queued else "failed"})
+                if is_request
+                else None
+            )
 
         raw_message = _require_non_empty_str(params, "message")
-        if raw_message is None:
+        if raw_message is None or _require_non_empty_str(params, "sessionId") is None:
             return _jsonrpc_error(message_id, -32602, "Invalid params") if is_request else None
-        try:
-            self._session_manager.get_session(session_id)
-        except KeyError as exc:
-            return _jsonrpc_error(message_id, -32002, str(exc)) if is_request else None
+        session_id, err = self._require_existing_session(message_id, params, is_request=is_request)
+        if session_id is None:
+            return err
 
-        queued = await self._session_manager.steer(
-            session_id=session_id,
-            message=raw_message,
-        )
+        queued = await self._session_manager.steer(session_id=session_id, message=raw_message)
         if queued:
             await self._emit_notification(
-                self._wire_adapter.build_steering_notification(
-                    session_id,
-                    "queued",
-                    raw_message,
-                )
+                self._wire_adapter.build_steering_notification(session_id, "queued", raw_message)
             )
-        if not is_request:
-            return None
-        return {
-            "jsonrpc": "2.0",
-            "id": message_id,
-            "result": {"queued": queued},
-        }
+        return _jsonrpc_result(message_id, {"queued": queued}) if is_request else None
 
     async def _handle_session_steer_clear(
         self,
@@ -1951,13 +1731,9 @@ class AcpDispatcher:
         is_request: bool = True,
     ) -> dict[str, Any] | None:
         """Handle `_session/steer/clear` to discard queued steers and emit notification."""
-        session_id = _require_non_empty_str(params, "sessionId")
+        session_id, err = self._require_existing_session(message_id, params, is_request=is_request)
         if session_id is None:
-            return _jsonrpc_error(message_id, -32602, "Invalid params") if is_request else None
-        try:
-            self._session_manager.get_session(session_id)
-        except KeyError as exc:
-            return _jsonrpc_error(message_id, -32002, str(exc)) if is_request else None
+            return err
 
         dropped = self._session_manager.clear_session_steers(session_id)
         await self._emit_notification(
@@ -1967,13 +1743,7 @@ class AcpDispatcher:
                 "\n".join(dropped),
             )
         )
-        if not is_request:
-            return None
-        return {
-            "jsonrpc": "2.0",
-            "id": message_id,
-            "result": {"cleared": True},
-        }
+        return _jsonrpc_result(message_id, {"cleared": True}) if is_request else None
 
     async def _handle_kas_session_context(
         self,
@@ -1987,13 +1757,14 @@ class AcpDispatcher:
             or _require_non_empty_str(params, "action")
             or _require_non_empty_str(params, "command")
         )
-        if session_id is None or subcommand is None:
-            return _jsonrpc_error(message_id, -32602, "Invalid params")
         raw_path = params.get("path")
-        if raw_path is not None and not isinstance(raw_path, str):
-            return _jsonrpc_error(message_id, -32602, "Invalid params")
         raw_force = params.get("force", False)
-        if not isinstance(raw_force, bool):
+        if (
+            session_id is None
+            or subcommand is None
+            or (raw_path is not None and not isinstance(raw_path, str))
+            or not isinstance(raw_force, bool)
+        ):
             return _jsonrpc_error(message_id, -32602, "Invalid params")
         try:
             res = self._session_manager.handle_session_context(
@@ -2004,11 +1775,7 @@ class AcpDispatcher:
             )
         except KeyError as exc:
             return _jsonrpc_error(message_id, -32002, str(exc))
-        return {
-            "jsonrpc": "2.0",
-            "id": message_id,
-            "result": res,
-        }
+        return _jsonrpc_result(message_id, res)
 
     async def _handle_kas_knowledge(
         self,
@@ -2017,20 +1784,16 @@ class AcpDispatcher:
     ) -> dict[str, Any]:
         """Handle `_kiro/knowledge` extension RPC."""
         session_id = _require_non_empty_str(params, "sessionId")
-        if session_id is None:
-            return _jsonrpc_error(message_id, -32602, "Invalid params")
         raw_sub = params.get("subcommand")
-        if raw_sub is not None and (not isinstance(raw_sub, str) or not raw_sub.strip()):
+        if session_id is None or (
+            raw_sub is not None and (not isinstance(raw_sub, str) or not raw_sub.strip())
+        ):
             return _jsonrpc_error(message_id, -32602, "Invalid params")
         try:
             res = self._session_manager.handle_knowledge(session_id, params)
         except KeyError as exc:
             return _jsonrpc_error(message_id, -32002, str(exc))
-        return {
-            "jsonrpc": "2.0",
-            "id": message_id,
-            "result": res,
-        }
+        return _jsonrpc_result(message_id, res)
 
     async def _handle_kas_code_intelligence(
         self,
@@ -2039,14 +1802,14 @@ class AcpDispatcher:
     ) -> dict[str, Any]:
         """Handle `_kiro/codeIntelligence` extension RPC."""
         session_id = _require_non_empty_str(params, "sessionId")
-        if session_id is None:
-            return _jsonrpc_error(message_id, -32602, "Invalid params")
         raw_sub = (
             params.get("subcommand")
             if "subcommand" in params
             else (params.get("action") if "action" in params else params.get("command"))
         )
-        if raw_sub is not None and (not isinstance(raw_sub, str) or not raw_sub.strip()):
+        if session_id is None or (
+            raw_sub is not None and (not isinstance(raw_sub, str) or not raw_sub.strip())
+        ):
             return _jsonrpc_error(message_id, -32602, "Invalid params")
         subcommand = raw_sub.strip() if isinstance(raw_sub, str) else "status"
         try:
@@ -2056,11 +1819,7 @@ class AcpDispatcher:
             )
         except KeyError as exc:
             return _jsonrpc_error(message_id, -32002, str(exc))
-        return {
-            "jsonrpc": "2.0",
-            "id": message_id,
-            "result": res,
-        }
+        return _jsonrpc_result(message_id, res)
 
     async def _handle_kas_checkpoint_revert_multiple(
         self,
@@ -2087,11 +1846,7 @@ class AcpDispatcher:
             return _jsonrpc_error(message_id, -32002, str(exc))
         except ValueError as exc:
             return _jsonrpc_error(message_id, -32602, "Invalid params", data=str(exc))
-        return {
-            "jsonrpc": "2.0",
-            "id": message_id,
-            "result": res,
-        }
+        return _jsonrpc_result(message_id, res)
 
     async def _handle_session_set_config_option(
         self,
@@ -2115,23 +1870,15 @@ class AcpDispatcher:
         except ValueError as exc:
             return _jsonrpc_error(message_id, -32602, "Invalid params", data=str(exc))
         await self._emit_notification(
-            {
-                "jsonrpc": "2.0",
-                "method": "session/update",
-                "params": {
-                    "sessionId": session_id,
-                    "update": {
-                        "sessionUpdate": "config_option_update",
-                        "configOptions": res["configOptions"],
-                    },
+            _session_update_frame(
+                session_id,
+                {
+                    "sessionUpdate": "config_option_update",
+                    "configOptions": res["configOptions"],
                 },
-            }
+            )
         )
-        return {
-            "jsonrpc": "2.0",
-            "id": message_id,
-            "result": res,
-        }
+        return _jsonrpc_result(message_id, res)
 
     def serialize_frame(self, payload: dict[str, Any]) -> bytes:
         """Serialize a JSON-RPC 2.0 payload into a newline-delimited UTF-8 frame <= 16 MiB."""
@@ -2223,25 +1970,20 @@ class AcpDispatcher:
             name="agy-acp",
             title="Google Antigravity ACP Harness",
         )
-        caps = dict(init_res["agentCapabilities"])
-        caps["sessionCapabilities"] = {
-            "close": {},
-            "fork": {},
-            "list": {},
-            "resume": {},
+        caps = {
+            **dict(init_res["agentCapabilities"]),
+            "sessionCapabilities": {"close": {}, "fork": {}, "list": {}, "resume": {}},
         }
-        info = dict(init_res["agentInfo"])
-        info["_meta"] = {"agyAcpVersion": __version__}
-        return {
-            "jsonrpc": "2.0",
-            "id": msg_id,
-            "result": {
+        info = {**dict(init_res["agentInfo"]), "_meta": {"agyAcpVersion": __version__}}
+        return _jsonrpc_result(
+            msg_id,
+            {
                 "protocolVersion": init_res["protocolVersion"],
                 "agentCapabilities": caps,
                 "agentInfo": info,
                 "authMethods": [],
             },
-        }
+        )
 
     async def _dispatch_method(
         self,
@@ -2273,10 +2015,9 @@ class AcpDispatcher:
             sessions = self._session_manager.list_sessions(
                 cwd=cwd_filter if isinstance(cwd_filter, str) and cwd_filter.strip() else None
             )
-            return {
-                "jsonrpc": "2.0",
-                "id": msg_id,
-                "result": {
+            return _jsonrpc_result(
+                msg_id,
+                {
                     "sessions": [
                         {
                             "sessionId": s["sessionId"],
@@ -2287,7 +2028,7 @@ class AcpDispatcher:
                         for s in sessions
                     ]
                 },
-            }
+            )
         if method == "session/set_mode":
             return await self._handle_session_set_mode(msg_id, params)
         if method == "session/set_model":
@@ -2315,18 +2056,13 @@ class AcpDispatcher:
             if session_id is None:
                 return _jsonrpc_error(msg_id, -32602, "Invalid params") if is_request else None
             if is_request:
-                try:
-                    self._session_manager.get_session(session_id)
-                except KeyError as exc:
-                    return _jsonrpc_error(msg_id, -32002, str(exc))
+                _, err = self._require_existing_session(msg_id, params)
+                if err is not None:
+                    return err
             await self._session_manager.cancel(session_id=session_id)
-            return {"jsonrpc": "2.0", "id": msg_id, "result": {}} if is_request else None
+            return _jsonrpc_result(msg_id, {}) if is_request else None
         if method == "_session/steer/clear":
-            return await self._handle_session_steer_clear(
-                msg_id,
-                params,
-                is_request=is_request,
-            )
+            return await self._handle_session_steer_clear(msg_id, params, is_request=is_request)
         if method in {"_session/steer", "_session/steering"}:
             return await self._handle_session_steer(
                 method,
@@ -2334,34 +2070,23 @@ class AcpDispatcher:
                 params,
                 is_request=is_request,
             )
-        if method == "session/close":
-            session_id = _require_non_empty_str(params, "sessionId")
-            if session_id is None:
-                return _jsonrpc_error(msg_id, -32602, "Invalid params")
-            try:
-                self._session_manager.get_session(session_id)
-            except KeyError as exc:
-                return _jsonrpc_error(msg_id, -32002, str(exc))
-            res = await self._session_manager.evict_session(session_id=session_id)
-            self._mcp_status_cache.pop(session_id, None)
-            return {"jsonrpc": "2.0", "id": msg_id, "result": res}
-        if method in {"_kiro.dev/session/terminate", "_kiro/session/delete"}:
-            session_id = _require_non_empty_str(params, "sessionId")
-            if session_id is None:
-                return _jsonrpc_error(msg_id, -32602, "Invalid params")
-            try:
-                self._session_manager.get_session(session_id)
-            except KeyError as exc:
-                return _jsonrpc_error(msg_id, -32002, str(exc))
+        if method in {"session/close", "_kiro.dev/session/terminate", "_kiro/session/delete"}:
+            session_id, err = self._require_existing_session(msg_id, params)
+            if err is not None or session_id is None:
+                return err or _jsonrpc_error(msg_id, -32602, "Invalid params")
             is_delete = method == "_kiro/session/delete"
-            res = await self._session_manager.terminate_session(
-                session_id=session_id,
-                delete_persisted=is_delete,
+            res = (
+                await self._session_manager.evict_session(session_id=session_id)
+                if method == "session/close"
+                else await self._session_manager.terminate_session(
+                    session_id=session_id,
+                    delete_persisted=is_delete,
+                )
             )
             self._mcp_status_cache.pop(session_id, None)
             if is_delete:
                 self._quota_tracker.evict_session(session_id)
-            return {"jsonrpc": "2.0", "id": msg_id, "result": res}
+            return _jsonrpc_result(msg_id, res)
 
         log_acp_event(
             "rpc.unhandled",
@@ -2371,6 +2096,4 @@ class AcpDispatcher:
             params=raw_params,
             raw_message=message,
         )
-        if is_request:
-            return _jsonrpc_error(msg_id, -32601, f"Method not found: {method}")
-        return None
+        return _jsonrpc_error(msg_id, -32601, f"Method not found: {method}") if is_request else None
