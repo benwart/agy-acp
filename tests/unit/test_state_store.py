@@ -127,6 +127,29 @@ def test_sqlite_models_cache_and_kv_state(tmp_path: Path) -> None:
     assert store2.get_kv("missing") is None
 
 
+def test_sqlite_models_cache_expires_after_one_day(tmp_path: Path) -> None:
+    """Verify load_models returns empty list when cached rows are older than 24 hours."""
+    from datetime import UTC, datetime, timedelta
+
+    store = SqliteStateStoreProvider(tmp_path)
+    models = [
+        {
+            "modelId": "gemini-4-argon-medium",
+            "name": "Gemini 4 Argon (Medium)",
+            "description": "Argon",
+        },
+    ]
+    store.save_models(models)
+    assert store.load_models() == models
+
+    stale_ts = (datetime.now(UTC) - timedelta(days=1, seconds=1)).isoformat()
+    with store._connect() as conn:
+        conn.execute("UPDATE models_cache SET updated_at = ?", (stale_ts,))
+
+    assert store.load_models() == []
+    assert store.load_models(max_age_seconds=None) == models
+
+
 def test_sqlite_token_ledger_persistence_across_instances(tmp_path: Path) -> None:
     """Verify cumulative token usage persists in SQLite across instances."""
     store1 = SqliteStateStoreProvider(tmp_path)
@@ -309,4 +332,3 @@ def test_sqlite_context_paths_knowledge_entries_and_revert_turns_from_message_id
     remaining = store.get_session_turns("sess-0121")
     assert len(remaining) == 1
     assert remaining[0]["user_message_id"] == "m-0"
-

@@ -11,6 +11,22 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+MODELS_CACHE_TTL_SECONDS: float = 86_400.0
+
+
+def _is_cache_timestamp_expired(raw_updated_at: Any, *, max_age_seconds: float) -> bool:
+    """Return whether an ISO-8601 `updated_at` timestamp is older than `max_age_seconds`."""
+    if not raw_updated_at:
+        return True
+    try:
+        parsed = datetime.fromisoformat(str(raw_updated_at))
+    except ValueError:
+        return True
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return (datetime.now(UTC) - parsed).total_seconds() > max_age_seconds
+
+
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT PRIMARY KEY,
@@ -576,12 +592,27 @@ class SqliteStateStoreProvider:
                     (model_id, name, desc, idx, now),
                 )
 
-    def load_models(self) -> list[dict[str, str]]:
-        """Load cached models from the SQLite `models_cache` table ordered by `sort_order ASC`."""
+    def load_models(
+        self,
+        *,
+        max_age_seconds: float | None = MODELS_CACHE_TTL_SECONDS,
+    ) -> list[dict[str, str]]:
+        """Load cached models from `models_cache` when within `max_age_seconds`."""
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT model_id, name, description FROM models_cache ORDER BY sort_order ASC"
+                """
+                SELECT model_id, name, description, updated_at
+                FROM models_cache
+                ORDER BY sort_order ASC
+                """
             ).fetchall()
+        if not rows:
+            return []
+        if max_age_seconds is not None and _is_cache_timestamp_expired(
+            rows[0]["updated_at"],
+            max_age_seconds=max_age_seconds,
+        ):
+            return []
         return [
             {
                 "modelId": str(r["model_id"]),

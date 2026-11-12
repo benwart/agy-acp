@@ -181,6 +181,39 @@ async def test_discover_models_parses_tab_separated_and_caches(tmp_path: Path) -
     assert provider.state_store.load_models() == models
 
 
+async def test_discover_models_refreshes_when_cache_older_than_one_day(tmp_path: Path) -> None:
+    """Verify discover_models(refresh=False) re-fetches from `agy models` after 24 hours."""
+    from datetime import UTC, datetime, timedelta
+
+    fake_agy = _write_executable(
+        tmp_path / "agy",
+        "#!/bin/sh\n"
+        'if [ "$1" = "models" ]; then\n'
+        '  printf "gemini-4-carbon-medium\\tGemini 4 Carbon (Medium)\\n"\n'
+        "  exit 0\n"
+        "fi\n"
+        "exit 1\n",
+    )
+    provider = AgyCliProvider(bin_path=fake_agy, save_dir=tmp_path)
+    provider.state_store.save_models(
+        [
+            {
+                "modelId": "gemini-4-argon-medium",
+                "name": "Gemini 4 Argon (Medium)",
+                "description": "Old",
+            }
+        ]
+    )
+    stale_ts = (datetime.now(UTC) - timedelta(days=1, seconds=5)).isoformat()
+    with provider.state_store._connect() as conn:
+        conn.execute("UPDATE models_cache SET updated_at = ?", (stale_ts,))
+
+    models = await provider.discover_models(refresh=False)
+    assert len(models) == 1
+    assert models[0]["modelId"] == "gemini-4-carbon-medium"
+    assert models[0]["name"] == "Gemini 4 Carbon (Medium)"
+
+
 async def test_run_slash_command_executes_async_subprocess(tmp_path: Path) -> None:
     """Verify run_slash_command executes `agy -p <cmd> --output-format json` via anyio."""
     usage_payload = {
@@ -2199,4 +2232,3 @@ async def test_clear_steers_pops_queued_steers_and_unlinks_temp_files(tmp_path: 
     assert dropped == ["First raw", "Second raw"]
     assert not tf.exists()
     assert provider.clear_steers("sess-steer-clear") == []
-

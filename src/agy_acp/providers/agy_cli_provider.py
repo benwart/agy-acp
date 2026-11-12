@@ -1457,6 +1457,9 @@ class AgyCliProvider:
         except TimeoutError, OSError:
             pass
 
+        stale = self._store.load_models(max_age_seconds=None)
+        if stale:
+            return stale
         return list(FALLBACK_MODELS)
 
     async def run_slash_command(
