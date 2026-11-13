@@ -19,7 +19,7 @@ from agy_acp.logic.session_manager import SessionManager
 from agy_acp.logic.wire import EngineWireAdapter, create_wire_adapter
 from agy_acp.providers.acp_logger import log_acp_event, snapshot_relevant_env
 
-AGENT_ENGINE_HELP = "Agent engine wire protocol (v2, v3)."
+AGENT_ENGINE_HELP = "Engine [possible values: v2, v3]."
 _V2_ENGINE_ALIASES: frozenset[str] = frozenset({"", "default", "v2", "kiro"})
 _V3_ENGINE_ALIASES: frozenset[str] = frozenset({"v3", "kas"})
 
