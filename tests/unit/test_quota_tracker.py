@@ -168,7 +168,7 @@ async def test_format_kirocrew_usage_and_slash_response() -> None:
     assert len(updates) == 2
     assert updates[0]["method"] == "session/update"
     assert updates[0]["params"]["update"]["sessionUpdate"] == "usage_update"
-    assert updates[0]["params"]["update"]["used"] == 1250
+    assert updates[0]["params"]["update"]["used"] == 0
     assert updates[0]["params"]["update"]["size"] == 1000000
     assert updates[1]["method"] == "_kiro.dev/metadata"
     assert updates[1]["params"]["modelId"] == "gemini-3.8-flash"
@@ -679,6 +679,7 @@ async def test_turn_telemetry_dataclass_delta_credits_and_rate_limit() -> None:
     assert t2.rate_limit_message is None
 
     # Turn 3: remaining_fraction drops to 0.0 -> rate_limit_message & rate_limit_params populated
+    # Omitting context_tokens preserves last measured session occupancy (30_000), never turn sum.
     dyn_provider._idx = 2
     t3 = await tracker.build_turn_telemetry(
         session_id="sess-telemetry-1",
@@ -686,13 +687,24 @@ async def test_turn_telemetry_dataclass_delta_credits_and_rate_limit() -> None:
         input_tokens=500,
         output_tokens=100,
     )
-    assert t3.context_tokens == 600
+    assert t3.context_tokens == 30_000
     assert t3.delta_credits == 170.0
     assert t3.rate_limit_message == "Quota limit reached for one or more rolling windows."
     assert t3.rate_limit_params is not None
     assert t3.rate_limit_params["message"] == t3.rate_limit_message
     assert t3.rate_limit_params["resetTime"] == "2026-10-24T07:52:04Z"
     assert len(t3.rate_limit_params["exhaustedBuckets"]) == 1
+
+    # Unmeasured multi-step session without context_tokens reports 0 rather than >100% turn sum.
+    t4 = await tracker.build_turn_telemetry(
+        session_id="sess-unmeasured",
+        model_id="gemini-3.1-pro-high",
+        input_tokens=391_156,
+        output_tokens=22_121,
+        cached_read_tokens=2_086_676,
+    )
+    assert t4.context_tokens == 0
+    assert t4.context_usage_pct == 0.0
 
 
 async def test_seed_session_baseline_single_usage_fetch_and_evict_session(tmp_path: Any) -> None:

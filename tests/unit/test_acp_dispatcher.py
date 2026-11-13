@@ -4195,3 +4195,161 @@ async def test_acp_dispatcher_default_quota_tracker_uses_session_tier_credits(
         ]
         assert len(turn_completions) == 1
         assert turn_completions[0]["promptTurnSummaries"] == [{"unit": "credit", "usage": 8.0}]
+
+
+async def test_kas_v3_emits_live_mid_turn_usage_updates_without_cost_and_avoids_sum_fallback(
+    tmp_path: Path,
+) -> None:
+    """Verify KAS v3 streams live mid-turn usage_update (no cost) and never sums turn tokens."""
+    from agy_acp.logic.wire import V3KasWireAdapter
+
+    turn_idx = 0
+
+    class _LiveUsageCli(_StubAgyAcpClientProvider):
+        async def stream_prompt(self, **kwargs: Any) -> PromptOutcome:
+            nonlocal turn_idx
+            turn_idx += 1
+            on_usage = kwargs.get("on_usage")
+            on_text = kwargs.get("on_text")
+            if turn_idx == 1:
+                if on_text is not None:
+                    await on_text("Unmeasured multi-step turn")
+                return PromptOutcome(
+                    conversation_id="conv-live-1",
+                    stop_reason="end_turn",
+                    response="Unmeasured multi-step turn",
+                    usage={
+                        "input_tokens": 391_156,
+                        "output_tokens": 22_121,
+                        "cache_read_tokens": 2_086_676,
+                        "thinking_tokens": 0,
+                        "total_tokens": 2_499_953,
+                        "context_tokens": 0,
+                    },
+                )
+            if on_usage is not None:
+                await on_usage(42_000)
+            if on_text is not None:
+                await on_text("Step 1 ")
+            if on_usage is not None:
+                await on_usage(75_000)
+            if on_text is not None:
+                await on_text("Step 2")
+            return PromptOutcome(
+                conversation_id="conv-live-1",
+                stop_reason="end_turn",
+                response="Step 1 Step 2",
+                usage={
+                    "input_tokens": 200,
+                    "output_tokens": 50,
+                    "cache_read_tokens": 0,
+                    "thinking_tokens": 0,
+                    "total_tokens": 250,
+                    "context_tokens": 75_000,
+                },
+            )
+
+    emitted: list[dict[str, Any]] = []
+
+    async def _sink(msg: dict[str, Any]) -> None:
+        emitted.append(msg)
+
+    cli = _LiveUsageCli(save_dir=tmp_path)
+    mgr = SessionManager(save_dir=tmp_path, cli_provider=cli)
+    qt = QuotaTracker(provider=QuotaProvider(cli_provider=cli), state_store=mgr.state_store)
+    dispatcher = AcpDispatcher(
+        notification_sink=_sink,
+        session_manager=mgr,
+        quota_tracker=qt,
+        wire_adapter=V3KasWireAdapter(),
+    )
+
+    new_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "session/new",
+                "params": {"cwd": str(tmp_path), "mcpServers": []},
+            }
+        )
+    )
+    assert new_resp is not None
+    sid = new_resp["result"]["sessionId"]
+    emitted.clear()
+
+    # Turn 1: no mid-turn usage_update -> reports 0% / 0 used rather than 249.9953% / 2,499,953
+    resp1 = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/prompt",
+                "params": {"sessionId": sid, "prompt": [{"type": "text", "text": "go"}]},
+            }
+        )
+    )
+    assert resp1 is not None
+    assert resp1["result"]["stopReason"] == "end_turn"
+    updates1 = [
+        n["params"]["update"]
+        for n in emitted
+        if n.get("method") == "session/update" and isinstance(n.get("params"), dict)
+    ]
+    ctx_info1 = [
+        u
+        for u in updates1
+        if u.get("sessionUpdate") == "session_info_update"
+        and u.get("_meta", {}).get("kiro", {}).get("kind") == "context_usage"
+    ]
+    usage_upds1 = [u for u in updates1 if u.get("sessionUpdate") == "usage_update"]
+    assert len(ctx_info1) == 1
+    assert ctx_info1[0]["_meta"]["kiro"]["usagePercentage"] == 0.0
+    assert len(usage_upds1) == 1
+    assert usage_upds1[0]["used"] == 0
+    assert "cost" not in usage_upds1[0]
+
+    emitted.clear()
+
+    # Turn 2: two live mid-turn usage_updates stream before chunks, all without `cost`
+    resp2 = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "session/prompt",
+                "params": {"sessionId": sid, "prompt": [{"type": "text", "text": "stream"}]},
+            }
+        )
+    )
+    assert resp2 is not None
+    assert resp2["result"]["stopReason"] == "end_turn"
+    updates2 = [
+        n["params"]["update"]
+        for n in emitted
+        if n.get("method") == "session/update" and isinstance(n.get("params"), dict)
+    ]
+    usage_indices = [
+        idx for idx, u in enumerate(updates2) if u.get("sessionUpdate") == "usage_update"
+    ]
+    chunk_indices = [
+        idx for idx, u in enumerate(updates2) if u.get("sessionUpdate") == "agent_message_chunk"
+    ]
+    ctx_idx = next(
+        idx
+        for idx, u in enumerate(updates2)
+        if u.get("sessionUpdate") == "session_info_update"
+        and u.get("_meta", {}).get("kiro", {}).get("kind") == "context_usage"
+    )
+    comp_idx = next(
+        idx
+        for idx, u in enumerate(updates2)
+        if u.get("sessionUpdate") == "session_info_update"
+        and u.get("_meta", {}).get("kiro", {}).get("kind") == "turn_completion"
+    )
+
+    assert [updates2[i]["used"] for i in usage_indices] == [42_000, 75_000, 75_000]
+    for i in usage_indices:
+        assert "cost" not in updates2[i]
+    assert usage_indices[0] < chunk_indices[0] < usage_indices[1] < chunk_indices[1]
+    assert ctx_idx < usage_indices[-1] < comp_idx

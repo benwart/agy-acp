@@ -1655,10 +1655,6 @@ class AgyAcpClientProvider:
                 if persisted is not None:
                     persisted["contextTokens"] = ctx_tokens
                     self._store.upsert_session(persisted)
-                self._store.record_tokens(
-                    input_tokens=ctx_tokens,
-                    scope=f"session:{turn.session_id}",
-                )
                 async with turn.stream_lock:
                     if turn.on_usage is not None:
                         await turn.on_usage(ctx_tokens)
@@ -1977,6 +1973,7 @@ class AgyAcpClientProvider:
                 self._cancelled_sessions.discard(sid)
 
                 if was_user_cancelled:
+                    self._record_session_turn_tokens(sid, usage)
                     return PromptOutcome(
                         conversation_id=resolved_agy_sid,
                         stop_reason="cancelled",
@@ -2019,6 +2016,7 @@ class AgyAcpClientProvider:
 
         full_response = "".join(collected_texts)
         self._finalize_turn_usage(usage, bool(prompt or current_blocks), full_response)
+        self._record_session_turn_tokens(sid, usage)
         return PromptOutcome(
             conversation_id=resolved_agy_sid,
             stop_reason="end_turn",
@@ -2029,6 +2027,20 @@ class AgyAcpClientProvider:
             fallback_from_model=fallback_from_model,
             error=outcome_error,
         )
+
+    def _record_session_turn_tokens(self, session_id: str, usage: Mapping[str, int]) -> None:
+        in_tok = int(usage.get("input_tokens", 0))
+        out_tok = int(usage.get("output_tokens", 0))
+        cache_tok = int(usage.get("cache_read_tokens", 0))
+        think_tok = int(usage.get("thinking_tokens", 0))
+        if in_tok or out_tok or cache_tok or think_tok:
+            self._store.record_tokens(
+                input_tokens=in_tok,
+                output_tokens=out_tok,
+                cached_read_tokens=cache_tok,
+                thinking_tokens=think_tok,
+                scope=f"session:{session_id}",
+            )
 
     @staticmethod
     def _finalize_turn_usage(usage: dict[str, int], has_input: bool, full_response: str) -> None:
@@ -2043,8 +2055,6 @@ class AgyAcpClientProvider:
                 + usage["thinking_tokens"]
                 + usage["cache_read_tokens"]
             )
-        if usage["context_tokens"] == 0:
-            usage["context_tokens"] = usage["total_tokens"]
 
     @staticmethod
     def _accumulate_prompt_usage(
@@ -2084,5 +2094,3 @@ class AgyAcpClientProvider:
             usage["total_tokens"] += tot_tok
         if last_context_tokens > 0:
             usage["context_tokens"] = last_context_tokens
-        elif usage["total_tokens"] > 0:
-            usage["context_tokens"] = usage["total_tokens"]

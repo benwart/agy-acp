@@ -640,7 +640,7 @@ class QuotaTracker:
         active_context_tokens = (
             max(0, int(context_tokens))
             if context_tokens is not None
-            else (input_tokens + output_tokens + cached_read_tokens + thinking_tokens)
+            else (self.get_session_context_tokens(session_id) or 0)
         )
         usage_notification = self.build_usage_update_notification(
             session_id=session_id,

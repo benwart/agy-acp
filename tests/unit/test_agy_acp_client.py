@@ -510,6 +510,74 @@ def handle_prompt(req_id, params: dict) -> None:
         })
         return
 
+    if "MULTI_STEP_NO_USAGE_UPDATE" in text:
+        send_frame({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "Done multi-step."},
+                },
+            },
+        })
+        send_frame({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "stopReason": "end_turn",
+                "usage": {
+                    "inputTokens": 391156,
+                    "cachedReadTokens": 2086676,
+                    "outputTokens": 22121,
+                    "totalTokens": 2499953,
+                },
+            },
+        })
+        return
+
+    if "MULTI_STEP_USAGE_SNAPSHOTS" in text:
+        for used_ctx in (50000, 80000):
+            send_frame({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": sid,
+                    "update": {
+                        "sessionUpdate": "usage_update",
+                        "used": used_ctx,
+                        "size": 1000000,
+                    },
+                },
+            })
+        send_frame({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "Snapshots complete."},
+                },
+            },
+        })
+        send_frame({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "stopReason": "end_turn",
+                "usage": {
+                    "inputTokens": 1200,
+                    "outputTokens": 300,
+                    "cachedReadTokens": 4500,
+                    "thoughtTokens": 50,
+                    "totalTokens": 6050,
+                },
+            },
+        })
+        return
+
     # Standard streaming turn: thought + read tool + usage_update + text
     send_frame({
         "jsonrpc": "2.0",
@@ -1724,3 +1792,71 @@ async def test_discover_tier_and_session_caching_persists_ultra_tier(tmp_path: P
             "name": "Google AI Ultra",
             "upgradeUri": "",
         }
+
+
+async def test_should_keep_context_tokens_separate_from_cumulative_turn_totals_and_ledger(
+    tmp_path: Path,
+) -> None:
+    """Verify multi-step turn totals never inflate context_tokens or duplicate session ledger."""
+    script, state_file = _make_mock_agy(tmp_path)
+    store = SqliteStateStoreProvider(tmp_path / "state")
+    store.upsert_session({"sessionId": "sess-no-ctx", "cwd": str(tmp_path)})
+    store.upsert_session({"sessionId": "sess-snapshots", "cwd": str(tmp_path)})
+
+    observed_usages: list[int] = []
+
+    async def on_usage(tokens: int) -> None:
+        observed_usages.append(tokens)
+
+    async with AgyAcpClientProvider(
+        bin_path=script,
+        state_store=store,
+        env={"MOCK_AGY_STATE_FILE": str(state_file)},
+    ) as client:
+        no_ctx_outcome = await client.stream_prompt(
+            cwd=str(tmp_path),
+            session_id="sess-no-ctx",
+            prompt="MULTI_STEP_NO_USAGE_UPDATE",
+        )
+        snap_outcome = await client.stream_prompt(
+            cwd=str(tmp_path),
+            session_id="sess-snapshots",
+            prompt="MULTI_STEP_USAGE_SNAPSHOTS",
+            on_usage=on_usage,
+        )
+
+    assert no_ctx_outcome.usage == {
+        "input_tokens": 391156,
+        "output_tokens": 22121,
+        "thinking_tokens": 0,
+        "cache_read_tokens": 2086676,
+        "total_tokens": 2499953,
+        "context_tokens": 0,
+    }
+    assert store.get_token_ledger(scope="session:sess-no-ctx") == {
+        "input_tokens": 391156,
+        "output_tokens": 22121,
+        "cached_read_tokens": 2086676,
+        "thinking_tokens": 0,
+        "total_tokens": 2499953,
+    }
+
+    assert observed_usages == [50000, 80000]
+    assert snap_outcome.usage == {
+        "input_tokens": 1200,
+        "output_tokens": 300,
+        "thinking_tokens": 50,
+        "cache_read_tokens": 4500,
+        "total_tokens": 6050,
+        "context_tokens": 80000,
+    }
+    persisted_snap = store.get_session("sess-snapshots")
+    assert persisted_snap is not None
+    assert persisted_snap["contextTokens"] == 80000
+    assert store.get_token_ledger(scope="session:sess-snapshots") == {
+        "input_tokens": 1200,
+        "output_tokens": 300,
+        "cached_read_tokens": 4500,
+        "thinking_tokens": 50,
+        "total_tokens": 6050,
+    }

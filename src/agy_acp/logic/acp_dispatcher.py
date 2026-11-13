@@ -1178,12 +1178,7 @@ class AcpDispatcher:
             )
 
         async def _on_usage(ctx_tokens: int) -> None:
-            notif = self._quota_tracker.build_usage_update_notification(
-                session_id=session_id,
-                context_tokens=ctx_tokens,
-            )
-            if self._wire_adapter.engine_id != "v3":
-                await self._emit_notification(notif)
+            await self._emit_persisted_usage_update(session_id, ctx_tokens)
 
         async def _on_steer_consumed(raw_content: str) -> None:
             if raw_content.strip():
@@ -1662,7 +1657,7 @@ class AcpDispatcher:
             cached_read_tokens=0,
             context_tokens=int(compact_res.get("contextTokens", 0)),
         )
-        await self._emit_notification(telemetry.usage_update_notification)
+        await self._emit_persisted_usage_update(session_id, telemetry.context_tokens)
         if self._wire_adapter.engine_id == "v3":
             await self._emit_notification(
                 _session_update_frame(

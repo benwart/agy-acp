@@ -1298,12 +1298,13 @@ def _assert_kas_v3_turn_telemetry_frames(
     ]
 
     assert len(context_usage_indices) == 1
-    assert len(usage_indices) == 1
+    assert len(usage_indices) >= 1
     assert len(completion_indices) == 1
-    assert context_usage_indices[0] < usage_indices[0] < completion_indices[0]
+    assert context_usage_indices[0] < usage_indices[-1] < completion_indices[0]
 
-    usage_upd = updates[usage_indices[0]]
-    assert "cost" not in usage_upd
+    for idx in usage_indices:
+        assert "cost" not in updates[idx]
+    usage_upd = updates[usage_indices[-1]]
     assert usage_upd["used"] == 1600
 
     completion_kiro = updates[completion_indices[0]]["_meta"]["kiro"]
