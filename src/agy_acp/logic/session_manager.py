@@ -474,10 +474,51 @@ class SessionManager:
         self._active_cancel_scopes: dict[str, anyio.CancelScope] = self._cancel_scopes
         self._turn_locks: dict[str, anyio.Lock] = {}
         self._mcp_status_cache: dict[str, dict[str, McpServerStatus]] = {}
+        self._mcp_enabled: bool = True
+        self._process_session_ids: set[str] = set()
 
     async def close(self) -> None:
         """Close the underlying `AgyAcpClientProvider` and any active `agy acp` process."""
         await self._cli.close()
+
+    @property
+    def mcp_enabled(self) -> bool:
+        """Return whether MCP server merging and probing are enabled for this process."""
+        return self._mcp_enabled
+
+    async def set_mcp_enabled(self, enabled: bool) -> None:
+        """Toggle process-local MCP state (`_kiro/mcp/toggle`) without touching peer sessions."""
+        next_enabled = bool(enabled)
+        if self._mcp_enabled == next_enabled:
+            return
+        self._mcp_enabled = next_enabled
+        self._mcp_status_cache.clear()
+        for sid in list(self._process_session_ids):
+            session = self._store.get_session(sid)
+            if session is None:
+                self._process_session_ids.discard(sid)
+                continue
+            prev_mcp = copy.deepcopy(session.get("mcp_servers", []))
+            cwd = str(session.get("cwd") or "")
+            registry = self.get_custom_agent_registry(
+                cwd=cwd,
+                custom_agents=session.get("custom_agents") or [],
+            )
+            raw_wire = session.get("wire_mcp_servers", [])
+            active_agent = session.get("agent")
+            session["mcp_servers"] = self._merge_session_mcp(
+                cwd=cwd,
+                raw_wire_mcp=raw_wire if isinstance(raw_wire, list) else [],
+                active_agent=str(active_agent) if active_agent else None,
+                registry=registry,
+            )
+            await self._maybe_reset_backend_on_profile_change(
+                session,
+                prev_mcp=prev_mcp,
+                prev_prompt=session.get("agentPrompt"),
+                old_agy_id=str(session.get("agyConversationId") or "").strip(),
+            )
+            self._store.upsert_session(session)
 
     @property
     def state_store(self) -> SqliteStateStoreProvider:
@@ -677,6 +718,8 @@ class SessionManager:
         registry: CustomAgentRegistry,
     ) -> list[dict[str, Any]]:
         """Merge session wire MCP servers with active customAgent MCP servers (session wins)."""
+        if not self._mcp_enabled:
+            return []
         wire_translated = _dedupe_mcp_servers(
             [translate_mcp_server(s) for s in raw_wire_mcp if isinstance(s, dict)]
         )
@@ -850,6 +893,8 @@ class SessionManager:
 
     def get_session_mcp_server_names(self, session_id: str) -> list[str]:
         """Return ordered unique MCP server names configured for `session_id`."""
+        if not self._mcp_enabled:
+            return []
         session = self._store.get_session(session_id)
         if session is None:
             return []
@@ -869,6 +914,8 @@ class SessionManager:
         session: dict[str, Any],
     ) -> list[dict[str, Any]]:
         """Build the ordered MCP server declarations to probe for `session`."""
+        if not self._mcp_enabled:
+            return []
         cwd = str(session.get("cwd") or "")
         registry = self.get_custom_agent_registry(
             cwd=cwd,
@@ -1067,6 +1114,7 @@ class SessionManager:
         )
 
         state = self._store.upsert_session(draft_state)
+        self._process_session_ids.add(sid)
         _write_dsh_gate_marker_if_configured()
         return self._build_descriptor(state, available_models=available_models)
 
@@ -1097,6 +1145,7 @@ class SessionManager:
             self._cli.evict_backend_session(old_agy_id)
 
         restored_state = self._store.upsert_session(draft_state)
+        self._process_session_ids.add(session_id)
         _write_dsh_gate_marker_if_configured()
         return self._build_descriptor(restored_state, available_models=available_models)
 
@@ -1153,6 +1202,7 @@ class SessionManager:
         )
 
         forked_state = self._store.upsert_session(draft_state)
+        self._process_session_ids.add(new_sid)
         for idx, turn in enumerate(turns_to_copy):
             self._store.append_session_turn(
                 session_id=new_sid,
@@ -1234,14 +1284,20 @@ class SessionManager:
         user_text: str,
     ) -> dict[str, Any]:
         """Build common `stream_prompt` keyword arguments for `session`."""
+        effective_session = (
+            session if self._mcp_enabled else {**session, "mcp_servers": [], "wire_mcp_servers": []}
+        )
         return {
             "session_id": session_id,
-            "mcp_servers": session.get("mcp_servers"),
-            "system_prompt_append": _build_system_prompt_append(session, user_text=user_text),
-            "route_spawn_run": _session_has_kirocrew_spawn_run(session),
+            "mcp_servers": effective_session.get("mcp_servers"),
+            "system_prompt_append": _build_system_prompt_append(
+                effective_session,
+                user_text=user_text,
+            ),
+            "route_spawn_run": _session_has_kirocrew_spawn_run(effective_session),
             "known_mcp_servers": self.get_session_mcp_server_names(session_id),
             "env": _extract_session_mcp_env(
-                session,
+                effective_session,
                 session_id=session_id,
                 state_db_path=self._store.db_path,
             ),
@@ -1475,7 +1531,19 @@ class SessionManager:
                 or outcome is None
                 or outcome.stop_reason == "cancelled"
             ):
-                return {"stopReason": "cancelled"}
+                cancelled_payload: dict[str, Any] = {"stopReason": "cancelled"}
+                if outcome is not None:
+                    cancel_ctx = int(outcome.usage.get("context_tokens", 0))
+                    latest_cancel = self._store.get_session(session_id)
+                    if latest_cancel is not None and (outcome.conversation_id or cancel_ctx > 0):
+                        if outcome.conversation_id:
+                            latest_cancel["agyConversationId"] = outcome.conversation_id
+                        if cancel_ctx > 0:
+                            latest_cancel["contextTokens"] = cancel_ctx
+                        self._store.upsert_session(latest_cancel)
+                    if outcome.usage:
+                        cancelled_payload["usage"] = outcome.usage
+                return cancelled_payload
 
             ctx_tokens = int(outcome.usage.get("context_tokens", 0))
             fallback_from = outcome.fallback_from_model
@@ -1900,6 +1968,7 @@ class SessionManager:
         if scope is not None:
             scope.cancel()
         self._mcp_status_cache.pop(session_id, None)
+        self._process_session_ids.discard(session_id)
         self._store.set_kv(f"cancelled:{session_id}", False)
         existing = self._store.get_session(session_id)
         old_agy_id = (

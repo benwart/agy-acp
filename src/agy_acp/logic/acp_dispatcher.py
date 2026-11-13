@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextvars
 import json
 import os
+import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -402,6 +403,35 @@ def _jsonrpc_error(
     return {"jsonrpc": "2.0", "id": msg_id, "error": err}
 
 
+_RE_MONTHLY_LIMIT_ERROR = re.compile(
+    r"monthly\s+usage\s+limit|monthly.*limit|usage\s+limit\s+has\s+been\s+reached"
+    r"|quota\s+(?:limit|exhausted|exceeded)|freetierlimitexceeded|monthlylimiterror",
+    re.IGNORECASE,
+)
+_RE_THROTTLE_ERROR = re.compile(
+    r"\b429\b|too\s+many\s+requests|rate[\s_-]?limit|throttl",
+    re.IGNORECASE,
+)
+_RE_SERVICE_UNAVAILABLE_ERROR = re.compile(
+    r"econnreset|econnrefused|etimedout|epipe"
+    r"|connection\s+(?:reset|refused|closed|error|aborted)"
+    r"|temporarily\s+unavailable|service\s+unavailable"
+    r"|\b50[0234]\b|bad\s+gateway|gateway\s+timeout|overloaded",
+    re.IGNORECASE,
+)
+
+
+def _classify_turn_error_type(turn_error: str) -> str:
+    """Classify a turn-level error message into KiroCrew 0.12.2 `data.errorType`."""
+    if _RE_MONTHLY_LIMIT_ERROR.search(turn_error):
+        return "MonthlyLimitError"
+    if _RE_THROTTLE_ERROR.search(turn_error):
+        return "ThrottlingException"
+    if _RE_SERVICE_UNAVAILABLE_ERROR.search(turn_error):
+        return "ServiceUnavailableError"
+    return "ProviderError"
+
+
 def _prompt_turn_result(
     msg_id: Any,
     *,
@@ -619,6 +649,52 @@ class AcpDispatcher:
     def _cancelled_prompt_response(message_id: Any) -> dict[str, Any]:
         """Build a JSON-RPC 2.0 `session/prompt` response with `stopReason == 'cancelled'`."""
         return _prompt_turn_result(message_id, stop_reason="cancelled")
+
+    async def _finish_cancelled_prompt(
+        self,
+        message_id: Any,
+        *,
+        session_id: str,
+        usage: Mapping[str, Any] | None = None,
+        turn_id: str = "",
+    ) -> dict[str, Any]:
+        """Emit cancelled-turn telemetry (and post-response v2 drain metadata) and build result."""
+        usage_map = usage if isinstance(usage, Mapping) else {}
+        input_tokens = max(0, int(usage_map.get("input_tokens", 0)))
+        output_tokens = max(0, int(usage_map.get("output_tokens", 0)))
+        cached_read_tokens = max(0, int(usage_map.get("cache_read_tokens", 0)))
+        thinking_tokens = max(0, int(usage_map.get("thinking_tokens", 0)))
+        raw_ctx = usage_map.get("context_tokens")
+        effective_ctx = (
+            int(raw_ctx)
+            if raw_ctx is not None and int(raw_ctx) > 0
+            else self._quota_tracker.get_session_context_tokens(session_id)
+        )
+        telemetry = await self._emit_turn_telemetry_frames(
+            session_id=session_id,
+            model_id=self._resolve_session_model(session_id),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_read_tokens=cached_read_tokens,
+            thinking_tokens=thinking_tokens,
+            context_tokens=effective_ctx,
+            turn_id=turn_id,
+        )
+        if self._wire_adapter.engine_id == "v2":
+            post_params = {
+                **telemetry.metadata_params,
+                "meteringUsage": [{"unit": "credit", "unitPlural": "credits", "value": 0.0}],
+            }
+            self._queue_post_response_notifications(
+                [{"jsonrpc": "2.0", "method": "_kiro.dev/metadata", "params": post_params}]
+            )
+        return _prompt_turn_result(
+            message_id,
+            stop_reason="cancelled",
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_read_tokens=cached_read_tokens,
+        )
 
     def _evaluate_tool_permission(
         self,
@@ -919,7 +995,11 @@ class AcpDispatcher:
             return _jsonrpc_error(message_id, -32002, str(exc))
 
         if self._session_manager.consume_cancellation(session_id):
-            return self._cancelled_prompt_response(message_id)
+            await self._quota_tracker.seed_session_baseline(
+                session_id,
+                model_id=self._resolve_session_model(session_id),
+            )
+            return await self._finish_cancelled_prompt(message_id, session_id=session_id)
 
         prompt_blocks: list[dict[str, Any]] = [b for b in raw_prompt if isinstance(b, dict)]
         prompt_text = self._extract_prompt_text(prompt_blocks)
@@ -1136,7 +1216,14 @@ class AcpDispatcher:
 
         stop_reason = str(turn_result.get("stopReason", "end_turn"))
         if stop_reason == "cancelled" or self._session_manager.consume_cancellation(session_id):
-            return self._cancelled_prompt_response(message_id)
+            await _emit_message_piece(carousel_normalizer.flush())
+            raw_cancel_usage = turn_result.get("usage")
+            return await self._finish_cancelled_prompt(
+                message_id,
+                session_id=session_id,
+                usage=raw_cancel_usage if isinstance(raw_cancel_usage, Mapping) else None,
+                turn_id=user_message_id,
+            )
 
         await _emit_message_piece(carousel_normalizer.flush())
 
@@ -1202,7 +1289,12 @@ class AcpDispatcher:
         )
 
         if turn_error:
-            return _jsonrpc_error(message_id, -32603, turn_error)
+            return _jsonrpc_error(
+                message_id,
+                -32603,
+                turn_error,
+                data={"errorType": _classify_turn_error_type(turn_error)},
+            )
 
         return _prompt_turn_result(
             message_id,
@@ -1585,6 +1677,21 @@ class AcpDispatcher:
                 )
             )
         return _jsonrpc_result(message_id, {"success": True})
+
+    async def _handle_kas_mcp_toggle(
+        self,
+        message_id: Any,
+        params: dict[str, Any],
+        *,
+        is_request: bool = False,
+    ) -> dict[str, Any] | None:
+        """Handle `_kiro/mcp/toggle` notification or request to toggle process MCP subsystem."""
+        enabled = params.get("enabled")
+        if not isinstance(enabled, bool):
+            return _jsonrpc_error(message_id, -32602, "Invalid params") if is_request else None
+        self._mcp_status_cache.clear()
+        await self._session_manager.set_mcp_enabled(enabled)
+        return _jsonrpc_result(message_id, {}) if is_request else None
 
     async def _handle_kas_mcp_reset_server(
         self,
@@ -2078,6 +2185,8 @@ class AcpDispatcher:
             return await self._handle_kas_code_intelligence(msg_id, params)
         if method == "_kiro/checkpoint/revertMultiple":
             return await self._handle_kas_checkpoint_revert_multiple(msg_id, params)
+        if method == "_kiro/mcp/toggle":
+            return await self._handle_kas_mcp_toggle(msg_id, params, is_request=is_request)
         if method == "_kiro/mcp/resetServer":
             return await self._handle_kas_mcp_reset_server(msg_id, params)
         if method == "_kiro.dev/commands/execute":

@@ -2882,7 +2882,11 @@ async def test_session_prompt_returns_jsonrpc_error_on_unrecovered_cli_error(
     assert prompt_resp == {
         "jsonrpc": "2.0",
         "id": 2,
-        "error": {"code": -32603, "message": "read ECONNRESET"},
+        "error": {
+            "code": -32603,
+            "message": "read ECONNRESET",
+            "data": {"errorType": "ServiceUnavailableError"},
+        },
     }
     assert mgr.state_store.get_session_turns(sid) == []
     usage_updates = [
@@ -3672,3 +3676,395 @@ async def test_w4_kas_steering_queued_persisted_turns_and_tool_call_recheck_dedu
     saved_texts = [b.get("text", "") for b in turns[0]["prompt_blocks"] if b.get("type") == "text"]
     assert "Initial instruction" in saved_texts
     assert "Focus on tests instead" in saved_texts
+
+
+async def test_session_prompt_structured_error_type_classification(tmp_path: Path) -> None:
+    """Verify session/prompt attaches KiroCrew 0.12.2 structured errorType data on turn errors."""
+    from agy_acp.logic.wire import V3KasWireAdapter
+
+    next_error = ""
+
+    class _DynamicErrorCli(_StubAgyAcpClientProvider):
+        async def stream_prompt(self, **kwargs: Any) -> PromptOutcome:
+            return PromptOutcome(
+                conversation_id="conv-err-types",
+                stop_reason="end_turn",
+                response="",
+                error=next_error,
+                usage={"input_tokens": 2, "output_tokens": 0, "total_tokens": 2},
+            )
+
+    adapter = V3KasWireAdapter()
+    cli = _DynamicErrorCli(save_dir=tmp_path)
+    mgr = SessionManager(save_dir=tmp_path, cli_provider=cli, wire_adapter=adapter)
+    dispatcher = AcpDispatcher(
+        session_manager=mgr,
+        quota_tracker=QuotaTracker(
+            provider=QuotaProvider(cli_provider=cli),
+            state_store=cli.state_store,
+        ),
+        wire_adapter=adapter,
+    )
+    new_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "session/new",
+                "params": {"cwd": str(tmp_path), "mcpServers": []},
+            }
+        )
+    )
+    assert new_resp is not None
+    sid = new_resp["result"]["sessionId"]
+
+    cases = [
+        ("The monthly usage limit has been reached for this account", "MonthlyLimitError"),
+        ("HTTP 429 Too Many Requests: rate limit exceeded", "ThrottlingException"),
+        ("503 Service Temporarily Unavailable", "ServiceUnavailableError"),
+        ("Unexpected model decoding failure", "ProviderError"),
+    ]
+    for idx, (err_text, expected_type) in enumerate(cases, start=10):
+        next_error = err_text
+        resp = await dispatcher.handle_message(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": idx,
+                    "method": "session/prompt",
+                    "params": {
+                        "sessionId": sid,
+                        "prompt": [{"type": "text", "text": "check"}],
+                    },
+                }
+            )
+        )
+        assert resp == {
+            "jsonrpc": "2.0",
+            "id": idx,
+            "error": {
+                "code": -32603,
+                "message": err_text,
+                "data": {"errorType": expected_type},
+            },
+        }
+
+
+async def test_kas_mcp_toggle_disables_and_reenables_mcp_servers_and_probing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify _kiro/mcp/toggle isolates process-local MCP merging, probing, and stream kwargs."""
+    from agy_acp.logic.mcp_catalog_prober import McpCatalogProber
+    from agy_acp.logic.wire import McpServerStatus, V3KasWireAdapter
+
+    log_file = tmp_path / "acp-toggle.log"
+    monkeypatch.setenv("AGY_ACP_LOG_FILE", str(log_file))
+
+    probe_calls: list[list[str]] = []
+    prompt_kwargs_seen: list[dict[str, Any]] = []
+
+    class _CountingProber(McpCatalogProber):
+        async def probe_servers(
+            self,
+            servers: Any,
+            *,
+            session_env: Any = None,
+            cwd: str | None = None,
+        ) -> list[McpServerStatus]:
+            names = [str(d.get("name") or "") for d in servers]
+            probe_calls.append(names)
+            return [McpServerStatus(name=n, status="connected") for n in names if n]
+
+    class _InspectPromptCli(_StubAgyAcpClientProvider):
+        async def stream_prompt(self, **kwargs: Any) -> PromptOutcome:
+            prompt_kwargs_seen.append(kwargs)
+            return PromptOutcome(
+                conversation_id="conv-toggle",
+                stop_reason="end_turn",
+                response="ok",
+                usage={"input_tokens": 4, "output_tokens": 2, "total_tokens": 6},
+            )
+
+    # Peer process sharing the same SQLite store MUST NOT have its session wiped
+    peer_cli = _InspectPromptCli(save_dir=tmp_path)
+    peer_mgr = SessionManager(save_dir=tmp_path, cli_provider=peer_cli)
+    peer_desc = await peer_mgr.create_session(
+        cwd=str(tmp_path),
+        mcp_servers=[{"name": "peer-mcp", "command": "echo", "args": ["peer"]}],
+    )
+    peer_sid = peer_desc["sessionId"]
+    assert [s["name"] for s in peer_mgr.get_session(peer_sid)["mcp_servers"]] == ["peer-mcp"]
+
+    emitted: list[dict[str, Any]] = []
+
+    async def _sink(msg: dict[str, Any]) -> None:
+        emitted.append(msg)
+
+    adapter = V3KasWireAdapter()
+    cli = _InspectPromptCli(save_dir=tmp_path)
+    mgr = SessionManager(
+        save_dir=tmp_path,
+        cli_provider=cli,
+        wire_adapter=adapter,
+        mcp_prober=_CountingProber(),
+    )
+    dispatcher = AcpDispatcher(
+        notification_sink=_sink,
+        session_manager=mgr,
+        quota_tracker=QuotaTracker(
+            provider=QuotaProvider(cli_provider=cli),
+            state_store=cli.state_store,
+        ),
+        wire_adapter=adapter,
+    )
+
+    toggle_off = await dispatcher.handle_message(
+        json.dumps({"jsonrpc": "2.0", "method": "_kiro/mcp/toggle", "params": {"enabled": False}})
+    )
+    assert toggle_off is None
+    assert mgr.mcp_enabled is False
+    assert [s["name"] for s in peer_mgr.get_session(peer_sid)["mcp_servers"]] == ["peer-mcp"]
+
+    custom_agents = [
+        {
+            "id": "kirocrew-lite",
+            "name": "KiroCrew Lite",
+            "prompt": "Background helper.",
+            "mcpServers": {"kirocrew-core": {"command": "echo", "args": ["core"]}},
+        }
+    ]
+    new_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "session/new",
+                "params": {
+                    "cwd": str(tmp_path),
+                    "mcpServers": [{"name": "wire-srv", "command": "echo", "args": ["wire"]}],
+                    "_meta": {"kiro": {"customAgents": custom_agents}},
+                },
+            }
+        )
+    )
+    assert new_resp is not None
+    sid = new_resp["result"]["sessionId"]
+    post_frames = dispatcher.pop_post_response_notifications()
+    mcp_status_frames = [f for f in post_frames if f.get("method") == "_kiro/mcp/status"]
+    assert len(mcp_status_frames) == 1
+    assert mcp_status_frames[0]["params"]["servers"] == []
+    assert probe_calls == []
+    assert mgr.get_session(sid)["mcp_servers"] == []
+    assert [s["name"] for s in mgr.get_session(sid)["wire_mcp_servers"]] == ["wire-srv"]
+
+    mode_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/set_mode",
+                "params": {"sessionId": sid, "modeId": "kirocrew-lite"},
+            }
+        )
+    )
+    assert mode_resp == {"jsonrpc": "2.0", "id": 2, "result": {}}
+    dispatcher.pop_post_response_notifications()
+    assert probe_calls == []
+    assert mgr.get_session(sid)["mcp_servers"] == []
+
+    prompt_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": sid,
+                    "prompt": [{"type": "text", "text": "summarize"}],
+                },
+            }
+        )
+    )
+    assert prompt_resp is not None and prompt_resp["result"]["stopReason"] == "end_turn"
+    assert len(prompt_kwargs_seen) == 1
+    assert prompt_kwargs_seen[0]["mcp_servers"] == []
+    assert prompt_kwargs_seen[0]["route_spawn_run"] is False
+
+    bad_toggle = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "_kiro/mcp/toggle",
+                "params": {"enabled": "invalid"},
+            }
+        )
+    )
+    assert bad_toggle is not None and bad_toggle["error"]["code"] == -32602
+
+    toggle_on = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "_kiro/mcp/toggle",
+                "params": {"enabled": True},
+            }
+        )
+    )
+    assert toggle_on == {"jsonrpc": "2.0", "id": 5, "result": {}}
+    assert mgr.mcp_enabled is True
+    assert [s["name"] for s in mgr.get_session(sid)["mcp_servers"]] == [
+        "wire-srv",
+        "kirocrew-core",
+    ]
+    probed = await mgr.probe_session_mcp_servers(sid)
+    assert [p.name for p in probed] == ["wire-srv", "kirocrew-core"]
+
+    log_events = [
+        json.loads(line)["event"]
+        for line in log_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert "rpc.unhandled" not in log_events
+
+
+async def test_cancelled_session_prompt_emits_turn_telemetry_on_v2_and_v3(
+    tmp_path: Path,
+) -> None:
+    """Verify cancelled turns emit metering frames on both v2 (post-response drain) and v3."""
+    from agy_acp.logic.wire import V2KiroWireAdapter, V3KasWireAdapter
+
+    class _CancelUsageCli(_StubAgyAcpClientProvider):
+        async def stream_prompt(self, **kwargs: Any) -> PromptOutcome:
+            return PromptOutcome(
+                conversation_id="conv-cancel-usage",
+                stop_reason="cancelled",
+                response="",
+                usage={
+                    "input_tokens": 24,
+                    "output_tokens": 9,
+                    "cache_read_tokens": 4,
+                    "context_tokens": 1200,
+                },
+            )
+
+    for engine_name, adapter in (("v2", V2KiroWireAdapter()), ("v3", V3KasWireAdapter())):
+        sub_dir = tmp_path / engine_name
+        sub_dir.mkdir(parents=True)
+        emitted: list[dict[str, Any]] = []
+
+        async def _sink(msg: dict[str, Any], bucket: list[dict[str, Any]] = emitted) -> None:
+            bucket.append(msg)
+
+        cli = _CancelUsageCli(save_dir=sub_dir)
+        mgr = SessionManager(save_dir=sub_dir, cli_provider=cli, wire_adapter=adapter)
+        dispatcher = AcpDispatcher(
+            notification_sink=_sink,
+            session_manager=mgr,
+            quota_tracker=QuotaTracker(
+                provider=QuotaProvider(cli_provider=cli),
+                state_store=cli.state_store,
+            ),
+            wire_adapter=adapter,
+        )
+        new_resp = await dispatcher.handle_message(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "session/new",
+                    "params": {"cwd": str(sub_dir), "mcpServers": []},
+                }
+            )
+        )
+        assert new_resp is not None
+        sid = new_resp["result"]["sessionId"]
+        dispatcher.pop_post_response_notifications()
+        emitted.clear()
+
+        # 1. Pre-cancelled prompt (cancel arrives before session/prompt)
+        await dispatcher.handle_message(
+            json.dumps({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": sid}})
+        )
+        pre_resp = await dispatcher.handle_message(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "session/prompt",
+                    "params": {"sessionId": sid, "prompt": [{"type": "text", "text": "abort"}]},
+                }
+            )
+        )
+        assert pre_resp is not None
+        assert pre_resp["result"]["stopReason"] == "cancelled"
+        pre_post = dispatcher.pop_post_response_notifications()
+        if engine_name == "v2":
+            assert len(pre_post) == 1
+            assert pre_post[0]["method"] == "_kiro.dev/metadata"
+            assert pre_post[0]["params"].get("contextUsagePercentage") is not None
+            assert pre_post[0]["params"]["meteringUsage"][0]["value"] == 0.0
+        else:
+            assert pre_post == []
+            pre_kinds = [
+                n["params"]["update"].get("_meta", {}).get("kiro", {}).get("kind")
+                for n in emitted
+                if n.get("method") == "session/update"
+                and n["params"]["update"].get("sessionUpdate") == "session_info_update"
+            ]
+            assert "context_usage" in pre_kinds
+            assert "turn_completion" in pre_kinds
+
+        emitted.clear()
+
+        # 2. Mid-turn cancelled prompt with partial token usage
+        mid_resp = await dispatcher.handle_message(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "session/prompt",
+                    "params": {"sessionId": sid, "prompt": [{"type": "text", "text": "work"}]},
+                }
+            )
+        )
+        assert mid_resp == {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "result": {
+                "stopReason": "cancelled",
+                "usage": {
+                    "inputTokens": 24,
+                    "outputTokens": 9,
+                    "cachedReadTokens": 4,
+                    "cachedWriteTokens": 0,
+                },
+            },
+        }
+        usage_updates = [
+            n["params"]["update"]
+            for n in emitted
+            if n.get("method") == "session/update"
+            and n["params"]["update"].get("sessionUpdate") == "usage_update"
+        ]
+        assert len(usage_updates) >= 1
+        assert usage_updates[-1]["used"] == 1200
+
+        mid_post = dispatcher.pop_post_response_notifications()
+        if engine_name == "v2":
+            assert len(mid_post) == 1
+            assert mid_post[0]["method"] == "_kiro.dev/metadata"
+            assert mid_post[0]["params"].get("contextUsagePercentage") is not None
+            assert mid_post[0]["params"]["meteringUsage"][0]["value"] == 0.0
+        else:
+            assert mid_post == []
+            mid_kinds = [
+                n["params"]["update"].get("_meta", {}).get("kiro", {}).get("kind")
+                for n in emitted
+                if n.get("method") == "session/update"
+                and n["params"]["update"].get("sessionUpdate") == "session_info_update"
+            ]
+            assert "context_usage" in mid_kinds
+            assert "turn_completion" in mid_kinds
