@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import contextlib
 import json
+import subprocess
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import anyio
+from anyio.streams.buffered import BufferedByteReceiveStream
 
 from agy_acp.logic.tool_classifier import build_scrubbed_subprocess_env, resolve_agy_binary
 
@@ -61,6 +64,81 @@ async def run_agy_slash_json(
         "response": stdout,
         "command": {"name": normalized.lstrip("/")},
     }
+
+
+def _supports_tier_capability(init_res: Mapping[str, Any]) -> bool:
+    """Return whether `initialize` advertised `_meta.antigravity.tier`."""
+    caps = init_res.get("agentCapabilities")
+    caps_meta = caps.get("_meta") if isinstance(caps, Mapping) else None
+    caps_agy = caps_meta.get("antigravity") if isinstance(caps_meta, Mapping) else None
+    if isinstance(caps_agy, Mapping) and bool(caps_agy.get("tier")):
+        return True
+    top_meta = init_res.get("_meta")
+    top_agy = top_meta.get("antigravity") if isinstance(top_meta, Mapping) else None
+    return isinstance(top_agy, Mapping) and bool(top_agy.get("tier"))
+
+
+async def run_agy_acp_tier_json(
+    *,
+    agy_bin: str | Path | None = None,
+    timeout: float = 15.0,
+) -> dict[str, str] | None:
+    """Probe `agy acp --stdio` via `initialize` + `authenticate` for `_meta.antigravity.tier`."""
+    bin_path = resolve_agy_binary(agy_bin)
+    with anyio.fail_after(timeout):
+        proc = await anyio.open_process(
+            [bin_path, "acp", "--stdio"],
+            env=build_scrubbed_subprocess_env(),
+            stderr=subprocess.DEVNULL,
+        )
+        async with proc:
+            try:
+                if proc.stdin is None or proc.stdout is None:
+                    return None
+                reader = BufferedByteReceiveStream(proc.stdout)
+
+                async def _rpc(req_id: int, method: str, params: dict[str, Any]) -> dict[str, Any]:
+                    assert proc.stdin is not None
+                    payload = {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}
+                    frame = (json.dumps(payload) + "\n").encode("utf-8")
+                    await proc.stdin.send(frame)
+                    while True:
+                        raw_line = await reader.receive_until(b"\n", 1024 * 1024)
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                        if not line:
+                            continue
+                        with contextlib.suppress(json.JSONDecodeError):
+                            msg = json.loads(line)
+                            if isinstance(msg, dict) and msg.get("id") == req_id:
+                                res = msg.get("result")
+                                return dict(res) if isinstance(res, Mapping) else {}
+
+                init_res = await _rpc(
+                    1, "initialize", {"protocolVersion": 1, "clientCapabilities": {}}
+                )
+                if not _supports_tier_capability(init_res):
+                    return None
+                auth_res = await _rpc(2, "authenticate", {"methodId": "oauth-personal"})
+                meta = auth_res.get("_meta")
+                agy_meta = meta.get("antigravity") if isinstance(meta, Mapping) else None
+                tier = agy_meta.get("tier") if isinstance(agy_meta, Mapping) else None
+                if not isinstance(tier, Mapping):
+                    return None
+                tier_id = str(tier.get("id") or "").strip()
+                if not tier_id:
+                    return None
+                return {
+                    "id": tier_id,
+                    "name": str(tier.get("name") or "").strip(),
+                    "upgradeUri": str(tier.get("upgradeUri") or "").strip(),
+                }
+            finally:
+                if proc.stdin is not None:
+                    with contextlib.suppress(Exception):
+                        await proc.stdin.aclose()
+                if proc.returncode is None:
+                    with contextlib.suppress(ProcessLookupError):
+                        proc.terminate()
 
 
 class QuotaProvider:
@@ -142,3 +220,20 @@ class QuotaProvider:
             "remaining_credits": remaining_credits,
             "upgrade_uri": upgrade_uri,
         }
+
+    async def fetch_tier(self) -> dict[str, str] | None:
+        """Query the active Antigravity Google AI plan tier via `cli_provider` or `agy acp`."""
+        if self._cli is not None:
+            discover_tier = getattr(self._cli, "discover_tier", None)
+            if callable(discover_tier):
+                res = await discover_tier()
+                if isinstance(res, Mapping) and str(res.get("id") or "").strip():
+                    return {
+                        "id": str(res["id"]).strip(),
+                        "name": str(res.get("name") or "").strip(),
+                        "upgradeUri": str(res.get("upgradeUri") or "").strip(),
+                    }
+            return None
+        if type(self) is QuotaProvider:
+            return await run_agy_acp_tier_json(agy_bin=self._agy_bin)
+        return None

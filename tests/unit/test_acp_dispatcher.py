@@ -4068,3 +4068,130 @@ async def test_cancelled_session_prompt_emits_turn_telemetry_on_v2_and_v3(
             ]
             assert "context_usage" in mid_kinds
             assert "turn_completion" in mid_kinds
+
+
+@pytest.mark.parametrize("engine_name", ["v2", "v3"])
+async def test_acp_dispatcher_default_quota_tracker_uses_session_tier_credits(
+    tmp_path: Path,
+    engine_name: str,
+) -> None:
+    """Verify `AcpDispatcher` reports Ultra 20x (4000/800) credits on v2 and v3 wires."""
+    from agy_acp.logic.wire import create_wire_adapter
+    from agy_acp.providers.state_store import SqliteStateStoreProvider
+
+    class _DroppingUltraCli(_StubAgyAcpClientProvider):
+        def __init__(self, store: SqliteStateStoreProvider) -> None:
+            super().__init__(state_store=store)
+            self._fractions = [0.95, 0.94]
+
+        async def run_slash_command(
+            self,
+            command: str,
+            *,
+            cwd: str | None = None,
+            session_id: str | None = None,
+            timeout: float = 30.0,
+        ) -> dict[str, Any]:
+            _ = (cwd, session_id, timeout)
+            if command.lstrip("/") == "usage":
+                frac = self._fractions.pop(0) if self._fractions else 0.94
+                return {
+                    "status": "SUCCESS",
+                    "command": {
+                        "name": "usage",
+                        "data": {
+                            "groups": [
+                                {
+                                    "name": "Gemini Models",
+                                    "buckets": [
+                                        {
+                                            "id": "gemini-5h",
+                                            "name": "Five Hour Limit Remaining",
+                                            "window": "5h",
+                                            "remaining_fraction": frac,
+                                            "reset_time": "2026-10-24T07:52:04Z",
+                                        },
+                                        {
+                                            "id": "gemini-weekly",
+                                            "name": "Weekly Limit Remaining",
+                                            "window": "weekly",
+                                            "remaining_fraction": 0.90,
+                                            "reset_time": "2026-10-24T12:34:28Z",
+                                        },
+                                    ],
+                                }
+                            ]
+                        },
+                    },
+                }
+            return {
+                "status": "SUCCESS",
+                "command": {
+                    "name": "credits",
+                    "data": {"remaining_credits": 0, "upgrade_uri": ""},
+                },
+            }
+
+    store = SqliteStateStoreProvider(tmp_path / "ultra-disp-state")
+    store.save_tier({"id": "g1-ultra-tier", "name": "Google AI Ultra", "upgradeUri": ""})
+    cli = _DroppingUltraCli(store)
+    adapter = create_wire_adapter(engine_name)
+    emitted: list[dict[str, Any]] = []
+
+    async def _sink(frame: dict[str, Any]) -> None:
+        emitted.append(frame)
+
+    # Note: omit quota_tracker=... to exercise AcpDispatcher's default wiring!
+    dispatcher = AcpDispatcher(
+        notification_sink=_sink,
+        session_manager=SessionManager(cli_provider=cli, state_store=store, wire_adapter=adapter),
+        wire_adapter=adapter,
+    )
+    new_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "session/new",
+                "params": {"cwd": str(tmp_path), "mcpServers": []},
+            }
+        )
+    )
+    assert new_resp is not None
+    sid = new_resp["result"]["sessionId"]
+    dispatcher.pop_post_response_notifications()
+    emitted.clear()
+
+    prompt_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/prompt",
+                "params": {"sessionId": sid, "prompt": [{"type": "text", "text": "hello"}]},
+            }
+        )
+    )
+    assert prompt_resp is not None
+    assert prompt_resp["result"]["stopReason"] == "end_turn"
+
+    post = dispatcher.pop_post_response_notifications()
+    if engine_name == "v2":
+        meta_frames = [n for n in [*emitted, *post] if n.get("method") == "_kiro.dev/metadata"]
+        assert len(meta_frames) == 1
+        meta = meta_frames[0]["params"]
+        assert meta["creditsCapacity"] == 800.0
+        assert meta["credits"] == 752.0
+        assert meta["meteringUsage"] == [{"unit": "credit", "unitPlural": "credits", "value": 8.0}]
+        assert meta["planTierId"] == "g1-ultra-tier"
+    else:
+        turn_completions = [
+            n["params"]["update"]["_meta"]["kiro"]
+            for n in emitted
+            if n.get("method") == "session/update"
+            and n["params"]["update"].get("sessionUpdate") == "session_info_update"
+            and n["params"]["update"].get("_meta", {}).get("kiro", {}).get("kind")
+            == "turn_completion"
+        ]
+        assert len(turn_completions) == 1
+        assert turn_completions[0]["promptTurnSummaries"] == [{"unit": "credit", "usage": 8.0}]

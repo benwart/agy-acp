@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, tzinfo
 from typing import Any
@@ -11,6 +12,65 @@ from agy_acp.providers.quota_provider import QuotaProvider
 from agy_acp.providers.state_store import SqliteStateStoreProvider
 
 RATE_LIMIT_MESSAGE = "Quota limit reached for one or more rolling windows."
+
+
+@dataclass(frozen=True)
+class PlanCreditSpec:
+    """Credit capacities mapped from an Antigravity Google AI plan tier."""
+
+    tier_id: str
+    label: str
+    weekly_capacity: float
+    five_hour_capacity: float
+
+
+PLAN_CREDIT_SPECS: dict[str, PlanCreditSpec] = {
+    "g1-ultra-tier": PlanCreditSpec(
+        tier_id="g1-ultra-tier",
+        label="Google AI Ultra (20x)",
+        weekly_capacity=4_000.0,
+        five_hour_capacity=800.0,
+    ),
+    "g1-ultra-lite-tier": PlanCreditSpec(
+        tier_id="g1-ultra-lite-tier",
+        label="Google AI Ultra (5x)",
+        weekly_capacity=1_000.0,
+        five_hour_capacity=200.0,
+    ),
+    "g1-pro-tier": PlanCreditSpec(
+        tier_id="g1-pro-tier",
+        label="Google AI Pro (1x)",
+        weekly_capacity=200.0,
+        five_hour_capacity=40.0,
+    ),
+    "g1-plus-tier": PlanCreditSpec(
+        tier_id="g1-plus-tier",
+        label="Google AI Plus",
+        weekly_capacity=100.0,
+        five_hour_capacity=20.0,
+    ),
+    "free-tier": PlanCreditSpec(
+        tier_id="free-tier",
+        label="Free",
+        weekly_capacity=40.0,
+        five_hour_capacity=8.0,
+    ),
+}
+
+DEFAULT_PLAN_CREDIT_SPEC: PlanCreditSpec = PLAN_CREDIT_SPECS["g1-ultra-lite-tier"]
+
+
+def resolve_plan_credit_spec(tier: Mapping[str, Any] | str | None = None) -> PlanCreditSpec:
+    """Resolve weekly (`7d`) and 5-hour (`5h`) credit capacities for `tier`."""
+    raw_id = ""
+    if isinstance(tier, Mapping):
+        raw_id = str(tier.get("id") or "")
+    elif isinstance(tier, str):
+        raw_id = tier
+    normalized = raw_id.strip().lower().replace("_", "-")
+    if not normalized:
+        return DEFAULT_PLAN_CREDIT_SPEC
+    return PLAN_CREDIT_SPECS.get(normalized, DEFAULT_PLAN_CREDIT_SPEC)
 
 
 @dataclass(frozen=True)
@@ -122,8 +182,14 @@ class QuotaTracker:
         provider: QuotaProvider | None = None,
         state_store: SqliteStateStoreProvider | None = None,
     ) -> None:
+        self._store = (
+            state_store
+            if state_store is not None
+            else (SqliteStateStoreProvider() if provider is None else None)
+        )
         self._provider = provider or QuotaProvider()
-        self._store = state_store
+        self._cached_tier: dict[str, str] | None = None
+        self._tier_probed: bool = False
         initial = (
             self._store.get_token_ledger()
             if self._store is not None
@@ -144,6 +210,40 @@ class QuotaTracker:
         self._session_context_tokens: dict[str, int] = {}
         self._last_session_effective_credits: dict[str, float] = {}
 
+    async def _resolve_tier(self) -> dict[str, str] | None:
+        """Resolve active Antigravity plan tier from SQLite cache, provider probe, or fallback."""
+        if self._store is not None:
+            stored = self._store.load_tier()
+            if stored is not None:
+                self._cached_tier = stored
+                return stored
+        if self._cached_tier is not None:
+            return self._cached_tier
+        if not self._tier_probed:
+            self._tier_probed = True
+            fetch_tier = getattr(self._provider, "fetch_tier", None)
+            if callable(fetch_tier):
+                with contextlib.suppress(Exception):
+                    fetched = await fetch_tier()
+                    if isinstance(fetched, Mapping):
+                        tier_id = str(fetched.get("id") or "").strip()
+                        if tier_id:
+                            normalized = {
+                                "id": tier_id,
+                                "name": str(fetched.get("name") or "").strip(),
+                                "upgradeUri": str(fetched.get("upgradeUri") or "").strip(),
+                            }
+                            if self._store is not None:
+                                self._store.save_tier(normalized)
+                            self._cached_tier = normalized
+                            return normalized
+        if self._store is not None:
+            stale = self._store.load_tier(max_age_seconds=None)
+            if stale is not None:
+                self._cached_tier = stale
+                return stale
+        return None
+
     def evict_session(self, session_id: str) -> None:
         """Evict per-session token and credit baseline tracking for `session_id`."""
         if not session_id:
@@ -161,7 +261,8 @@ class QuotaTracker:
         if not session_id or session_id in self._last_session_effective_credits:
             return
         with contextlib.suppress(Exception):
-            five_hour, seven_day = await self._fetch_both_quotas()
+            active_tier = await self._resolve_tier()
+            five_hour, seven_day = await self._fetch_both_quotas(tier=active_tier)
             credits_info = await self._provider.fetch_credits()
             g1_overage = int(credits_info.get("remaining_credits", 0))
             kiro_credits = self.calculate_effective_kiro_credits(
@@ -169,6 +270,7 @@ class QuotaTracker:
                 seven_day["buckets"],
                 model_id=model_id,
                 g1_overage_credits=g1_overage,
+                tier=active_tier,
             )
             self._last_session_effective_credits[session_id] = float(
                 kiro_credits["effective_credits"]
@@ -268,16 +370,28 @@ class QuotaTracker:
         return raw_buckets
 
     @classmethod
-    def _format_bucket(cls, raw_bucket: dict[str, Any], *, window: str) -> dict[str, Any]:
+    def _format_bucket(
+        cls,
+        raw_bucket: dict[str, Any],
+        *,
+        window: str,
+        tier: Mapping[str, Any] | str | None = None,
+    ) -> dict[str, Any]:
         """Enrich a raw quota bucket with remaining/used percentages and Kiro credit equivalents."""
         remaining_fraction = float(raw_bucket["remaining_fraction"])
         remaining_percent = round(remaining_fraction * 100.0, 2)
         used_percent = round((1.0 - remaining_fraction) * 100.0, 2)
-        credit_capacity = (
-            cls.WEEKLY_CREDIT_CAPACITY
-            if window in {"7d", "weekly"}
-            else cls.FIVE_HOUR_CREDIT_CAPACITY
-        )
+        if tier is not None:
+            spec = resolve_plan_credit_spec(tier)
+            credit_capacity = (
+                spec.weekly_capacity if window in {"7d", "weekly"} else spec.five_hour_capacity
+            )
+        else:
+            credit_capacity = (
+                cls.WEEKLY_CREDIT_CAPACITY
+                if window in {"7d", "weekly"}
+                else cls.FIVE_HOUR_CREDIT_CAPACITY
+            )
         remaining_credits = round(remaining_fraction * credit_capacity, 2)
         return {
             "id": raw_bucket["id"],
@@ -300,9 +414,17 @@ class QuotaTracker:
         *,
         model_id: str | None = None,
         g1_overage_credits: int = 0,
+        tier: Mapping[str, Any] | str | None = None,
     ) -> dict[str, Any]:
-        """Convert 7d (1000) and 5h (200) quotas to Kiro credits, picking min and its reset."""
+        """Convert tier-scaled 7d and 5h quotas to Kiro credits, picking min and its reset."""
         prefer_gemini = model_id is None or "gemini" in model_id.lower()
+        spec = resolve_plan_credit_spec(tier) if tier is not None else None
+        default_5h_capacity = (
+            spec.five_hour_capacity if spec is not None else cls.FIVE_HOUR_CREDIT_CAPACITY
+        )
+        default_7d_capacity = (
+            spec.weekly_capacity if spec is not None else cls.WEEKLY_CREDIT_CAPACITY
+        )
 
         def _pick_group_bucket(buckets: list[dict[str, Any]]) -> dict[str, Any] | None:
             for bucket in buckets:
@@ -314,11 +436,22 @@ class QuotaTracker:
         bucket_5h = _pick_group_bucket(five_hour_buckets)
         bucket_7d = _pick_group_bucket(seven_day_buckets)
 
+        cap_5h = (
+            float(bucket_5h.get("credit_capacity", default_5h_capacity))
+            if bucket_5h is not None
+            else default_5h_capacity
+        )
+        cap_7d = (
+            float(bucket_7d.get("credit_capacity", default_7d_capacity))
+            if bucket_7d is not None
+            else default_7d_capacity
+        )
+
         credits_5h = (
             float(
                 bucket_5h.get(
                     "remaining_credits",
-                    float(bucket_5h.get("remaining_fraction", 0.0)) * cls.FIVE_HOUR_CREDIT_CAPACITY,
+                    float(bucket_5h.get("remaining_fraction", 0.0)) * cap_5h,
                 )
             )
             if bucket_5h is not None
@@ -328,7 +461,7 @@ class QuotaTracker:
             float(
                 bucket_7d.get(
                     "remaining_credits",
-                    float(bucket_7d.get("remaining_fraction", 0.0)) * cls.WEEKLY_CREDIT_CAPACITY,
+                    float(bucket_7d.get("remaining_fraction", 0.0)) * cap_7d,
                 )
             )
             if bucket_7d is not None
@@ -342,24 +475,34 @@ class QuotaTracker:
         ):
             bottleneck_window = "7d"
             quota_credits = round(credits_7d, 2)
-            base_capacity = cls.WEEKLY_CREDIT_CAPACITY
+            base_capacity = cap_7d
             reset_time = str(bucket_7d.get("reset_time", ""))
             active_group = str(bucket_7d.get("group", ""))
         elif bucket_5h is not None and credits_5h is not None:
             bottleneck_window = "5h"
             quota_credits = round(credits_5h, 2)
-            base_capacity = cls.FIVE_HOUR_CREDIT_CAPACITY
+            base_capacity = cap_5h
             reset_time = str(bucket_5h.get("reset_time", ""))
             active_group = str(bucket_5h.get("group", ""))
         else:
             bottleneck_window = "5h"
             quota_credits = 0.0
-            base_capacity = cls.FIVE_HOUR_CREDIT_CAPACITY
+            base_capacity = default_5h_capacity
             reset_time = ""
             active_group = "Gemini Models" if prefer_gemini else "Claude and GPT models"
 
         effective_credits = round(quota_credits + float(g1_overage_credits), 2)
-        return {
+        tier_id = (
+            str(tier.get("id") or "").strip()
+            if isinstance(tier, Mapping)
+            else (tier.strip() if isinstance(tier, str) else "")
+        )
+        tier_name = (
+            str(tier.get("name") or "").strip()
+            if isinstance(tier, Mapping)
+            else (spec.label if spec is not None and tier_id else "")
+        )
+        result: dict[str, Any] = {
             "effective_credits": effective_credits,
             "quota_credits": quota_credits,
             "g1_overage_credits": g1_overage_credits,
@@ -370,21 +513,27 @@ class QuotaTracker:
             "five_hour_credits": round(credits_5h, 2) if credits_5h is not None else 0.0,
             "seven_day_credits": round(credits_7d, 2) if credits_7d is not None else 0.0,
         }
+        if tier_id:
+            result["tier_id"] = tier_id
+            result["tier_name"] = tier_name or resolve_plan_credit_spec(tier_id).label
+        return result
 
     async def _fetch_both_quotas(
         self,
         *,
         group: str | None = None,
+        tier: Mapping[str, Any] | str | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Fetch raw quota groups once and partition into formatted 5h and 7d snapshots."""
+        active_tier = tier if tier is not None else await self._resolve_tier()
         raw = await self._extract_raw_buckets(group=group)
         five_hour_buckets = [
-            self._format_bucket(bucket, window="5h")
+            self._format_bucket(bucket, window="5h", tier=active_tier)
             for bucket in raw
             if bucket.get("window") == "5h"
         ]
         seven_day_buckets = [
-            self._format_bucket(bucket, window="7d")
+            self._format_bucket(bucket, window="7d", tier=active_tier)
             for bucket in raw
             if bucket.get("window") in {"weekly", "7d"}
         ]
@@ -395,8 +544,9 @@ class QuotaTracker:
 
     async def get_five_hour_quota(self, *, group: str | None = None) -> dict[str, Any]:
         """Return 5-hour rolling quota buckets and reset times."""
+        active_tier = await self._resolve_tier()
         buckets = [
-            self._format_bucket(bucket, window="5h")
+            self._format_bucket(bucket, window="5h", tier=active_tier)
             for bucket in await self._extract_raw_buckets(group=group)
             if bucket.get("window") == "5h"
         ]
@@ -404,8 +554,9 @@ class QuotaTracker:
 
     async def get_seven_day_quota(self, *, group: str | None = None) -> dict[str, Any]:
         """Return 7-day (weekly) rolling quota buckets and reset times."""
+        active_tier = await self._resolve_tier()
         buckets = [
-            self._format_bucket(bucket, window="7d")
+            self._format_bucket(bucket, window="7d", tier=active_tier)
             for bucket in await self._extract_raw_buckets(group=group)
             if bucket.get("window") in {"weekly", "7d"}
         ]
@@ -413,18 +564,21 @@ class QuotaTracker:
 
     async def get_credits_and_tokens(self, *, group: str | None = None) -> dict[str, Any]:
         """Return G1 credit balance, converted Kiro quota credits, and session token ledger."""
+        active_tier = await self._resolve_tier()
         credits = await self._provider.fetch_credits()
-        five_hour, seven_day = await self._fetch_both_quotas(group=group)
+        five_hour, seven_day = await self._fetch_both_quotas(group=group, tier=active_tier)
         g1_overage = int(credits.get("remaining_credits", 0))
         kiro_credits = self.calculate_effective_kiro_credits(
             five_hour["buckets"],
             seven_day["buckets"],
             model_id=group,
             g1_overage_credits=g1_overage,
+            tier=active_tier,
         )
         return {
             "remaining_credits": g1_overage,
             "upgrade_uri": credits.get("upgrade_uri"),
+            "tier": active_tier,
             "kiro_credits": kiro_credits,
             "token_usage": {
                 "input_tokens": self.input_tokens,
@@ -437,7 +591,8 @@ class QuotaTracker:
 
     async def get_unified_status(self, *, group: str | None = None) -> dict[str, Any]:
         """Return combined 5-hour, 7-day, credit, and token usage snapshot."""
-        five_hour, seven_day = await self._fetch_both_quotas(group=group)
+        active_tier = await self._resolve_tier()
+        five_hour, seven_day = await self._fetch_both_quotas(group=group, tier=active_tier)
         raw_credits = await self._provider.fetch_credits()
         g1_overage = int(raw_credits.get("remaining_credits", 0))
         kiro_credits = self.calculate_effective_kiro_credits(
@@ -445,10 +600,12 @@ class QuotaTracker:
             seven_day["buckets"],
             model_id=group,
             g1_overage_credits=g1_overage,
+            tier=active_tier,
         )
         return {
             "five_hour": five_hour,
             "seven_day": seven_day,
+            "tier": active_tier,
             "credits": {
                 **raw_credits,
                 "kiro_credits": kiro_credits,
@@ -490,7 +647,8 @@ class QuotaTracker:
             context_tokens=active_context_tokens,
         )
 
-        five_hour, seven_day = await self._fetch_both_quotas()
+        active_tier = await self._resolve_tier()
+        five_hour, seven_day = await self._fetch_both_quotas(tier=active_tier)
         credits_info = await self._provider.fetch_credits()
         g1_overage = int(credits_info.get("remaining_credits", 0))
         kiro_credits = self.calculate_effective_kiro_credits(
@@ -498,6 +656,7 @@ class QuotaTracker:
             seven_day["buckets"],
             model_id=model_id,
             g1_overage_credits=g1_overage,
+            tier=active_tier,
         )
         context_usage_pct = round((active_context_tokens / self.CONTEXT_WINDOW_SIZE) * 100.0, 4)
         effective_credits = float(kiro_credits["effective_credits"])
@@ -535,6 +694,11 @@ class QuotaTracker:
                 }
             },
         }
+        if active_tier is not None and active_tier.get("id"):
+            metadata_params["planTierId"] = active_tier["id"]
+            metadata_params["planTierName"] = (
+                active_tier.get("name") or resolve_plan_credit_spec(active_tier).label
+            )
 
         all_buckets = [*five_hour["buckets"], *seven_day["buckets"]]
         exhausted = [bucket for bucket in all_buckets if float(bucket["remaining_fraction"]) <= 0.0]
@@ -621,10 +785,18 @@ class QuotaTracker:
         if not normalized.startswith("/"):
             normalized = f"/{normalized}"
 
-        five_hour_snap, seven_day_snap = await self._fetch_both_quotas()
+        active_tier = await self._resolve_tier()
+        five_hour_snap, seven_day_snap = await self._fetch_both_quotas(tier=active_tier)
         five_hour = five_hour_snap["buckets"]
         seven_day = seven_day_snap["buckets"]
         credits = await self._provider.fetch_credits()
+        g1_overage = int(credits.get("remaining_credits", 0))
+        kiro_credits = self.calculate_effective_kiro_credits(
+            five_hour,
+            seven_day,
+            g1_overage_credits=g1_overage,
+            tier=active_tier,
+        )
         tokens = {
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
@@ -633,7 +805,7 @@ class QuotaTracker:
             "total_tokens": self.total_tokens,
         }
         credits_and_tokens = {
-            "remaining_credits": int(credits.get("remaining_credits", 0)),
+            "remaining_credits": g1_overage,
             "upgrade_uri": credits.get("upgrade_uri"),
         }
 
@@ -656,10 +828,16 @@ class QuotaTracker:
                 f"{reset_display} |"
             )
 
+        lines.extend(["", "**Credits & Session Tokens**"])
+        if active_tier is not None and active_tier.get("id"):
+            spec = resolve_plan_credit_spec(active_tier)
+            tier_label = active_tier.get("name") or spec.label
+            lines.append(f"- Plan Tier: `{tier_label}` (`{active_tier['id']}`)")
         lines.extend(
             [
-                "",
-                "**Credits & Session Tokens**",
+                f"- Effective Kiro Credits: `{kiro_credits['effective_credits']:.1f} / "
+                f"{kiro_credits['credit_capacity']:.0f}` "
+                f"(`{kiro_credits['bottleneck_window']}` bottleneck)",
                 f"- Remaining Credits: `{credits_and_tokens['remaining_credits']}` "
                 f"({credits_and_tokens['upgrade_uri']})",
                 f"- Input Tokens: `{tokens['input_tokens']}`",

@@ -6,12 +6,14 @@ import contextlib
 import json
 import os
 import sqlite3
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 MODELS_CACHE_TTL_SECONDS: float = 86_400.0
+TIER_CACHE_TTL_SECONDS: float = 86_400.0
+_ACCOUNT_TIER_KV_KEY: str = "account_tier"
 
 
 def _is_cache_timestamp_expired(raw_updated_at: Any, *, max_age_seconds: float) -> bool:
@@ -716,3 +718,47 @@ class SqliteStateStoreProvider:
         if row is None:
             return None
         return json.loads(row["value_json"])
+
+    def save_tier(self, tier: Mapping[str, Any] | None) -> dict[str, str] | None:
+        """Persist normalized Antigravity plan tier metadata in `kv_state`."""
+        if not isinstance(tier, Mapping):
+            return None
+        tier_id = str(tier.get("id") or "").strip()
+        if not tier_id:
+            return None
+        normalized = {
+            "id": tier_id,
+            "name": str(tier.get("name") or "").strip(),
+            "upgradeUri": str(tier.get("upgradeUri") or "").strip(),
+        }
+        self.set_kv(
+            _ACCOUNT_TIER_KV_KEY,
+            {
+                **normalized,
+                "updated_at": datetime.now(UTC).isoformat(),
+            },
+        )
+        return normalized
+
+    def load_tier(
+        self,
+        *,
+        max_age_seconds: float | None = TIER_CACHE_TTL_SECONDS,
+    ) -> dict[str, str] | None:
+        """Load cached Antigravity plan tier from `kv_state` when within `max_age_seconds`."""
+        raw = self.get_kv(_ACCOUNT_TIER_KV_KEY)
+        if not isinstance(raw, Mapping):
+            return None
+        tier_id = str(raw.get("id") or "").strip()
+        if not tier_id:
+            return None
+        if max_age_seconds is not None and _is_cache_timestamp_expired(
+            raw.get("updated_at"),
+            max_age_seconds=max_age_seconds,
+        ):
+            return None
+        return {
+            "id": tier_id,
+            "name": str(raw.get("name") or "").strip(),
+            "upgradeUri": str(raw.get("upgradeUri") or "").strip(),
+        }

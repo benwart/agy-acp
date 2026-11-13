@@ -903,3 +903,225 @@ async def test_run_agy_slash_json_and_quota_provider_decoupled_from_acp_client(
         "remaining_credits": 77,
         "upgrade_uri": None,
     }
+
+
+def test_state_store_save_and_load_tier_with_ttl(tmp_path: Any) -> None:
+    """Verify `SqliteStateStoreProvider` persists account tier with TTL and stale fallback."""
+    from datetime import UTC, datetime, timedelta
+
+    from agy_acp.providers.state_store import TIER_CACHE_TTL_SECONDS, SqliteStateStoreProvider
+
+    store = SqliteStateStoreProvider(tmp_path / "state.db")
+    assert store.load_tier() is None
+
+    store.save_tier({"id": "g1-ultra-tier", "name": "Google AI Ultra", "upgradeUri": ""})
+    loaded = store.load_tier()
+    assert loaded == {
+        "id": "g1-ultra-tier",
+        "name": "Google AI Ultra",
+        "upgradeUri": "",
+    }
+
+    # Ignoring empty/invalid tier payloads preserves prior valid cache
+    store.save_tier({})
+    assert store.load_tier() == loaded
+
+    # Expire cached timestamp beyond TIER_CACHE_TTL_SECONDS
+    stale_ts = (datetime.now(UTC) - timedelta(seconds=TIER_CACHE_TTL_SECONDS + 60)).isoformat()
+    store.set_kv(
+        "account_tier",
+        {
+            "id": "g1-ultra-tier",
+            "name": "Google AI Ultra",
+            "upgradeUri": "",
+            "updated_at": stale_ts,
+        },
+    )
+    assert store.load_tier() is None
+    assert store.load_tier(max_age_seconds=None) == loaded
+
+
+def test_resolve_plan_credit_spec_all_tiers_and_fallback() -> None:
+    """Verify tier-to-credit capacity table across Free, Plus, Pro, Ultra 5x, and Ultra 20x."""
+    from agy_acp.logic.quota_tracker import resolve_plan_credit_spec
+
+    ultra_20x = resolve_plan_credit_spec({"id": "g1-ultra-tier", "name": "Google AI Ultra"})
+    assert ultra_20x.tier_id == "g1-ultra-tier"
+    assert ultra_20x.weekly_capacity == 4_000.0
+    assert ultra_20x.five_hour_capacity == 800.0
+
+    enum_style = resolve_plan_credit_spec("G1_ULTRA_TIER")
+    assert enum_style.weekly_capacity == 4_000.0
+    assert enum_style.five_hour_capacity == 800.0
+
+    ultra_5x = resolve_plan_credit_spec({"id": "g1-ultra-lite-tier", "name": "Google AI Ultra"})
+    assert ultra_5x.weekly_capacity == 1_000.0
+    assert ultra_5x.five_hour_capacity == 200.0
+
+    pro = resolve_plan_credit_spec("g1-pro-tier")
+    assert pro.weekly_capacity == 200.0
+    assert pro.five_hour_capacity == 40.0
+
+    plus = resolve_plan_credit_spec("g1-plus-tier")
+    assert plus.weekly_capacity == 100.0
+    assert plus.five_hour_capacity == 20.0
+
+    free = resolve_plan_credit_spec("free-tier")
+    assert free.weekly_capacity == 40.0
+    assert free.five_hour_capacity == 8.0
+
+    fallback_none = resolve_plan_credit_spec(None)
+    assert fallback_none.weekly_capacity == 1_000.0
+    assert fallback_none.five_hour_capacity == 200.0
+
+    fallback_unknown = resolve_plan_credit_spec({"id": "mystery-enterprise-tier"})
+    assert fallback_unknown.weekly_capacity == 1_000.0
+    assert fallback_unknown.five_hour_capacity == 200.0
+
+
+async def test_quota_tracker_scales_credits_and_deltas_by_ultra_20x_tier(tmp_path: Any) -> None:
+    """Verify `g1-ultra-tier` scales 7d/5h capacities to 4000/800 across status and wire."""
+    from agy_acp.providers.state_store import SqliteStateStoreProvider
+
+    class _UltraDroppingProvider(QuotaProvider):
+        def __init__(self) -> None:
+            super().__init__(cli_provider=_StubSlashRunner())
+            self.fractions = [0.95, 0.94]
+            self.tier_calls = 0
+
+        async def fetch_quota_groups(self) -> list[dict[str, Any]]:
+            frac = self.fractions.pop(0) if self.fractions else 0.94
+            return [
+                {
+                    "group": "Gemini Models",
+                    "buckets": [
+                        {
+                            "id": "gemini-5h",
+                            "group": "Gemini Models",
+                            "name": "Five Hour Limit Remaining",
+                            "window": "5h",
+                            "remaining_fraction": frac,
+                            "reset_time": "2026-10-24T07:52:04Z",
+                        },
+                        {
+                            "id": "gemini-weekly",
+                            "group": "Gemini Models",
+                            "name": "Weekly Limit Remaining",
+                            "window": "weekly",
+                            "remaining_fraction": 0.39,
+                            "reset_time": "2026-10-24T12:34:28Z",
+                        },
+                    ],
+                }
+            ]
+
+        async def fetch_credits(self) -> dict[str, Any]:
+            return {"remaining_credits": 0, "upgrade_uri": ""}
+
+        async def fetch_tier(self) -> dict[str, str] | None:
+            self.tier_calls += 1
+            return {"id": "g1-ultra-tier", "name": "Google AI Ultra", "upgradeUri": ""}
+
+    store = SqliteStateStoreProvider(tmp_path / "state.db")
+    provider = _UltraDroppingProvider()
+    tracker = QuotaTracker(provider=provider, state_store=store)
+
+    # First call resolves tier via provider.fetch_tier() and persists to state_store
+    await tracker.seed_session_baseline("sess-ultra", model_id="gemini-3.7-pro")
+    assert provider.tier_calls == 1
+    assert store.load_tier() == {
+        "id": "g1-ultra-tier",
+        "name": "Google AI Ultra",
+        "upgradeUri": "",
+    }
+    # 0.95 * 800 = 760.0 vs 0.39 * 4000 = 1560.0 -> 5h bottleneck = 760.0
+    assert tracker._last_session_effective_credits["sess-ultra"] == 760.0
+
+    # Turn 1 drops 0.95 -> 0.94 (760.0 -> 752.0 => delta_credits = 8.0, zero extra fetch_tier calls)
+    telemetry = await tracker.build_turn_telemetry(
+        session_id="sess-ultra",
+        model_id="gemini-3.7-pro",
+        input_tokens=500,
+        output_tokens=100,
+        context_tokens=600,
+    )
+    assert provider.tier_calls == 1
+    assert telemetry.delta_credits == 8.0
+    assert telemetry.metadata_params["credits"] == 752.0
+    assert telemetry.metadata_params["quotaCredits"] == 752.0
+    assert telemetry.metadata_params["creditsCapacity"] == 800.0
+    assert telemetry.metadata_params["creditsBottleneckWindow"] == "5h"
+    assert telemetry.metadata_params["planTierId"] == "g1-ultra-tier"
+    assert telemetry.metadata_params["planTierName"] == "Google AI Ultra"
+    kiro_meta = telemetry.metadata_params["_meta"]["quota"]["kiro_credits"]
+    assert kiro_meta["five_hour_credits"] == 752.0
+    assert kiro_meta["seven_day_credits"] == 1_560.0
+    assert kiro_meta["tier_id"] == "g1-ultra-tier"
+
+    # Slash command Markdown includes plan tier & scaled Kiro credits
+    md = await tracker.format_slash_command_response("/usage")
+    assert "Google AI Ultra" in md
+    assert "752.0 / 800" in md
+
+    # Updating state_store tier mid-process immediately switches capacities without restart
+    store.save_tier({"id": "g1-pro-tier", "name": "Google AI Pro", "upgradeUri": ""})
+    status = await tracker.get_unified_status(group="Gemini Models")
+    assert status["five_hour"]["buckets"][0]["credit_capacity"] == 40.0
+    assert status["seven_day"]["buckets"][0]["credit_capacity"] == 200.0
+    assert status["credits"]["kiro_credits"]["credit_capacity"] == 40.0
+
+
+async def test_run_agy_acp_tier_json_and_quota_provider_fetch_tier(tmp_path: Any) -> None:
+    """Verify `run_agy_acp_tier_json` probes `agy acp` without importing `agy_acp_client`."""
+    import stat
+
+    from agy_acp.providers.quota_provider import QuotaProvider, run_agy_acp_tier_json
+
+    fake_acp = tmp_path / "fake-agy-tier"
+    fake_acp.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "for line in sys.stdin:\n"
+        "    if not line.strip(): continue\n"
+        "    msg = json.loads(line)\n"
+        "    mid = msg.get('id')\n"
+        "    method = msg.get('method')\n"
+        "    if method == 'initialize':\n"
+        "        caps = {'_meta': {'antigravity': {'tier': True}}}\n"
+        "        res = {'jsonrpc': '2.0', 'id': mid, 'result': {\n"
+        "            'protocolVersion': 1, 'agentCapabilities': caps\n"
+        "        }}\n"
+        "        sys.stdout.write(json.dumps(res) + '\\n')\n"
+        "        sys.stdout.flush()\n"
+        "    elif method == 'authenticate':\n"
+        "        sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':mid,'result':{\n"
+        "            '_meta': {'antigravity': {'tier': {\n"
+        "                'id': 'g1-ultra-tier',\n"
+        "                'name': 'Google AI Ultra',\n"
+        "                'upgradeUri': '',\n"
+        "            }}}\n"
+        "        }}) + '\\n')\n"
+        "        sys.stdout.flush()\n",
+        encoding="utf-8",
+    )
+    fake_acp.chmod(fake_acp.stat().st_mode | stat.S_IEXEC)
+
+    tier = await run_agy_acp_tier_json(agy_bin=fake_acp)
+    assert tier == {
+        "id": "g1-ultra-tier",
+        "name": "Google AI Ultra",
+        "upgradeUri": "",
+    }
+
+    standalone = QuotaProvider(agy_bin=fake_acp)
+    assert await standalone.fetch_tier() == tier
+
+    class _DuckWithTier:
+        async def discover_tier(self) -> dict[str, str]:
+            return {"id": "g1-pro-tier", "name": "Google AI Pro", "upgradeUri": ""}
+
+    assert await QuotaProvider(cli_provider=_DuckWithTier()).fetch_tier() == {
+        "id": "g1-pro-tier",
+        "name": "Google AI Pro",
+        "upgradeUri": "",
+    }

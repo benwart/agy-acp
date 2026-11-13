@@ -184,6 +184,8 @@ def render_rich_quota_status(
             g1_overage_credits=int(credits.get("remaining_credits", 0)),
         )
     bottleneck_reset = format_reset_time(str(kiro_credits.get("reset_time", "")), now=now)
+    tier_name = str(kiro_credits.get("tier_name") or "").strip()
+    tier_prefix = f"{tier_name}, " if tier_name else ""
     active_console.print()
     active_console.print(
         Text.assemble(
@@ -193,7 +195,8 @@ def render_rich_quota_status(
                 "cyan",
             ),
             (
-                f" ({kiro_credits['bottleneck_window']} bottleneck, resets {bottleneck_reset})",
+                f" ({tier_prefix}{kiro_credits['bottleneck_window']} bottleneck, "
+                f"resets {bottleneck_reset})",
                 "dim",
             ),
             (

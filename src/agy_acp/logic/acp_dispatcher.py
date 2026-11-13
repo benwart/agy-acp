@@ -42,6 +42,7 @@ from agy_acp.logic.wire import (
     WireTurnTelemetry,
 )
 from agy_acp.providers.acp_logger import log_acp_event
+from agy_acp.providers.quota_provider import QuotaProvider
 
 MAX_FRAME_SIZE_BYTES = 16 * 1024 * 1024
 SLASH_QUOTA_COMMANDS = frozenset({"/quota", "/usage", "/credits"})
@@ -526,7 +527,8 @@ class AcpDispatcher:
         self._session_manager = session_manager or SessionManager(wire_adapter=resolved_adapter)
         self._auth_manager = auth_manager
         self._quota_tracker = quota_tracker or QuotaTracker(
-            state_store=self._session_manager.state_store
+            provider=QuotaProvider(cli_provider=self._session_manager.cli_provider),
+            state_store=self._session_manager.state_store,
         )
         self._post_response_ctx: contextvars.ContextVar[list[dict[str, Any]] | None] = (
             contextvars.ContextVar(f"agy_acp_post_notifs_{id(self)}", default=None)

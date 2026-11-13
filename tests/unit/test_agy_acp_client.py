@@ -685,9 +685,28 @@ for raw_line in sys.stdin:
                 ],
                 "_meta": {
                     "antigravity": {
-                        "tier": {"id": "g1-ultra-lite-tier", "name": "Google AI Ultra"}
+                        "tier": {
+                            "id": os.environ.get("MOCK_AGY_TIER_ID", "g1-ultra-lite-tier"),
+                            "name": os.environ.get("MOCK_AGY_TIER_NAME", "Google AI Ultra"),
+                        }
                     }
                 },
+            },
+        })
+    elif method == "authenticate":
+        send_frame({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "_meta": {
+                    "antigravity": {
+                        "tier": {
+                            "id": os.environ.get("MOCK_AGY_TIER_ID", "g1-ultra-lite-tier"),
+                            "name": os.environ.get("MOCK_AGY_TIER_NAME", "Google AI Ultra"),
+                            "upgradeUri": "",
+                        }
+                    }
+                }
             },
         })
     elif method == "session/load":
@@ -1649,3 +1668,59 @@ async def test_w4_reevaluate_populated_input_fail_closed_callbacks_and_shielded_
         await anyio.sleep(0.02)
     with pytest.raises(ProcessLookupError):
         os.kill(spawned_pid, 0)
+
+
+async def test_discover_tier_and_session_caching_persists_ultra_tier(tmp_path: Path) -> None:
+    """Verify `discover_tier`, `discover_models`, and `create_backend_session` persist tier."""
+    script, state_file = _make_mock_agy(tmp_path)
+    store = SqliteStateStoreProvider(tmp_path / "tier-state")
+
+    async with AgyAcpClientProvider(
+        bin_path=script,
+        state_store=store,
+        env={
+            "MOCK_AGY_STATE_FILE": str(state_file),
+            "MOCK_AGY_TIER_ID": "g1-ultra-tier",
+            "MOCK_AGY_TIER_NAME": "Google AI Ultra",
+        },
+    ) as client:
+        tier = await client.discover_tier()
+        assert tier == {
+            "id": "g1-ultra-tier",
+            "name": "Google AI Ultra",
+            "upgradeUri": "",
+        }
+        assert store.load_tier() == tier
+
+        recvs_first = [
+            r["msg"]["method"]
+            for r in _read_mock_records(state_file)
+            if r["type"] == "recv" and "method" in r["msg"]
+        ]
+        assert recvs_first == ["initialize", "authenticate"]
+
+        # Second call serves from SQLite cache without extra authenticate RPC
+        assert await client.discover_tier() == tier
+        recvs_second = [
+            r["msg"]["method"]
+            for r in _read_mock_records(state_file)
+            if r["type"] == "recv" and "method" in r["msg"]
+        ]
+        assert recvs_second == ["initialize", "authenticate"]
+
+    # Also verify discover_models populates tier in a fresh store
+    models_store = SqliteStateStoreProvider(tmp_path / "models-tier-state")
+    async with AgyAcpClientProvider(
+        bin_path=script,
+        state_store=models_store,
+        env={
+            "MOCK_AGY_STATE_FILE": str(state_file),
+            "MOCK_AGY_TIER_ID": "g1-ultra-tier",
+        },
+    ) as client2:
+        await client2.discover_models(cwd=str(tmp_path))
+        assert models_store.load_tier() == {
+            "id": "g1-ultra-tier",
+            "name": "Google AI Ultra",
+            "upgradeUri": "",
+        }

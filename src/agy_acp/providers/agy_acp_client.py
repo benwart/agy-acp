@@ -594,6 +594,7 @@ class _AcpSubprocessConnection:
         self.session_results: dict[str, dict[str, Any]] = {}
         self.session_prefs: dict[str, tuple[str, str, str]] = {}
         self.initialized = False
+        self.supports_tier = False
         self._tg_stack: contextlib.AsyncExitStack | None = None
 
     @property
@@ -1012,7 +1013,7 @@ class AgyAcpClientProvider:
             )
             await conn.start(supervisor_tg=self._supervisor_tg)
             try:
-                await conn.request(
+                init_res = await conn.request(
                     "initialize",
                     {"protocolVersion": 1, "clientCapabilities": {}},
                     timeout=self._rpc_timeout,
@@ -1021,6 +1022,15 @@ class AgyAcpClientProvider:
                 await conn.close()
                 raise
             conn.initialized = True
+            caps = init_res.get("agentCapabilities")
+            caps_meta = caps.get("_meta") if isinstance(caps, Mapping) else None
+            caps_agy = caps_meta.get("antigravity") if isinstance(caps_meta, Mapping) else None
+            top_meta = init_res.get("_meta")
+            top_agy = top_meta.get("antigravity") if isinstance(top_meta, Mapping) else None
+            conn.supports_tier = bool(
+                (isinstance(caps_agy, Mapping) and caps_agy.get("tier"))
+                or (isinstance(top_agy, Mapping) and top_agy.get("tier"))
+            )
             self._conn = conn
             return conn
 
@@ -1049,6 +1059,38 @@ class AgyAcpClientProvider:
             self._store.save_models(models)
         return models
 
+    def _cache_tier(self, tier: Mapping[str, Any] | None) -> dict[str, str] | None:
+        return self._store.save_tier(tier)
+
+    async def discover_tier(self, *, refresh: bool = False) -> dict[str, str] | None:
+        """Return cached Antigravity plan tier or probe `authenticate` on `agy acp`."""
+        if (
+            type(self) is not AgyAcpClientProvider
+            and type(self).discover_tier is AgyAcpClientProvider.discover_tier
+        ):
+            return self._store.load_tier() if self._is_custom_store else None
+
+        if not refresh:
+            stored = self._store.load_tier()
+            if stored is not None:
+                return stored
+            if self._is_custom_store and not self.has_explicit_bin and self._conn is None:
+                return None
+
+        with contextlib.suppress(AgyAcpError, OSError, TimeoutError):
+            conn = await self._ensure_connection()
+            if conn.supports_tier:
+                res = await conn.request(
+                    "authenticate",
+                    {"methodId": "oauth-personal"},
+                    timeout=min(self._rpc_timeout, 10.0),
+                )
+                cached = self._cache_tier(self._extract_tier(res))
+                if cached is not None:
+                    return cached
+
+        return self._store.load_tier(max_age_seconds=None)
+
     async def discover_models(
         self,
         *,
@@ -1072,6 +1114,7 @@ class AgyAcpClientProvider:
                 timeout=self._rpc_timeout,
             )
             temp_sid = str(res.get("sessionId") or "").strip()
+            self._cache_tier(self._extract_tier(res))
             models_block = res.get("models")
             raw_avail = (
                 models_block.get("availableModels") if isinstance(models_block, Mapping) else None
@@ -1198,12 +1241,14 @@ class AgyAcpClientProvider:
             available_models=models,
         )
         conn.session_prefs[sid] = (model or "", mode, effort or "")
+        extracted_tier = self._extract_tier(res)
+        self._cache_tier(extracted_tier)
         return {
             "agySessionId": sid,
             "models": models,
             "currentModelId": resolved_model,
             "fallbackFromModel": fallback_from,
-            "tier": self._extract_tier(res),
+            "tier": extracted_tier,
             "modes": dict(res["modes"]) if isinstance(res.get("modes"), Mapping) else {},
             "configOptions": (
                 list(res["configOptions"]) if isinstance(res.get("configOptions"), list) else []
