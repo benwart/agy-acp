@@ -8,6 +8,7 @@ import os
 import re
 import signal
 import subprocess
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -19,6 +20,7 @@ from anyio.streams.buffered import BufferedByteReceiveStream
 
 from agy_acp.logic.custom_agents import AgentOrigin
 from agy_acp.logic.wire.base import McpServerStatus, McpToolDef
+from agy_acp.providers.telemetry import get_telemetry
 
 MCP_PROTOCOL_LATEST = "2025-03-26"
 MCP_PROTOCOL_LEGACY = "2024-11-05"
@@ -368,58 +370,78 @@ class McpCatalogProber:
 
         url = server_cfg.get("url")
         command = server_cfg.get("command")
-        try:
-            if isinstance(url, str) and url.strip():
-                return await self._probe_http_server(
+        telemetry = get_telemetry()
+        start_t = time.perf_counter()
+        result_status = "failed"
+        with telemetry.start_span(
+            "mcp.probe",
+            attributes={"mcp.server": name, "mcp.origin": origin},
+        ):
+            try:
+                if isinstance(url, str) and url.strip():
+                    res = await self._probe_http_server(
+                        name=name,
+                        display_name=display_name,
+                        url=url.strip(),
+                        server_cfg=server_cfg,
+                        origin=origin,
+                    )
+                    result_status = res.status
+                    return res
+                if isinstance(command, str) and command.strip():
+                    res = await self._probe_stdio_server(
+                        name=name,
+                        display_name=display_name,
+                        command=command.strip(),
+                        server_cfg=server_cfg,
+                        session_env=session_env,
+                        cwd=cwd,
+                        origin=origin,
+                    )
+                    result_status = res.status
+                    return res
+                return McpServerStatus(
                     name=name,
                     display_name=display_name,
-                    url=url.strip(),
-                    server_cfg=server_cfg,
+                    status="failed",
+                    error="MCP server config specifies neither 'command' nor 'url'",
                     origin=origin,
                 )
-            if isinstance(command, str) and command.strip():
-                return await self._probe_stdio_server(
+            except TimeoutError:
+                result_status = "timeout"
+                return McpServerStatus(
                     name=name,
                     display_name=display_name,
-                    command=command.strip(),
-                    server_cfg=server_cfg,
-                    session_env=session_env,
-                    cwd=cwd,
+                    status="failed",
+                    error=f"MCP server probe timed out after {self._timeout_secs:.2f}s",
                     origin=origin,
                 )
-            return McpServerStatus(
-                name=name,
-                display_name=display_name,
-                status="failed",
-                error="MCP server config specifies neither 'command' nor 'url'",
-                origin=origin,
-            )
-        except TimeoutError:
-            return McpServerStatus(
-                name=name,
-                display_name=display_name,
-                status="failed",
-                error=f"MCP server probe timed out after {self._timeout_secs:.2f}s",
-                origin=origin,
-            )
-        except _HttpAuthRequiredError as auth_err:
-            return McpServerStatus(
-                name=name,
-                display_name=display_name,
-                status="authRequired",
-                auth_url=auth_err.auth_url,
-                failed_authorization=True,
-                error=sanitize_mcp_error(auth_err.detail),
-                origin=origin,
-            )
-        except Exception as exc:  # noqa: BLE001 - prober must contain all transport errors
-            return McpServerStatus(
-                name=name,
-                display_name=display_name,
-                status="failed",
-                error=sanitize_mcp_error(str(exc) or type(exc).__name__),
-                origin=origin,
-            )
+            except _HttpAuthRequiredError as auth_err:
+                result_status = "authRequired"
+                return McpServerStatus(
+                    name=name,
+                    display_name=display_name,
+                    status="authRequired",
+                    auth_url=auth_err.auth_url,
+                    failed_authorization=True,
+                    error=sanitize_mcp_error(auth_err.detail),
+                    origin=origin,
+                )
+            except Exception as exc:  # noqa: BLE001 - prober must contain all transport errors
+                result_status = "failed"
+                return McpServerStatus(
+                    name=name,
+                    display_name=display_name,
+                    status="failed",
+                    error=sanitize_mcp_error(str(exc) or type(exc).__name__),
+                    origin=origin,
+                )
+            finally:
+                telemetry.record_mcp_probe(
+                    name or "unknown",
+                    status=result_status,
+                    duration_s=time.perf_counter() - start_t,
+                )
 
     async def _probe_stdio_server(
         self,

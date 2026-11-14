@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import sqlite3
+import time
 from collections.abc import Generator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -120,6 +121,14 @@ def resolve_state_db_path(save_dir_or_db: Path | str | None = None) -> Path:
     return Path.home() / ".config" / "agy-acp" / "state.db"
 
 
+def _record_sqlite_duration(db_path: Path, operation: str, duration_s: float) -> None:
+    if not operation:
+        return
+    from agy_acp.providers.telemetry import get_telemetry
+
+    get_telemetry(db_path).record_sqlite_operation(operation, duration_s=duration_s)
+
+
 class SqliteStateStoreProvider:
     """Manages SQLite persistence for sessions, steps, discovered models, and token usage."""
 
@@ -152,7 +161,8 @@ class SqliteStateStoreProvider:
                 )
 
     @contextlib.contextmanager
-    def _connect(self) -> Generator[sqlite3.Connection]:
+    def _connect(self, operation: str = "sqlite") -> Generator[sqlite3.Connection]:
+        start_t = time.perf_counter()
         conn = sqlite3.connect(str(self._db_path), timeout=10.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL;")
@@ -167,6 +177,7 @@ class SqliteStateStoreProvider:
             raise
         finally:
             conn.close()
+            _record_sqlite_duration(self._db_path, operation, time.perf_counter() - start_t)
 
     @staticmethod
     def _row_to_session(row: sqlite3.Row) -> dict[str, Any]:
@@ -316,7 +327,7 @@ class SqliteStateStoreProvider:
                 auth_config.pop("_knowledge_entries", None)
         created_at = str(existing.get("createdAt") or now)
 
-        with self._connect() as conn:
+        with self._connect("upsert_session") as conn:
             conn.execute(
                 """
                 INSERT INTO sessions (
@@ -665,9 +676,20 @@ class SqliteStateStoreProvider:
             )
         return self.get_token_ledger(scope=scope)
 
-    def get_token_ledger(self, *, scope: str = "global") -> dict[str, int]:
+    def count_sessions_silent(self) -> int:
+        """Return persisted session count without emitting `sqlite.duration` metrics."""
+        with self._connect("") as conn:
+            row = conn.execute("SELECT COUNT(*) AS cnt FROM sessions").fetchone()
+        return int(row["cnt"]) if row is not None else 0
+
+    def get_token_ledger(
+        self,
+        *,
+        scope: str = "global",
+        record_metric: bool = True,
+    ) -> dict[str, int]:
         """Return cumulative token ledger for `scope` from SQLite."""
-        with self._connect() as conn:
+        with self._connect("get_token_ledger" if record_metric else "") as conn:
             row = conn.execute(
                 """
                 SELECT input_tokens, output_tokens, cached_read_tokens,

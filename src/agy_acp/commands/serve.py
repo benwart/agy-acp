@@ -18,6 +18,7 @@ from agy_acp.logic.quota_tracker import QuotaTracker
 from agy_acp.logic.session_manager import SessionManager
 from agy_acp.logic.wire import EngineWireAdapter, create_wire_adapter
 from agy_acp.providers.acp_logger import log_acp_event, snapshot_relevant_env
+from agy_acp.providers.telemetry import get_telemetry
 
 AGENT_ENGINE_HELP = "Engine [possible values: v2, v3]."
 _V2_ENGINE_ALIASES: frozenset[str] = frozenset({"", "default", "v2", "kiro"})
@@ -76,6 +77,7 @@ async def run_stdio_server(
     async def _write_payloads(payloads: Sequence[dict[str, Any]]) -> None:
         if not payloads:
             return
+        telemetry = get_telemetry(save_dir)
         frames = [dispatcher.serialize_frame(payload) for payload in payloads]
         async with write_lock:
             if stdout_write is not None:
@@ -83,7 +85,8 @@ async def run_stdio_server(
                     await stdout_write(frame)
             else:
                 await _default_write_bytes(b"".join(frames))
-        for payload in payloads:
+        for frame, payload in zip(frames, payloads, strict=True):
+            telemetry.record_frame("out", len(frame))
             log_acp_event(
                 "stdout.frame",
                 save_dir_or_db=save_dir,
@@ -204,6 +207,7 @@ async def run_stdio_server(
                     line = raw_line.strip()
                     if not line:
                         continue
+                    get_telemetry(save_dir).record_frame("in", len(raw_line.encode("utf-8")))
                     try:
                         parsed = json.loads(line)
                     except json.JSONDecodeError as exc:

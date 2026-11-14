@@ -13,6 +13,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import time
 from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -21,6 +22,8 @@ from typing import Any, Self
 import anyio
 import anyio.abc
 from anyio.streams.text import TextReceiveStream
+from opentelemetry import context as otel_context
+from opentelemetry.context import Context
 
 from agy_acp.logic.tool_classifier import (
     FALLBACK_MODELS,
@@ -41,6 +44,7 @@ from agy_acp.logic.tool_classifier import (
 from agy_acp.logic.wire.base import synthesize_task_command
 from agy_acp.providers.acp_logger import log_acp_event
 from agy_acp.providers.state_store import SqliteStateStoreProvider
+from agy_acp.providers.telemetry import get_telemetry
 
 _NATIVE_SUBAGENT_TOOLS: frozenset[str] = frozenset(
     {"invoke_subagent", "define_subagent", "manage_subagents", "invoke_sub_agent"}
@@ -813,6 +817,7 @@ class _ActiveTurnState:
     emitted_any_signal: bool = False
     in_flight_handlers: int = 0
     drained_event: anyio.Event = field(default_factory=anyio.Event)
+    otel_ctx: Context = field(default_factory=otel_context.get_current)
 
     def __post_init__(self) -> None:
         self.drained_event.set()
@@ -987,6 +992,8 @@ class _AcpSubprocessConnection:
         req_id = self._next_id
         slot = _PendingRpc()
         self._pending[req_id] = slot
+        start_t = time.perf_counter()
+        rpc_status = "ok"
         try:
             await self.send_payload(
                 {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}
@@ -997,9 +1004,22 @@ class _AcpSubprocessConnection:
             else:
                 await slot.event.wait()
         except TimeoutError as exc:
+            rpc_status = "timeout"
             raise TimeoutError(f"Timed out waiting for agy acp '{method}' response") from exc
+        except BaseException:
+            rpc_status = "error"
+            raise
         finally:
             self._pending.pop(req_id, None)
+            if slot.error is not None or (
+                isinstance(slot.response, Mapping) and "error" in slot.response
+            ):
+                rpc_status = "error"
+            get_telemetry(self._save_dir_or_db).record_backend_rpc(
+                method,
+                status=rpc_status,
+                duration_s=time.perf_counter() - start_t,
+            )
 
         if slot.error is not None:
             raise slot.error
@@ -1032,6 +1052,7 @@ class _AcpSubprocessConnection:
                 start_new_session=True,
             )
             self._proc = proc
+            get_telemetry(self._save_dir_or_db).record_backend_spawn()
         except BaseException as exc:
             self._spawn_error = AgyAcpTransportError(f"Failed to spawn agy acp: {exc}")
             self._closed = True
@@ -1057,6 +1078,9 @@ class _AcpSubprocessConnection:
                 f"agy acp exited (code={proc.returncode})"
             )
             self._fail_pending(exit_err)
+            get_telemetry(self._save_dir_or_db).record_backend_exit(
+                returncode=proc.returncode if proc.returncode is not None else "unknown"
+            )
             log_acp_event(
                 "agy_acp.exit",
                 save_dir_or_db=self._save_dir_or_db,
@@ -1425,6 +1449,7 @@ class AgyAcpClientProvider:
         except AgyAcpTransportError:
             if not retry_on_disconnect:
                 raise
+            get_telemetry(self._store.db_path).record_backend_reconnect(reason="transport_error")
             conn = await self._ensure_connection(
                 profile_key=profile_key,
                 lazy_mcp_config=lazy_mcp_config,
@@ -1928,6 +1953,7 @@ class AgyAcpClientProvider:
             return
 
         turn.handler_enter()
+        ctx_tok = otel_context.attach(turn.otel_ctx)
         try:
             turn.emitted_any_signal = True
             raw_tc = params_dict.get("toolCall")
@@ -1982,6 +2008,7 @@ class AgyAcpClientProvider:
                     {"outcome": "selected", "optionId": reject_opt},
                 )
         finally:
+            otel_context.detach(ctx_tok)
             turn.handler_exit()
 
     async def _handle_notification(
@@ -2007,9 +2034,11 @@ class AgyAcpClientProvider:
             return
 
         turn.handler_enter()
+        notif_tok = otel_context.attach(turn.otel_ctx)
         try:
             await self._dispatch_turn_update(turn, kind, update)
         finally:
+            otel_context.detach(notif_tok)
             turn.handler_exit()
 
     async def _dispatch_turn_update(
@@ -2365,6 +2394,9 @@ class AgyAcpClientProvider:
                 if transport_failed is not None:
                     if not recovered_once and not turn_state.emitted_any_signal:
                         recovered_once = True
+                        get_telemetry(self._store.db_path).record_backend_reconnect(
+                            reason="turn_recovery"
+                        )
                         continue
                     outcome_error = str(transport_failed)
                     break

@@ -1,0 +1,768 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "End-to-end OpenTelemetry metrics, traces (Tempo), and redacted diagnostic logs (Loki) for agy-acp.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [
+    {
+      "asDropdown": false,
+      "icon": "doc",
+      "includeVars": true,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": true,
+      "title": "Explore ACP Logs (Loki)",
+      "tooltip": "Open correlated structured ACP logs in Grafana Explore",
+      "type": "link",
+      "url": "/explore?orgId=1&left=%7B%22datasource%22:%22loki%22,%22queries%22:%5B%7B%22refId%22:%22A%22,%22expr%22:%22%7Bservice_name%3D%5C%22agy-acp%5C%22%7D%22%7D%5D,%22range%22:%7B%22from%22:%22$%7B__from%7D%22,%22to%22:%22$%7B__to%7D%22%7D%7D"
+    },
+    {
+      "asDropdown": false,
+      "icon": "bolt",
+      "includeVars": true,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": true,
+      "title": "Explore Error Logs (Loki)",
+      "tooltip": "Filter structured ACP logs for errors and warnings",
+      "type": "link",
+      "url": "/explore?orgId=1&left=%7B%22datasource%22:%22loki%22,%22queries%22:%5B%7B%22refId%22:%22A%22,%22expr%22:%22%7Bservice_name%3D%5C%22agy-acp%5C%22%7D%20%7C~%20%5C%22(%3Fi)(error%7Cexception%7Creject%7Ccrash)%5C%22%22%7D%5D,%22range%22:%7B%22from%22:%22$%7B__from%7D%22,%22to%22:%22$%7B__to%7D%22%7D%7D"
+    },
+    {
+      "asDropdown": false,
+      "icon": "compass",
+      "includeVars": true,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": true,
+      "title": "Explore Traces (Tempo)",
+      "tooltip": "Search distributed traces in Tempo via TraceQL",
+      "type": "link",
+      "url": "/explore?orgId=1&left=%7B%22datasource%22:%22tempo%22,%22queries%22:%5B%7B%22refId%22:%22A%22,%22queryType%22:%22traceql%22,%22query%22:%22%7Bresource.service.name%3D%5C%22agy-acp%5C%22%7D%22%7D%5D,%22range%22:%7B%22from%22:%22$%7B__from%7D%22,%22to%22:%22$%7B__to%7D%22%7D%7D"
+    },
+    {
+      "asDropdown": false,
+      "icon": "clock-nine",
+      "includeVars": true,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": true,
+      "title": "Slow Spans > 5s (Tempo)",
+      "tooltip": "Inspect slow prompt turns and tool calls in Tempo",
+      "type": "link",
+      "url": "/explore?orgId=1&left=%7B%22datasource%22:%22tempo%22,%22queries%22:%5B%7B%22refId%22:%22A%22,%22queryType%22:%22traceql%22,%22query%22:%22%7Bresource.service.name%3D%5C%22agy-acp%5C%22%20%26%26%20duration%20%3E%205s%7D%22%7D%5D,%22range%22:%7B%22from%22:%22$%7B__from%7D%22,%22to%22:%22$%7B__to%7D%22%7D%7D"
+    }
+  ],
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 100,
+      "panels": [],
+      "title": "1. Executive Overview, Sessions & Antigravity Quotas",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "1 when the persistent agy acp backend subprocess is alive, 0 when offline or not yet spawned.",
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "options": {
+                "0": { "color": "orange", "index": 0, "text": "IDLE / DOWN" },
+                "1": { "color": "green", "index": 1, "text": "ONLINE" }
+              },
+              "type": "value"
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "orange", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 5, "w": 3, "x": 0, "y": 1 },
+      "id": 1,
+      "links": [
+        {
+          "targetBlank": true,
+          "title": "Backend Lifecycle Logs (Loki)",
+          "url": "/explore?orgId=1&left=%7B%22datasource%22:%22loki%22,%22queries%22:%5B%7B%22refId%22:%22A%22,%22expr%22:%22%7Bservice_name%3D%5C%22agy-acp%5C%22%7D%20%7C%3D%20%5C%22backend%5C%22%22%7D%5D,%22range%22:%7B%22from%22:%22$%7B__from%7D%22,%22to%22:%22$%7B__to%7D%22%7D%7D"
+        }
+      ],
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "expr": "max(agy_acp_backend_up)", "legendFormat": "backend", "refId": "A" }],
+      "title": "Backend Subprocess",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "In-flight streaming session/prompt turns right now.",
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "blue", "value": null },
+              { "color": "green", "value": 1 },
+              { "color": "yellow", "value": 4 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 5, "w": 3, "x": 3, "y": 1 },
+      "id": 2,
+      "links": [
+        {
+          "targetBlank": true,
+          "title": "Prompt Turn Traces (Tempo)",
+          "url": "/explore?orgId=1&left=%7B%22datasource%22:%22tempo%22,%22queries%22:%5B%7B%22refId%22:%22A%22,%22queryType%22:%22traceql%22,%22query%22:%22%7Bname%3D%5C%22acp.rpc.session/prompt%5C%22%7D%22%7D%5D,%22range%22:%7B%22from%22:%22$%7B__from%7D%22,%22to%22:%22$%7B__to%7D%22%7D%7D"
+        }
+      ],
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "expr": "sum(agy_acp_turns_active) or vector(0)", "legendFormat": "active", "refId": "A" }],
+      "title": "Active Turns",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "In-memory active sessions and SQLite-persisted sessions.",
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "purple", "value": null }] }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 5, "w": 4, "x": 6, "y": 1 },
+      "id": 3,
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "expr": "sum by (state) (agy_acp_sessions_count)", "legendFormat": "{{state}}", "refId": "A" }],
+      "title": "Sessions (Active / Persisted)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Spans and logs buffered in RAM while collector was offline (drains to 0 on reconnect).",
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 512 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 5, "w": 4, "x": 10, "y": 1 },
+      "id": 4,
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [
+        { "expr": "sum by (signal) (agy_acp_telemetry_buffered_items)", "legendFormat": "{{signal}}", "refId": "A" }
+      ],
+      "title": "Offline Ring Buffer",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Remaining Antigravity rolling quota percentage by model family and window.",
+      "fieldConfig": {
+        "defaults": {
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 20 },
+              { "color": "green", "value": 50 }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 5, "w": 6, "x": 14, "y": 1 },
+      "id": 5,
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "showThresholdLabels": false, "showThresholdMarkers": true },
+      "targets": [
+        {
+          "expr": "max by (group, window) (agy_acp_quota_remaining_percent)",
+          "legendFormat": "{{group}} ({{window}})",
+          "refId": "A"
+        }
+      ],
+      "title": "Rolling Quota Remaining (%)",
+      "type": "gauge"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Estimated remaining and total Google AI plan credits.",
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 50 },
+              { "color": "green", "value": 150 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 5, "w": 4, "x": 20, "y": 1 },
+      "id": 6,
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [
+        { "expr": "max(agy_acp_quota_remaining_credits)", "legendFormat": "Remaining", "refId": "A" },
+        { "expr": "max(agy_acp_quota_capacity_credits)", "legendFormat": "Capacity", "refId": "B" }
+      ],
+      "title": "Google AI Plan Credits",
+      "type": "stat"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 },
+      "id": 200,
+      "panels": [],
+      "title": "2. ACP JSON-RPC Wire & Stdio Framing",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "JSON-RPC 2.0 request throughput by method/engine and error rate by method/code.",
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 7 },
+      "id": 7,
+      "links": [
+        {
+          "targetBlank": true,
+          "title": "RPC Logs in Loki",
+          "url": "/explore?orgId=1&left=%7B%22datasource%22:%22loki%22,%22queries%22:%5B%7B%22refId%22:%22A%22,%22expr%22:%22%7Bservice_name%3D%5C%22agy-acp%5C%22%7D%20%7C%3D%20%5C%22rpc_%5C%22%22%7D%5D,%22range%22:%7B%22from%22:%22$%7B__from%7D%22,%22to%22:%22$%7B__to%7D%22%7D%7D"
+        },
+        {
+          "targetBlank": true,
+          "title": "RPC Spans in Tempo",
+          "url": "/explore?orgId=1&left=%7B%22datasource%22:%22tempo%22,%22queries%22:%5B%7B%22refId%22:%22A%22,%22queryType%22:%22traceql%22,%22query%22:%22%7Bname%3D~%5C%22acp.rpc.*%5C%22%7D%22%7D%5D,%22range%22:%7B%22from%22:%22$%7B__from%7D%22,%22to%22:%22$%7B__to%7D%22%7D%7D"
+        }
+      ],
+      "targets": [
+        {
+          "expr": "sum by (method, engine) (rate(agy_acp_rpc_requests_total[$__rate_interval]))",
+          "legendFormat": "req {{method}} ({{engine}})",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (method, code) (rate(agy_acp_rpc_errors_total[$__rate_interval]))",
+          "legendFormat": "err {{method}} [{{code}}]",
+          "refId": "B"
+        }
+      ],
+      "title": "ACP JSON-RPC Throughput & Errors",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "ACP JSON-RPC latency quantiles. Click diamond exemplars to jump straight to the Tempo trace.",
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 7 },
+      "id": 8,
+      "links": [
+        {
+          "targetBlank": true,
+          "title": "Slow RPC Traces in Tempo",
+          "url": "/explore?orgId=1&left=%7B%22datasource%22:%22tempo%22,%22queries%22:%5B%7B%22refId%22:%22A%22,%22queryType%22:%22traceql%22,%22query%22:%22%7Bname%3D~%5C%22acp.rpc.*%5C%22%20%26%26%20duration%20%3E%201s%7D%22%7D%5D,%22range%22:%7B%22from%22:%22$%7B__from%7D%22,%22to%22:%22$%7B__to%7D%22%7D%7D"
+        }
+      ],
+      "targets": [
+        {
+          "exemplar": true,
+          "expr": "histogram_quantile(0.50, sum by (le, method) (rate(agy_acp_rpc_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p50 {{method}}",
+          "refId": "A"
+        },
+        {
+          "exemplar": true,
+          "expr": "histogram_quantile(0.95, sum by (le, method) (rate(agy_acp_rpc_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p95 {{method}}",
+          "refId": "B"
+        },
+        {
+          "exemplar": false,
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(agy_acp_rpc_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p99 overall",
+          "refId": "C"
+        }
+      ],
+      "title": "ACP JSON-RPC Latency (p50 / p95 / p99 + Exemplars)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Raw stdio NDJSON frame sizes (p95) and byte rate across inbound stdin and outbound stdout.",
+      "fieldConfig": { "defaults": { "unit": "bytes" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 7 },
+      "id": 9,
+      "targets": [
+        {
+          "exemplar": true,
+          "expr": "histogram_quantile(0.95, sum by (le, direction) (rate(agy_acp_frame_size_bytes_bucket[$__rate_interval])))",
+          "legendFormat": "p95 frame {{direction}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (direction) (rate(agy_acp_frame_size_bytes_sum[$__rate_interval]))",
+          "legendFormat": "bytes/s {{direction}}",
+          "refId": "B"
+        }
+      ],
+      "title": "Stdio Frame Size (p95) & Byte Rate",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 },
+      "id": 300,
+      "panels": [],
+      "title": "3. Prompt Turns, TTFT, Context Window & Steering",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Completed turns, mid-turn steers, context compactions, and automatic model fallbacks.",
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 },
+      "id": 10,
+      "links": [
+        {
+          "targetBlank": true,
+          "title": "Turn & Steer Logs (Loki)",
+          "url": "/explore?orgId=1&left=%7B%22datasource%22:%22loki%22,%22queries%22:%5B%7B%22refId%22:%22A%22,%22expr%22:%22%7Bservice_name%3D%5C%22agy-acp%5C%22%7D%20%7C~%20%5C%22(prompt%7Csteer%7Ccompact%7Cfallback)%5C%22%22%7D%5D,%22range%22:%7B%22from%22:%22$%7B__from%7D%22,%22to%22:%22$%7B__to%7D%22%7D%7D"
+        }
+      ],
+      "targets": [
+        {
+          "expr": "sum by (stop_reason, model) (increase(agy_acp_turns_total[$__rate_interval]))",
+          "legendFormat": "turns {{model}} ({{stop_reason}})",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (outcome) (increase(agy_acp_steers_total[$__rate_interval]))",
+          "legendFormat": "steers ({{outcome}})",
+          "refId": "B"
+        },
+        {
+          "expr": "sum by (trigger, status) (increase(agy_acp_compactions_total[$__rate_interval]))",
+          "legendFormat": "compactions ({{trigger}}/{{status}})",
+          "refId": "C"
+        },
+        {
+          "expr": "sum by (from_model, to_model) (increase(agy_acp_model_fallbacks_total[$__rate_interval]))",
+          "legendFormat": "fallback {{from_model}} -> {{to_model}}",
+          "refId": "D"
+        }
+      ],
+      "title": "Turns, Steers, Compactions & Model Fallbacks",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "End-to-end prompt turn duration and Time-to-First-Token (TTFT) with clickable Tempo trace exemplars.",
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 },
+      "id": 11,
+      "links": [
+        {
+          "targetBlank": true,
+          "title": "Prompt Turn Waterfall (Tempo)",
+          "url": "/explore?orgId=1&left=%7B%22datasource%22:%22tempo%22,%22queries%22:%5B%7B%22refId%22:%22A%22,%22queryType%22:%22traceql%22,%22query%22:%22%7Bname%3D%5C%22acp.rpc.session/prompt%5C%22%7D%22%7D%5D,%22range%22:%7B%22from%22:%22$%7B__from%7D%22,%22to%22:%22$%7B__to%7D%22%7D%7D"
+        }
+      ],
+      "targets": [
+        {
+          "exemplar": true,
+          "expr": "histogram_quantile(0.95, sum by (le, model) (rate(agy_acp_turn_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "turn p95 ({{model}})",
+          "refId": "A"
+        },
+        {
+          "exemplar": true,
+          "expr": "histogram_quantile(0.50, sum by (le, model) (rate(agy_acp_turn_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "turn p50 ({{model}})",
+          "refId": "B"
+        },
+        {
+          "exemplar": true,
+          "expr": "histogram_quantile(0.95, sum by (le, model) (rate(agy_acp_turn_ttft_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "TTFT p95 ({{model}})",
+          "refId": "C"
+        },
+        {
+          "exemplar": false,
+          "expr": "histogram_quantile(0.50, sum by (le, model) (rate(agy_acp_turn_ttft_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "TTFT p50 ({{model}})",
+          "refId": "D"
+        }
+      ],
+      "title": "Turn Duration & TTFT (p50 / p95 + Exemplars)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Active context window utilization percentage and context token count (p95) per model.",
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 16 },
+      "id": 12,
+      "targets": [
+        {
+          "exemplar": true,
+          "expr": "histogram_quantile(0.95, sum by (le, model) (rate(agy_acp_context_usage_percent_bucket[$__rate_interval])))",
+          "legendFormat": "context % p95 ({{model}})",
+          "refId": "A"
+        },
+        {
+          "exemplar": true,
+          "expr": "histogram_quantile(0.95, sum by (le, model) (rate(agy_acp_context_tokens_bucket[$__rate_interval])))",
+          "legendFormat": "context tokens p95 ({{model}})",
+          "refId": "B"
+        }
+      ],
+      "title": "Context Window Utilization (% & Tokens p95)",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 24 },
+      "id": 400,
+      "panels": [],
+      "title": "4. Tokens, Plan Credits, Quota Fetch & SQLite Persistence",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Token processing rate by model/type alongside persisted SQLite cumulative ledger totals.",
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 25 },
+      "id": 13,
+      "targets": [
+        {
+          "expr": "sum by (model, token_type) (rate(agy_acp_tokens_total[$__rate_interval]))",
+          "legendFormat": "tokens/s {{model}} ({{token_type}})",
+          "refId": "A"
+        },
+        {
+          "expr": "max by (token_type) (agy_acp_ledger_tokens)",
+          "legendFormat": "ledger total ({{token_type}})",
+          "refId": "B"
+        }
+      ],
+      "title": "Token Throughput & Persisted SQLite Ledger",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Estimated Google AI plan credits consumed per window and cumulative session total.",
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 25 },
+      "id": 14,
+      "targets": [
+        {
+          "expr": "sum by (model) (increase(agy_acp_credits_consumed_total[$__rate_interval]))",
+          "legendFormat": "credits delta ({{model}})",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (model) (agy_acp_credits_consumed_total)",
+          "legendFormat": "credits cumulative ({{model}})",
+          "refId": "B"
+        }
+      ],
+      "title": "Estimated Credits Consumed",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "SQLite WAL state-store operation latency and Antigravity quota/credits CLI fetch latency.",
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 25 },
+      "id": 15,
+      "links": [
+        {
+          "targetBlank": true,
+          "title": "Quota Fetch Spans (Tempo)",
+          "url": "/explore?orgId=1&left=%7B%22datasource%22:%22tempo%22,%22queries%22:%5B%7B%22refId%22:%22A%22,%22queryType%22:%22traceql%22,%22query%22:%22%7Bname%3D~%5C%22quota.fetch.*%5C%22%7D%22%7D%5D,%22range%22:%7B%22from%22:%22$%7B__from%7D%22,%22to%22:%22$%7B__to%7D%22%7D%7D"
+        }
+      ],
+      "targets": [
+        {
+          "exemplar": true,
+          "expr": "histogram_quantile(0.95, sum by (le, operation) (rate(agy_acp_sqlite_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "sqlite p95 ({{operation}})",
+          "refId": "A"
+        },
+        {
+          "exemplar": true,
+          "expr": "histogram_quantile(0.95, sum by (le, endpoint, status) (rate(agy_acp_quota_fetch_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "quota fetch p95 ({{endpoint}}/{{status}})",
+          "refId": "B"
+        }
+      ],
+      "title": "SQLite Store & Quota Fetch Latency (p95 + Exemplars)",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 33 },
+      "id": 500,
+      "panels": [],
+      "title": "5. Agent Tool Calls, Permission Gate & MCP Discovery",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Agent tool invocations by tool/status and real-time permission gate decisions (allow_once / reject_once).",
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 34 },
+      "id": 16,
+      "links": [
+        {
+          "targetBlank": true,
+          "title": "Permission Gate Logs (Loki)",
+          "url": "/explore?orgId=1&left=%7B%22datasource%22:%22loki%22,%22queries%22:%5B%7B%22refId%22:%22A%22,%22expr%22:%22%7Bservice_name%3D%5C%22agy-acp%5C%22%7D%20%7C~%20%5C%22(permission%7Ctool)%5C%22%22%7D%5D,%22range%22:%7B%22from%22:%22$%7B__from%7D%22,%22to%22:%22$%7B__to%7D%22%7D%7D"
+        },
+        {
+          "targetBlank": true,
+          "title": "Tool Call Spans (Tempo)",
+          "url": "/explore?orgId=1&left=%7B%22datasource%22:%22tempo%22,%22queries%22:%5B%7B%22refId%22:%22A%22,%22queryType%22:%22traceql%22,%22query%22:%22%7Bname%3D%5C%22agy.tool_call%5C%22%7D%22%7D%5D,%22range%22:%7B%22from%22:%22$%7B__from%7D%22,%22to%22:%22$%7B__to%7D%22%7D%7D"
+        }
+      ],
+      "targets": [
+        {
+          "expr": "sum by (tool_name, status) (increase(agy_acp_tool_calls_total[$__rate_interval]))",
+          "legendFormat": "tool {{tool_name}} ({{status}})",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (kind, outcome) (increase(agy_acp_tool_permissions_total[$__rate_interval]))",
+          "legendFormat": "perm {{outcome}} [{{kind}}]",
+          "refId": "B"
+        }
+      ],
+      "title": "Agent Tool Calls & Permission Decisions",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Agent tool call execution latency (p50 / p95) with clickable trace exemplars.",
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 34 },
+      "id": 17,
+      "links": [
+        {
+          "targetBlank": true,
+          "title": "Slow Tool Spans (Tempo)",
+          "url": "/explore?orgId=1&left=%7B%22datasource%22:%22tempo%22,%22queries%22:%5B%7B%22refId%22:%22A%22,%22queryType%22:%22traceql%22,%22query%22:%22%7Bname%3D%5C%22agy.tool_call%5C%22%20%26%26%20duration%20%3E%201s%7D%22%7D%5D,%22range%22:%7B%22from%22:%22$%7B__from%7D%22,%22to%22:%22$%7B__to%7D%22%7D%7D"
+        }
+      ],
+      "targets": [
+        {
+          "exemplar": true,
+          "expr": "histogram_quantile(0.95, sum by (le, tool_name) (rate(agy_acp_tool_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p95 {{tool_name}}",
+          "refId": "A"
+        },
+        {
+          "exemplar": false,
+          "expr": "histogram_quantile(0.50, sum by (le, tool_name) (rate(agy_acp_tool_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p50 {{tool_name}}",
+          "refId": "B"
+        }
+      ],
+      "title": "Agent Tool Execution Latency (p50 / p95 + Exemplars)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Discovered MCP tool counts per server, catalog probe outcomes, and p95 probe latency.",
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 34 },
+      "id": 18,
+      "links": [
+        {
+          "targetBlank": true,
+          "title": "MCP Probe Spans (Tempo)",
+          "url": "/explore?orgId=1&left=%7B%22datasource%22:%22tempo%22,%22queries%22:%5B%7B%22refId%22:%22A%22,%22queryType%22:%22traceql%22,%22query%22:%22%7Bname%3D%5C%22mcp.probe%5C%22%7D%22%7D%5D,%22range%22:%7B%22from%22:%22$%7B__from%7D%22,%22to%22:%22$%7B__to%7D%22%7D%7D"
+        }
+      ],
+      "targets": [
+        {
+          "expr": "max by (server) (agy_acp_mcp_tools_discovered)",
+          "legendFormat": "tools {{server}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (server, status) (increase(agy_acp_mcp_probes_total[$__rate_interval]))",
+          "legendFormat": "probe {{server}} ({{status}})",
+          "refId": "B"
+        },
+        {
+          "exemplar": true,
+          "expr": "histogram_quantile(0.95, sum by (le, server) (rate(agy_acp_mcp_probe_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "probe p95s {{server}}",
+          "refId": "C"
+        }
+      ],
+      "title": "MCP Tools Discovered & Catalog Probe Latency",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 42 },
+      "id": 600,
+      "panels": [],
+      "title": "6. Backend Subprocess Lifecycle & Live Correlated Traces + Logs",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Persistent agy acp subprocess spawns, exits, and automatic crash/EOF reconnections.",
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 43 },
+      "id": 19,
+      "links": [
+        {
+          "targetBlank": true,
+          "title": "Subprocess Logs (Loki)",
+          "url": "/explore?orgId=1&left=%7B%22datasource%22:%22loki%22,%22queries%22:%5B%7B%22refId%22:%22A%22,%22expr%22:%22%7Bservice_name%3D%5C%22agy-acp%5C%22%7D%20%7C~%20%5C%22(spawn%7Creconnect%7Cexit%7Cbackend)%5C%22%22%7D%5D,%22range%22:%7B%22from%22:%22$%7B__from%7D%22,%22to%22:%22$%7B__to%7D%22%7D%7D"
+        }
+      ],
+      "targets": [
+        {
+          "expr": "sum(increase(agy_acp_backend_spawns_total[$__rate_interval]))",
+          "legendFormat": "spawns",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (returncode) (increase(agy_acp_backend_exits_total[$__rate_interval]))",
+          "legendFormat": "exits (rc={{returncode}})",
+          "refId": "B"
+        },
+        {
+          "expr": "sum by (reason) (increase(agy_acp_backend_reconnects_total[$__rate_interval]))",
+          "legendFormat": "reconnects ({{reason}})",
+          "refId": "C"
+        }
+      ],
+      "title": "Backend Subprocess Spawns, Exits & Reconnects",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Upstream agy acp child-process JSON-RPC latency (p50 / p95) with clickable Tempo exemplars.",
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 43 },
+      "id": 20,
+      "links": [
+        {
+          "targetBlank": true,
+          "title": "All Service Traces (Tempo)",
+          "url": "/explore?orgId=1&left=%7B%22datasource%22:%22tempo%22,%22queries%22:%5B%7B%22refId%22:%22A%22,%22queryType%22:%22traceql%22,%22query%22:%22%7Bresource.service.name%3D%5C%22agy-acp%5C%22%7D%22%7D%5D,%22range%22:%7B%22from%22:%22$%7B__from%7D%22,%22to%22:%22$%7B__to%7D%22%7D%7D"
+        }
+      ],
+      "targets": [
+        {
+          "exemplar": true,
+          "expr": "histogram_quantile(0.95, sum by (le, method) (rate(agy_acp_backend_rpc_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p95 {{method}}",
+          "refId": "A"
+        },
+        {
+          "exemplar": false,
+          "expr": "histogram_quantile(0.50, sum by (le, method) (rate(agy_acp_backend_rpc_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p50 {{method}}",
+          "refId": "B"
+        }
+      ],
+      "title": "Upstream agy acp Subprocess RPC Latency (p50 / p95 + Exemplars)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "tempo", "uid": "tempo" },
+      "description": "Live TraceQL search over agy-acp spans. Click any Trace ID to inspect waterfall & jump to Loki logs.",
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 10, "w": 10, "x": 0, "y": 51 },
+      "id": 21,
+      "options": { "showHeader": true },
+      "targets": [
+        {
+          "limit": 25,
+          "query": "{resource.service.name=\"agy-acp\"}",
+          "queryType": "traceql",
+          "refId": "A",
+          "tableType": "traces"
+        }
+      ],
+      "title": "Recent Traces in Tempo (Click Trace ID -> Waterfall & Logs)",
+      "type": "table"
+    },
+    {
+      "datasource": { "type": "loki", "uid": "loki" },
+      "description": "Redacted structured ACP diagnostic events streamed over OTLP Logs (disk logging disabled by default). Expand any line and click View in Tempo on TraceID.",
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 10, "w": 14, "x": 10, "y": 51 },
+      "id": 22,
+      "options": {
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "prettifyLogMessage": true,
+        "showCommonLabels": false,
+        "showLabels": false,
+        "showTime": true,
+        "sortOrder": "Descending",
+        "wrapLogMessage": true
+      },
+      "targets": [
+        {
+          "expr": "{service_name=\"agy-acp\"}",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Live Redacted ACP Structured Logs in Loki (Click TraceID -> Tempo)",
+      "type": "logs"
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 40,
+  "tags": ["agy-acp", "opentelemetry", "acp", "kirocrew"],
+  "templating": { "list": [] },
+  "time": { "from": "now-15m", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Antigravity ACP — Telemetry, Traces & Logs",
+  "uid": "agy-acp-overview",
+  "version": 1
+}

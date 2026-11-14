@@ -10,6 +10,7 @@ from typing import Any
 
 from agy_acp.providers.quota_provider import QuotaProvider
 from agy_acp.providers.state_store import SqliteStateStoreProvider
+from agy_acp.providers.telemetry import TelemetryCallbacks, get_telemetry
 
 RATE_LIMIT_MESSAGE = "Quota limit reached for one or more rolling windows."
 
@@ -209,6 +210,63 @@ class QuotaTracker:
         self._total_tokens: int = self.total_tokens
         self._session_context_tokens: dict[str, int] = {}
         self._last_session_effective_credits: dict[str, float] = {}
+        self._last_otel_buckets: list[dict[str, Any]] = []
+        self._last_otel_remaining_credits: float | None = None
+        self._last_otel_capacity_credits: float | None = None
+        db_ref = self._store.db_path if self._store is not None else None
+        get_telemetry(db_ref).register_callbacks(
+            TelemetryCallbacks(quota_metrics=self._get_otel_quota_snapshot)
+        )
+
+    def _update_otel_quota_snapshot(
+        self,
+        five_hour_buckets: list[dict[str, Any]],
+        seven_day_buckets: list[dict[str, Any]],
+        kiro_credits: Mapping[str, Any],
+    ) -> None:
+        buckets: list[dict[str, Any]] = []
+        for win_label, items in (("5h", five_hour_buckets), ("7d", seven_day_buckets)):
+            for b in items:
+                frac = float(b.get("remaining_fraction", 0.0))
+                buckets.append(
+                    {
+                        "group": str(b.get("group") or b.get("name") or "default"),
+                        "window": win_label,
+                        "percent": round(max(0.0, min(100.0, frac * 100.0)), 2),
+                    }
+                )
+        self._last_otel_buckets = buckets
+        self._last_otel_remaining_credits = float(kiro_credits.get("effective_credits", 0.0))
+        self._last_otel_capacity_credits = float(kiro_credits.get("credit_capacity", 0.0))
+
+    def _get_otel_quota_snapshot(
+        self,
+    ) -> tuple[list[dict[str, Any]], float | None, float | None]:
+        if self._last_otel_buckets:
+            return (
+                list(self._last_otel_buckets),
+                self._last_otel_remaining_credits,
+                self._last_otel_capacity_credits,
+            )
+        loader = getattr(self, "_load_cached_quota_groups", None)
+        cached_groups = loader() if callable(loader) else None
+        if not cached_groups:
+            return [], self._last_otel_remaining_credits, self._last_otel_capacity_credits
+        derived: list[dict[str, Any]] = []
+        for grp in cached_groups:
+            grp_name = str(grp.get("group") or grp.get("name") or "default")
+            for b in grp.get("buckets", []) if isinstance(grp.get("buckets"), list) else []:
+                if isinstance(b, Mapping) and "remaining_fraction" in b:
+                    raw_win = str(b.get("window") or "5h").lower()
+                    win = "7d" if "week" in raw_win or "7" in raw_win else "5h"
+                    derived.append(
+                        {
+                            "group": grp_name,
+                            "window": win,
+                            "percent": round(float(b["remaining_fraction"]) * 100.0, 2),
+                        }
+                    )
+        return derived, self._last_otel_remaining_credits, self._last_otel_capacity_credits
 
     async def _resolve_tier(self) -> dict[str, str] | None:
         """Resolve active Antigravity plan tier from SQLite cache, provider probe, or fallback."""
@@ -575,6 +633,11 @@ class QuotaTracker:
             g1_overage_credits=g1_overage,
             tier=active_tier,
         )
+        self._update_otel_quota_snapshot(
+            five_hour["buckets"],
+            seven_day["buckets"],
+            kiro_credits,
+        )
         return {
             "remaining_credits": g1_overage,
             "upgrade_uri": credits.get("upgrade_uri"),
@@ -601,6 +664,11 @@ class QuotaTracker:
             model_id=group,
             g1_overage_credits=g1_overage,
             tier=active_tier,
+        )
+        self._update_otel_quota_snapshot(
+            five_hour["buckets"],
+            seven_day["buckets"],
+            kiro_credits,
         )
         return {
             "five_hour": five_hour,
@@ -666,6 +734,25 @@ class QuotaTracker:
             round(prev_credits - effective_credits, 4)
             if prev_credits is not None and prev_credits > effective_credits
             else 0.0
+        )
+        self._update_otel_quota_snapshot(
+            five_hour["buckets"],
+            seven_day["buckets"],
+            kiro_credits,
+        )
+        otel = get_telemetry(self._store.db_path if self._store is not None else None)
+        otel.record_tokens(
+            model_id,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_tokens=cached_read_tokens,
+            thought_tokens=thinking_tokens,
+        )
+        otel.record_credits_consumed(model_id, delta_credits)
+        otel.record_context_usage(
+            model_id,
+            used_tokens=active_context_tokens,
+            usage_percent=context_usage_pct,
         )
         metering_usage: list[dict[str, Any]] = [
             {

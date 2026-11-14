@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import subprocess
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ import anyio
 from anyio.streams.buffered import BufferedByteReceiveStream
 
 from agy_acp.logic.tool_classifier import build_scrubbed_subprocess_env, resolve_agy_binary
+from agy_acp.providers.telemetry import get_telemetry
 
 
 async def run_agy_slash_json(
@@ -160,7 +162,21 @@ class QuotaProvider:
 
     async def fetch_quota_groups(self) -> list[dict[str, Any]]:
         """Query `agy -p /usage --output-format json` and return normalized quota groups."""
-        payload = await self._run_slash("/usage")
+        telemetry = get_telemetry()
+        start_t = time.perf_counter()
+        status = "ok"
+        try:
+            with telemetry.start_span("quota.fetch.usage"):
+                payload = await self._run_slash("/usage")
+        except Exception:
+            status = "error"
+            raise
+        finally:
+            telemetry.record_quota_fetch(
+                "usage",
+                status=status,
+                duration_s=time.perf_counter() - start_t,
+            )
         cmd = payload.get("command")
         cmd_data = cmd.get("data") if isinstance(cmd, dict) else None
         raw_groups = cmd_data.get("groups") if isinstance(cmd_data, dict) else None
@@ -192,7 +208,21 @@ class QuotaProvider:
 
     async def fetch_credits(self) -> dict[str, Any]:
         """Query `agy -p /credits --output-format json` and return G1 remaining credits."""
-        payload = await self._run_slash("/credits")
+        telemetry = get_telemetry()
+        start_t = time.perf_counter()
+        status = "ok"
+        try:
+            with telemetry.start_span("quota.fetch.credits"):
+                payload = await self._run_slash("/credits")
+        except Exception:
+            status = "error"
+            raise
+        finally:
+            telemetry.record_quota_fetch(
+                "credits",
+                status=status,
+                duration_s=time.perf_counter() - start_t,
+            )
         cmd = payload.get("command")
         cmd_data = cmd.get("data") if isinstance(cmd, dict) else None
         if isinstance(cmd_data, dict) and "remaining_credits" in cmd_data:

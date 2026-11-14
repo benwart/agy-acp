@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from agy_acp.providers.state_store import resolve_state_db_path
+from agy_acp.providers.telemetry import get_telemetry, resolve_telemetry_config
 
 REDACTED_PLACEHOLDER = "[REDACTED]"
 
@@ -155,19 +156,39 @@ def redact_sensitive_data(value: Any) -> Any:
     return _redact_value(value, depth=0)
 
 
+def is_disk_logging_enabled(save_dir_or_db: Path | str | None = None) -> bool:
+    """Return True only when diagnostic disk logging (`acp.log`) is explicitly enabled."""
+    return resolve_telemetry_config(save_dir_or_db).disk_logs
+
+
 def log_acp_event(
     event: str,
     *,
     save_dir_or_db: Path | str | None = None,
     **fields: Any,
 ) -> None:
-    """Append a single redacted JSONL diagnostic record to `acp.log` (and stderr if enabled)."""
+    """Emit a redacted diagnostic event to OpenTelemetry Logs (and `acp.log` / `stderr` opt-in)."""
+    telemetry = get_telemetry(save_dir_or_db)
+    disk_enabled = is_disk_logging_enabled(save_dir_or_db)
+    stderr_enabled = os.environ.get("AGY_ACP_LOG_STDERR") == "1"
+    if not telemetry.config.enabled and not disk_enabled and not stderr_enabled:
+        return
+
     redacted_fields = redact_sensitive_data(fields)
+    redacted_dict: dict[str, Any] = redacted_fields if isinstance(redacted_fields, dict) else {}
+    trace_id, span_id = telemetry.current_trace_identifiers()
+    trace_meta: dict[str, str] = {}
+    if trace_id:
+        trace_meta["trace_id"] = trace_id
+    if span_id:
+        trace_meta["span_id"] = span_id
+
     record: dict[str, Any] = {
         "timestamp": datetime.now(UTC).isoformat(),
         "pid": os.getpid(),
         "event": event,
-        **(redacted_fields if isinstance(redacted_fields, dict) else {}),
+        **trace_meta,
+        **redacted_dict,
     }
     try:
         serialized = json.dumps(record, ensure_ascii=False, default=str)
@@ -178,22 +199,31 @@ def log_acp_event(
                 "timestamp": record["timestamp"],
                 "pid": record["pid"],
                 "event": event,
+                **trace_meta,
                 "raw": _scrub_string_patterns(repr(redacted_fields)),
             },
             ensure_ascii=False,
         )
 
-    line_bytes = f"{serialized}\n".encode()
-    log_path = resolve_log_file_path(save_dir_or_db)
-    with contextlib.suppress(OSError):
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        try:
-            os.write(fd, line_bytes)
-        finally:
-            os.close(fd)
+    if telemetry.config.enabled:
+        otel_fields = {
+            k: (_scrub_string_patterns(v) if isinstance(v, str) else v)
+            for k, v in {**trace_meta, **redacted_dict}.items()
+        }
+        telemetry.emit_log(event, otel_fields, body=serialized)
 
-    if os.environ.get("AGY_ACP_LOG_STDERR") == "1":
+    if disk_enabled:
+        line_bytes = f"{serialized}\n".encode()
+        log_path = resolve_log_file_path(save_dir_or_db)
+        with contextlib.suppress(OSError):
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                os.write(fd, line_bytes)
+            finally:
+                os.close(fd)
+
+    if stderr_enabled:
         with contextlib.suppress(OSError):
             sys.stderr.write(f"[agy-acp] {serialized}\n")
             sys.stderr.flush()

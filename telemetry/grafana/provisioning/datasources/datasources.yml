@@ -1,0 +1,74 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+    jsonData:
+      httpMethod: POST
+      timeInterval: 5s
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: tempo
+          urlDisplayLabel: View Trace in Tempo
+        - name: traceID
+          datasourceUid: tempo
+          urlDisplayLabel: View Trace in Tempo
+
+  - name: Tempo
+    uid: tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    editable: true
+    jsonData:
+      nodeGraph:
+        enabled: true
+      lokiSearch:
+        datasourceUid: loki
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: "-1m"
+        spanEndTimeShift: "1m"
+        filterByTraceID: false
+        filterBySpanID: false
+        customQuery: true
+        query: '{service_name="agy-acp"} | trace_id="${__trace.traceId}" or "${__trace.traceId}"'
+      tracesToMetrics:
+        datasourceUid: prometheus
+        spanStartTimeShift: "-5m"
+        spanEndTimeShift: "5m"
+        tags:
+          - key: service.name
+            value: service_name
+        queries:
+          - name: RPC Latency p95
+            query: 'histogram_quantile(0.95, sum by (le) (rate(agy_acp_rpc_duration_seconds_bucket{$__tags}[5m])))'
+          - name: Turn Throughput
+            query: 'sum(rate(agy_acp_turns_total{$__tags}[5m]))'
+
+  - name: Loki
+    uid: loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    editable: true
+    jsonData:
+      maxLines: 1000
+      derivedFields:
+        - name: TraceID
+          matcherType: label
+          matcherRegex: trace_id
+          url: "$${__value.raw}"
+          datasourceUid: tempo
+          urlDisplayLabel: View in Tempo
+        - name: trace_id_json
+          matcherType: regex
+          matcherRegex: '"trace_id":\s*"([0-9a-f]{32})"'
+          url: "$${__value.raw}"
+          datasourceUid: tempo
+          urlDisplayLabel: View in Tempo

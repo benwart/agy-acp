@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import anyio
+from opentelemetry.trace import Span, SpanKind, Status, StatusCode
 
 from agy_acp import KIRO_CLI_COMPAT_VERSION, __version__
 from agy_acp.logic.auth_manager import AuthManager
@@ -43,6 +44,7 @@ from agy_acp.logic.wire import (
 )
 from agy_acp.providers.acp_logger import log_acp_event
 from agy_acp.providers.quota_provider import QuotaProvider
+from agy_acp.providers.telemetry import get_telemetry
 
 MAX_FRAME_SIZE_BYTES = 16 * 1024 * 1024
 SLASH_QUOTA_COMMANDS = frozenset({"/quota", "/usage", "/credits"})
@@ -822,6 +824,7 @@ class AcpDispatcher:
         perm_params_factory: Callable[[], dict[str, Any]],
     ) -> bool:
         """Evaluate customAgent/session permissions and prompt client only on `ask`."""
+        telemetry = get_telemetry(self._session_manager.state_store.db_path)
         decision = self._evaluate_tool_permission(
             session=session,
             spec=self._session_manager.get_active_custom_agent(session_id),
@@ -829,10 +832,17 @@ class AcpDispatcher:
             session_mode=self._resolve_session_mode(session_id),
         )
         if decision == "allow":
+            telemetry.record_tool_permission(norm.kind, outcome="auto_allow")
             return True
         if decision == "deny":
+            telemetry.record_tool_permission(norm.kind, outcome="policy_deny")
             return False
-        return await self._request_client_permission(session_id, perm_params_factory())
+        client_allowed = await self._request_client_permission(session_id, perm_params_factory())
+        telemetry.record_tool_permission(
+            norm.kind,
+            outcome="user_allow" if client_allowed else "user_deny",
+        )
+        return client_allowed
 
     async def _emit_turn_telemetry_frames(
         self,
@@ -967,6 +977,10 @@ class AcpDispatcher:
         output_tokens = max(1, int(compact_res.get("outputTokens", 1)))
 
         phase = "failed" if status_type == "failed" else "completed"
+        get_telemetry(self._session_manager.state_store.db_path).record_compaction(
+            trigger="slash",
+            status=phase,
+        )
         await self._emit_notification(
             self._wire_adapter.build_compaction_notification(
                 session_id,
@@ -1100,8 +1114,14 @@ class AcpDispatcher:
 
         user_message_id = f"msg_{uuid.uuid4().hex[:12]}"
         prompt_received_ms = int(time.time() * 1000)
+        turn_start = time.perf_counter()
+        ttft_s: float | None = None
         first_displayed_chunk = True
         collected_chunks: list[str] = []
+        telemetry = get_telemetry(self._session_manager.state_store.db_path)
+        turn_otel_ctx = telemetry.current_context()
+        tool_start_times: dict[str, float] = {}
+        tool_spans: dict[str, Span] = {}
 
         await self._quota_tracker.seed_session_baseline(
             session_id,
@@ -1115,7 +1135,9 @@ class AcpDispatcher:
             await self._emit_notification(start_frame)
 
         def _maybe_attach_ttft(frame: dict[str, Any], chunk_text: str) -> dict[str, Any]:
-            nonlocal first_displayed_chunk
+            nonlocal first_displayed_chunk, ttft_s
+            if chunk_text and ttft_s is None:
+                ttft_s = max(0.0, time.perf_counter() - turn_start)
             if (
                 self._wire_adapter.engine_id == "v3"
                 and want_ttft
@@ -1152,6 +1174,16 @@ class AcpDispatcher:
             first_announce = event.tool_call_id not in announced_tool_ids
             announced_tool_ids.add(event.tool_call_id)
             if first_announce:
+                tool_start_times[event.tool_call_id] = time.perf_counter()
+                tool_spans[event.tool_call_id] = telemetry.start_manual_span(
+                    "agy.tool_call",
+                    attributes={
+                        "tool.name": event.title or event.kiro_tool_name or "tool",
+                        "tool.kind": event.kind,
+                        "tool.id": event.tool_call_id,
+                    },
+                    parent_context=turn_otel_ctx,
+                )
                 await _emit_message_piece(carousel_normalizer.flush_prose_before_boundary())
             if self._wire_adapter.engine_id == "v3":
                 return await self._handle_v3_tool_call(
@@ -1167,6 +1199,19 @@ class AcpDispatcher:
 
         async def _on_tool_update(event: ToolCallEvent) -> None:
             allowed = event.status != "failed"
+            t_start = tool_start_times.pop(event.tool_call_id, None)
+            t_dur = max(0.0, time.perf_counter() - t_start) if t_start is not None else 0.0
+            telemetry.record_tool_call(
+                event.title or event.kiro_tool_name or "tool",
+                kind=event.kind,
+                status=event.status,
+                duration_s=t_dur,
+            )
+            t_span = tool_spans.pop(event.tool_call_id, None)
+            if t_span is not None:
+                if not allowed:
+                    t_span.set_status(Status(StatusCode.ERROR, event.status))
+                t_span.end()
             content_blocks = list(event.diff_content) or [
                 {"type": "content", "content": {"type": "text", "text": event.output}}
             ]
@@ -1224,6 +1269,7 @@ class AcpDispatcher:
             for frame in self._wire_adapter.build_subagent_notifications(session_id, subagents):
                 await self._emit_notification(frame)
 
+        telemetry.turn_started()
         try:
             turn_result = await self._session_manager.prompt(
                 session_id=session_id,
@@ -1238,10 +1284,23 @@ class AcpDispatcher:
             )
         except KeyError as exc:
             return _jsonrpc_error(message_id, -32002, str(exc))
+        finally:
+            telemetry.turn_finished()
+            for dangling_span in tool_spans.values():
+                dangling_span.end()
+            tool_spans.clear()
 
+        active_model = self._resolve_session_model(session_id)
         stop_reason = str(turn_result.get("stopReason", "end_turn"))
         if stop_reason == "cancelled" or self._session_manager.consume_cancellation(session_id):
             await _emit_message_piece(carousel_normalizer.flush())
+            telemetry.record_turn(
+                stop_reason="cancelled",
+                model=active_model,
+                engine=self._wire_adapter.engine_id,
+                duration_s=time.perf_counter() - turn_start,
+                ttft_s=ttft_s,
+            )
             raw_cancel_usage = turn_result.get("usage")
             return await self._finish_cancelled_prompt(
                 message_id,
@@ -1255,6 +1314,7 @@ class AcpDispatcher:
         fallback_from = str(turn_result.get("fallbackFromModel") or "")
         resolved_to = str(turn_result.get("resolvedModel") or "")
         if fallback_from and resolved_to and fallback_from != resolved_to:
+            telemetry.record_model_fallback(fallback_from, resolved_to, reason="availability")
             for fb_frame in self._wire_adapter.build_model_fallback_notifications(
                 session_id,
                 from_model=fallback_from,
@@ -1313,6 +1373,13 @@ class AcpDispatcher:
             context_breakdown=context_breakdown,
         )
 
+        telemetry.record_turn(
+            stop_reason="error" if turn_error else stop_reason,
+            model=self._resolve_session_model(session_id),
+            engine=self._wire_adapter.engine_id,
+            duration_s=time.perf_counter() - turn_start,
+            ttft_s=ttft_s,
+        )
         if turn_error:
             return _jsonrpc_error(
                 message_id,
@@ -1660,6 +1727,10 @@ class AcpDispatcher:
 
         status_type = str(compact_res.get("status", "completed"))
         summary_text = str(compact_res.get("summary", ""))
+        get_telemetry(self._session_manager.state_store.db_path).record_compaction(
+            trigger="rpc",
+            status="failed" if status_type == "failed" else "completed",
+        )
         if status_type == "failed":
             await self._emit_notification(
                 self._wire_adapter.build_compaction_notification(
@@ -1860,6 +1931,9 @@ class AcpDispatcher:
                 session_id=session_id,
                 prompt_blocks=steer_blocks,
             )
+            get_telemetry(self._session_manager.state_store.db_path).record_steer(
+                outcome="queued" if queued else "failed"
+            )
             if queued:
                 await self._emit_notification(
                     self._wire_adapter.build_steering_notification(
@@ -1882,6 +1956,9 @@ class AcpDispatcher:
             return err
 
         queued = await self._session_manager.steer(session_id=session_id, message=raw_message)
+        get_telemetry(self._session_manager.state_store.db_path).record_steer(
+            outcome="queued" if queued else "failed"
+        )
         if queued:
             await self._emit_notification(
                 self._wire_adapter.build_steering_notification(session_id, "queued", raw_message)
@@ -2078,36 +2155,78 @@ class AcpDispatcher:
         method = parsed.get("method")
         raw_params = parsed.get("params")
         db_path = self._session_manager.state_store.db_path
-        log_acp_event(
-            "rpc.receive",
-            save_dir_or_db=db_path,
-            id=msg_id,
-            method=method,
-            params=raw_params,
-            raw_message=parsed,
-        )
-        if not isinstance(method, str) or not method.strip():
-            return _jsonrpc_error(msg_id if has_id else None, -32600, "Invalid Request")
+        telemetry = get_telemetry(db_path)
+        span_method = method.strip() if isinstance(method, str) and method.strip() else "invalid"
+        rpc_start = time.perf_counter()
 
-        if raw_params is not None and not isinstance(raw_params, dict):
-            return _jsonrpc_error(msg_id, -32602, "Invalid params") if has_id else None
-
-        response = await self._dispatch_method(
-            method,
-            msg_id,
-            raw_params,
-            parsed,
-            is_request=has_id,
-        )
-        if response is not None:
+        with telemetry.start_span(
+            f"acp.rpc.{span_method}",
+            kind=SpanKind.SERVER,
+            attributes={
+                "rpc.system": "jsonrpc",
+                "rpc.method": span_method,
+                "agy_acp.engine": self._wire_adapter.engine_id,
+            },
+        ) as span:
             log_acp_event(
-                "rpc.response",
+                "rpc.receive",
                 save_dir_or_db=db_path,
                 id=msg_id,
                 method=method,
-                response=response,
+                params=raw_params,
+                raw_message=parsed,
             )
-        return response
+            if not isinstance(method, str) or not method.strip():
+                err_resp = _jsonrpc_error(msg_id if has_id else None, -32600, "Invalid Request")
+                telemetry.record_rpc_error(
+                    span_method,
+                    code=-32600,
+                    engine=self._wire_adapter.engine_id,
+                )
+                span.set_status(Status(StatusCode.ERROR, "Invalid Request"))
+                return err_resp
+
+            if raw_params is not None and not isinstance(raw_params, dict):
+                telemetry.record_rpc_error(
+                    span_method,
+                    code=-32602,
+                    engine=self._wire_adapter.engine_id,
+                )
+                span.set_status(Status(StatusCode.ERROR, "Invalid params"))
+                return _jsonrpc_error(msg_id, -32602, "Invalid params") if has_id else None
+
+            response = await self._dispatch_method(
+                method,
+                msg_id,
+                raw_params,
+                parsed,
+                is_request=has_id,
+            )
+            duration_s = time.perf_counter() - rpc_start
+            telemetry.record_rpc_request(
+                method,
+                duration_s=duration_s,
+                engine=self._wire_adapter.engine_id,
+            )
+            if response is not None:
+                if isinstance(response.get("error"), Mapping):
+                    err_code = response["error"].get("code", -32603)
+                    telemetry.record_rpc_error(
+                        method,
+                        code=err_code,
+                        engine=self._wire_adapter.engine_id,
+                    )
+                    span.set_status(
+                        Status(StatusCode.ERROR, str(response["error"].get("message", "")))
+                    )
+                log_acp_event(
+                    "rpc.response",
+                    save_dir_or_db=db_path,
+                    id=msg_id,
+                    method=method,
+                    response=response,
+                )
+            return response
 
     def _build_initialize_response(
         self,

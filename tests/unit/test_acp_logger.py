@@ -151,3 +151,62 @@ def test_log_acp_event_redacts_raw_json_frames_and_strings_in_file_and_stderr(
     assert parsed_raw["params"]["mcpServers"][0]["env"][0]["value"] == "[REDACTED]"
     assert parsed_raw["params"]["mcpServers"][0]["headers"][0]["value"] == "[REDACTED]"
     assert parsed_raw["params"]["_meta"]["apiKey"] == "[REDACTED]"
+
+
+def test_log_acp_event_skips_disk_by_default_and_streams_to_otel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """By default `log_acp_event` does not touch `acp.log` on disk and emits redacted OTel logs."""
+    from agy_acp.providers import telemetry as tel_mod
+
+    monkeypatch.delenv("AGY_ACP_LOG_FILE", raising=False)
+    monkeypatch.delenv("AGY_ACP_LOG_DISK", raising=False)
+    monkeypatch.setenv("AGY_ACP_TELEMETRY_ENABLED", "1")
+    monkeypatch.setenv("AGY_ACP_OTLP_ENDPOINT", "http://127.0.0.1:59999")
+    tel_mod.reset_telemetry_for_tests()
+
+    mgr = tel_mod.TelemetryManager(
+        tel_mod.resolve_telemetry_config(tmp_path),
+        use_simple_processors=True,
+    )
+    monkeypatch.setattr(tel_mod, "_GLOBAL_MANAGER", mgr)
+    try:
+        with mgr.start_span("parent-span") as span:
+            log_acp_event(
+                "rpc.receive",
+                save_dir_or_db=tmp_path,
+                method="session/new",
+                headers={"Authorization": "Bearer TOP_SECRET_OTEL_999"},
+            )
+            expected_trace_id = span.get_span_context().trace_id
+
+        default_log = tmp_path / "acp.log"
+        assert not default_log.exists()
+
+        buffered = mgr.peek_buffered_logs()
+        assert len(buffered) == 1
+        rec = buffered[0].log_record
+        assert rec.trace_id == expected_trace_id
+        assert rec.attributes is not None
+        assert rec.attributes["event"] == "rpc.receive"
+        assert "TOP_SECRET_OTEL_999" not in str(rec.body)
+        assert "TOP_SECRET_OTEL_999" not in str(rec.attributes)
+    finally:
+        tel_mod.reset_telemetry_for_tests()
+
+
+def test_log_acp_event_writes_disk_when_opt_in_enabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Setting `AGY_ACP_LOG_DISK=1` opts back into writing redacted JSONL to `acp.log`."""
+    monkeypatch.delenv("AGY_ACP_LOG_FILE", raising=False)
+    monkeypatch.setenv("AGY_ACP_LOG_DISK", "1")
+
+    log_acp_event("opt_in.event", save_dir_or_db=tmp_path, detail="hello")
+    default_log = tmp_path / "acp.log"
+    assert default_log.exists()
+    parsed = json.loads(default_log.read_text(encoding="utf-8").strip())
+    assert parsed["event"] == "opt_in.event"
+    assert parsed["detail"] == "hello"

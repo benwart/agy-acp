@@ -34,6 +34,7 @@ from agy_acp.logic.tool_classifier import (
 from agy_acp.logic.wire import EngineWireAdapter, McpServerStatus, V2KiroWireAdapter
 from agy_acp.providers.agy_acp_client import AgyAcpClientProvider
 from agy_acp.providers.state_store import SqliteStateStoreProvider
+from agy_acp.providers.telemetry import TelemetryCallbacks, get_telemetry
 
 DEFAULT_MODEL_ID = "gemini-3.7-pro"
 DEFAULT_REASONING_EFFORT = "medium"
@@ -476,6 +477,36 @@ class SessionManager:
         self._mcp_status_cache: dict[str, dict[str, McpServerStatus]] = {}
         self._mcp_enabled: bool = True
         self._process_session_ids: set[str] = set()
+        get_telemetry(self._store.db_path).register_callbacks(
+            TelemetryCallbacks(
+                backend_up=lambda: 1 if self._cli.worker_pid is not None else 0,
+                session_counts=self._observe_session_counts,
+                ledger_tokens=self._observe_ledger_tokens,
+                mcp_tools_discovered=self._observe_mcp_tools,
+            )
+        )
+
+    def _observe_session_counts(self) -> dict[str, int]:
+        return {
+            "active": len(self._process_session_ids),
+            "persisted": self._store.count_sessions_silent(),
+        }
+
+    def _observe_ledger_tokens(self) -> dict[str, int]:
+        ledger = self._store.get_token_ledger(record_metric=False)
+        return {
+            "input": ledger.get("input_tokens", 0),
+            "output": ledger.get("output_tokens", 0),
+            "cached": ledger.get("cached_read_tokens", 0),
+            "thought": ledger.get("thinking_tokens", 0),
+        }
+
+    def _observe_mcp_tools(self) -> dict[str, int]:
+        per_server: dict[str, int] = {}
+        for status_map in self._mcp_status_cache.values():
+            for srv_name, status in status_map.items():
+                per_server[srv_name] = max(per_server.get(srv_name, 0), len(status.tools))
+        return per_server
 
     async def close(self) -> None:
         """Close the underlying `AgyAcpClientProvider` and any active `agy acp` process."""

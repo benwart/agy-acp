@@ -1,0 +1,10 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: "agy-acp-otel"
+    scrape_interval: 5s
+    honor_labels: true
+    static_configs:
+      - targets: ["otel-collector:8889"]

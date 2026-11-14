@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from agy_acp.providers.acp_logger import resolve_log_file_path
+from agy_acp.providers.acp_logger import is_disk_logging_enabled, resolve_log_file_path
 
 
 def default(
@@ -27,7 +27,13 @@ def default(
         return 0
 
     if not log_path.exists():
-        print(f"No log file found at {log_path}")
+        if not is_disk_logging_enabled(save_dir):
+            print(
+                f"No log file found at {log_path} "
+                "(disk logging is disabled by default; logs stream via OpenTelemetry)."
+            )
+        else:
+            print(f"No log file found at {log_path}")
         return 0
 
     lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
