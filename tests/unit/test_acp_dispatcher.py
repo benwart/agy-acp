@@ -4353,3 +4353,86 @@ async def test_kas_v3_emits_live_mid_turn_usage_updates_without_cost_and_avoids_
         assert "cost" not in updates2[i]
     assert usage_indices[0] < chunk_indices[0] < usage_indices[1] < chunk_indices[1]
     assert ctx_idx < usage_indices[-1] < comp_idx
+
+
+def test_should_deny_lazy_call_mcp_tool_when_tool_or_server_disabled(tmp_path: Path) -> None:
+    """Verify `_evaluate_tool_permission` denies `disabledTools` and `disabled` MCP servers."""
+    from agy_acp.logic.acp_dispatcher import _to_normalized_tool_event
+    from agy_acp.logic.wire import V3KasWireAdapter
+    from agy_acp.providers.agy_acp_client import (
+        _build_tool_event_from_record,
+        _merge_tool_record,
+    )
+
+    async def _sink(_: dict[str, Any]) -> None:
+        return None
+
+    cli = _StubAgyAcpClientProvider(save_dir=tmp_path)
+    mgr = SessionManager(save_dir=tmp_path, cli_provider=cli, wire_adapter=V3KasWireAdapter())
+    dispatcher = AcpDispatcher(
+        notification_sink=_sink,
+        session_manager=mgr,
+        quota_tracker=QuotaTracker(
+            provider=QuotaProvider(cli_provider=cli),
+            state_store=cli.state_store,
+        ),
+        wire_adapter=V3KasWireAdapter(),
+    )
+    session_state: dict[str, Any] = {
+        "agentAllowedTools": ["*"],
+        "mcp_servers": [
+            {
+                "name": "kirocrew-core",
+                "command": "kiro-mcp",
+                "disabledTools": ["dangerous_op"],
+            },
+            {
+                "name": "toggled-off-srv",
+                "command": "off-mcp",
+                "disabled": True,
+            },
+        ],
+    }
+    known_servers = ("kirocrew-core", "toggled-off-srv")
+
+    def _make_lazy_norm(server_name: str, tool_name: str) -> Any:
+        raw_args = {"ServerName": server_name, "ToolName": tool_name, "Arguments": {"x": 1}}
+        merged = _merge_tool_record(
+            {},
+            {"title": "call_mcp_tool", "rawInput": raw_args, "status": "in_progress"},
+        )
+        _, _, ev = _build_tool_event_from_record(
+            "tc_lazy",
+            merged,
+            known_mcp_servers=known_servers,
+            status_override="in_progress",
+        )
+        return _to_normalized_tool_event(ev, known_mcp_servers=known_servers)
+
+    assert (
+        dispatcher._evaluate_tool_permission(
+            session=session_state,
+            spec=None,
+            norm=_make_lazy_norm("kirocrew-core", "dangerous_op"),
+            session_mode="auto",
+        )
+        == "deny"
+    )
+    assert (
+        dispatcher._evaluate_tool_permission(
+            session=session_state,
+            spec=None,
+            norm=_make_lazy_norm("toggled-off-srv", "any_tool"),
+            session_mode="auto",
+        )
+        == "deny"
+    )
+    assert (
+        dispatcher._evaluate_tool_permission(
+            session=session_state,
+            spec=None,
+            norm=_make_lazy_norm("kirocrew-core", "safe_op"),
+            session_mode="auto",
+        )
+        == "allow"
+    )

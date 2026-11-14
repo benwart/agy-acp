@@ -87,6 +87,13 @@ def _write_custom_fake_agy(bin_path: Path, trace_file: Path, marker_file: Path) 
 import json, os, pathlib, queue, sys, threading, time
 
 args = sys.argv[1:]
+gemini_dir = args[args.index("--gemini-dir") + 1] if "--gemini-dir" in args else ""
+lazy_cfg_path = pathlib.Path(gemini_dir) / "config" / "mcp_config.json" if gemini_dir else None
+lazy_mcp_config = (
+    json.loads(lazy_cfg_path.read_text(encoding="utf-8"))
+    if lazy_cfg_path and lazy_cfg_path.is_file()
+    else None
+)
 
 prompt = ""
 for i, arg in enumerate(args):
@@ -294,6 +301,7 @@ while True:
             "configs": dict(s.get("configs", {{}})),
             "system_prompt": s.get("system_prompt", ""),
             "mcp_servers": s.get("mcp_servers", []),
+            "lazy_mcp_config": lazy_mcp_config,
         }}
         with open({str(trace_file)!r}, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(trace_entry) + "\\n")
@@ -537,7 +545,8 @@ async def test_kas_v3_initialize_mcp_catalog_custom_agent_and_mandate_injection(
     assert "[AGENT SYSTEM PROMPT]" in sys_prompt
     assert "You are Kiro v3 custom agent." in sys_prompt
     assert traces[0]["prompt"] == "Verify turn 1 mandate"
-    mcp_env = {item["name"]: item["value"] for item in traces[0]["mcp_servers"][0]["env"]}
+    assert traces[0]["mcp_servers"] == []
+    mcp_env = traces[0]["lazy_mcp_config"]["mcpServers"]["kirocrew-core"]["env"]
     assert mcp_env["KIROCREW_PORT"] == "9444"
     assert mcp_env["KIROCREW_STUB_SESSION_TOKEN"] == "tok-live-v3"
     assert mcp_env["KIROCREW_ROUTE_SPAWN_RUN"] == "1"

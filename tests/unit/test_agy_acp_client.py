@@ -15,6 +15,7 @@ from agy_acp.logic.tool_classifier import FALLBACK_MODELS, ToolCallEvent
 from agy_acp.providers.agy_acp_client import (
     AgyAcpClientProvider,
     format_acp_mcp_servers,
+    format_lazy_mcp_config,
     normalize_acp_content_blocks,
 )
 from agy_acp.providers.state_store import SqliteStateStoreProvider
@@ -51,10 +52,33 @@ def send_frame(payload: dict) -> None:
         sys.stdout.flush()
 
 
+def _extract_flag_value(argv: list[str], flag: str) -> str | None:
+    if flag in argv:
+        idx = argv.index(flag)
+        if idx + 1 < len(argv):
+            return argv[idx + 1]
+    return None
+
+
+_spawn_argv = sys.argv[1:]
+_spawn_gemini_dir = _extract_flag_value(_spawn_argv, "--gemini-dir")
+_spawn_app_data_dir = _extract_flag_value(_spawn_argv, "--app-data-dir")
+_spawn_lazy_mcp_config = None
+_spawn_mcp_config_mode = None
+if _spawn_gemini_dir:
+    _mcp_cfg_path = Path(_spawn_gemini_dir) / "config" / "mcp_config.json"
+    if _mcp_cfg_path.is_file():
+        _spawn_lazy_mcp_config = json.loads(_mcp_cfg_path.read_text(encoding="utf-8"))
+        _spawn_mcp_config_mode = oct(_mcp_cfg_path.stat().st_mode & 0o777)
+
 append_record({
     "type": "spawn",
     "pid": os.getpid(),
-    "argv": sys.argv[1:],
+    "argv": _spawn_argv,
+    "gemini_dir": _spawn_gemini_dir,
+    "app_data_dir": _spawn_app_data_dir,
+    "lazy_mcp_config": _spawn_lazy_mcp_config,
+    "mcp_config_mode": _spawn_mcp_config_mode,
     "pythoninspect": os.environ.get("PYTHONINSPECT"),
     "pythonstartup": os.environ.get("PYTHONSTARTUP"),
     "stub_token": os.environ.get("KIROCREW_STUB_SESSION_TOKEN"),
@@ -1023,8 +1047,18 @@ async def test_should_create_and_load_backend_session_with_mcp_meta_mode_and_fal
         assert first_new["params"]["_meta"] == {
             "antigravity": {"systemPrompt": {"append": "Injected Kiro instructions"}}
         }
-        assert len(first_new["params"]["mcpServers"]) == 2
-        assert first_new["params"]["mcpServers"][1]["type"] == "http"
+        assert first_new["params"]["mcpServers"] == []
+
+        spawns = [r for r in _read_mock_records(state_file) if r["type"] == "spawn"]
+        lazy_spawns = [s for s in spawns if s.get("lazy_mcp_config") is not None]
+        assert len(lazy_spawns) >= 1
+        first_lazy = lazy_spawns[0]["lazy_mcp_config"]["mcpServers"]
+        assert first_lazy["kirocrew-core"] == {
+            "command": "kiro-mcp",
+            "args": ["--stdio"],
+            "env": {"KIROCREW_SESSION_KEY": "sess-k1"},
+        }
+        assert first_lazy["remote-api"] == {"url": "https://api.example.com/mcp"}
 
         mode_configs = [
             m["params"]["value"]
@@ -1860,3 +1894,157 @@ async def test_should_keep_context_tokens_separate_from_cumulative_turn_totals_a
         "thinking_tokens": 50,
         "total_tokens": 6050,
     }
+
+
+def test_should_format_lazy_mcp_config_merging_base_and_filtering_legacy_shims(
+    tmp_path: Path,
+) -> None:
+    """Verify `format_lazy_mcp_config` keeps tools lazy, merges base config, and drops shims."""
+    base_servers: dict[str, Any] = {
+        "rea": {"command": "/usr/local/bin/rea-mcp", "args": []},
+        "kirocrew-stale": {
+            "command": "python3",
+            "args": ["-m", "agy_acp.providers.mcp_session_mux", "kirocrew-stale"],
+        },
+        "kirocrew-core": {
+            "command": "python3",
+            "args": ["-m", "agy_acp.providers.mcp_session_mux", "kirocrew-core"],
+        },
+        "user-toggled-off": {"command": "some-mcp", "args": []},
+    }
+    session_servers: list[dict[str, Any]] = [
+        {
+            "name": "kirocrew-core",
+            "command": "kiro-mcp",
+            "args": ["--stdio"],
+            "cwd": str(tmp_path),
+            "env": [{"name": "BASE_K", "value": "1"}],
+            "disabledTools": ["dangerous_tool"],
+            "tools": {"eager": True},
+        },
+        {
+            "type": "http",
+            "name": "remote-api",
+            "url": "https://api.example.com/mcp",
+            "headers": [{"name": "Authorization", "value": "Bearer tok"}],
+        },
+        {"name": "user-toggled-off", "command": "some-mcp", "disabled": True},
+    ]
+    lazy_cfg = format_lazy_mcp_config(
+        session_servers,
+        session_env={"KIROCREW_SESSION_KEY": "sess-xyz"},
+        base_mcp_servers=base_servers,
+    )
+    servers = lazy_cfg["mcpServers"]
+    assert set(servers) == {"rea", "kirocrew-core", "remote-api"}
+    assert "kirocrew-stale" not in servers
+    assert "user-toggled-off" not in servers
+    assert servers["kirocrew-core"] == {
+        "command": "kiro-mcp",
+        "args": ["--stdio"],
+        "cwd": str(tmp_path.resolve()),
+        "env": {"BASE_K": "1", "KIROCREW_SESSION_KEY": "sess-xyz"},
+        "disabledTools": ["dangerous_tool"],
+    }
+    assert "tools" not in servers["kirocrew-core"]
+    assert servers["remote-api"] == {
+        "url": "https://api.example.com/mcp",
+        "headers": {"Authorization": "Bearer tok"},
+    }
+
+
+async def test_should_isolate_concurrent_lazy_mcp_sessions_preserve_symlinks_and_cleanup(
+    tmp_path: Path,
+) -> None:
+    """Verify isolated `--gemini-dir` per MCP profile, symlink preservation, and cleanup."""
+    script, state_file = _make_mock_agy(tmp_path)
+    store = SqliteStateStoreProvider(tmp_path / "state")
+
+    fake_gemini = tmp_path / "fake_gemini"
+    (fake_gemini / "antigravity-cli").mkdir(parents=True)
+    (fake_gemini / "antigravity-cli" / "installation_id").write_text("inst-1", encoding="utf-8")
+    (fake_gemini / "GEMINI.md").write_text("# Global rule\n", encoding="utf-8")
+    (fake_gemini / "jetski-standalone-oauth-token").write_text("oauth-secret", encoding="utf-8")
+    cfg_dir = fake_gemini / "config"
+    (cfg_dir / "skills" / "demo-skill").mkdir(parents=True)
+    skill_md = cfg_dir / "skills" / "demo-skill" / "SKILL.md"
+    skill_md.write_text("# Demo Skill\n", encoding="utf-8")
+    (cfg_dir / ".migrated").write_text("", encoding="utf-8")
+    (cfg_dir / "config.json").write_text('{"theme":"dark"}', encoding="utf-8")
+    # Include JSONC comments and trailing comma + broken legacy shim
+    (cfg_dir / "mcp_config.json").write_text(
+        """{
+          // User custom MCP server
+          "mcpServers": {
+            "rea": {"command": "rea-bin", "args": ["--serve"],},
+            "kirocrew-core": {
+              "command": "python3",
+              "args": ["-m", "agy_acp.providers.mcp_session_mux", "kirocrew-core"],
+            },
+          },
+        }""",
+        encoding="utf-8",
+    )
+
+    mcp_list = [{"name": "kirocrew-core", "command": "kiro-mcp", "args": ["serve"]}]
+
+    gemini_dirs_seen: list[Path] = []
+    async with AgyAcpClientProvider(
+        bin_path=script,
+        state_store=store,
+        base_gemini_dir=fake_gemini,
+        env={"MOCK_AGY_STATE_FILE": str(state_file)},
+    ) as client:
+        s_a1 = await client.create_backend_session(
+            cwd=str(tmp_path),
+            mcp_servers=mcp_list,
+            session_env={"KIROCREW_SESSION_KEY": "sess-A"},
+        )
+        # Identical MCP + session_env reuses same connection without spawning a duplicate
+        s_a2 = await client.create_backend_session(
+            cwd=str(tmp_path),
+            mcp_servers=mcp_list,
+            session_env={"KIROCREW_SESSION_KEY": "sess-A"},
+        )
+        # Distinct session_env gets its own isolated `--gemini-dir`
+        s_b = await client.create_backend_session(
+            cwd=str(tmp_path),
+            mcp_servers=mcp_list,
+            session_env={"KIROCREW_SESSION_KEY": "sess-B"},
+        )
+        assert s_a1["agySessionId"] != s_a2["agySessionId"] != s_b["agySessionId"]
+
+        spawns = [r for r in _read_mock_records(state_file) if r["type"] == "spawn"]
+        assert len(spawns) == 2
+        for sp in spawns:
+            gdir = Path(sp["gemini_dir"])
+            gemini_dirs_seen.append(gdir)
+            assert gdir.is_dir()
+            assert sp["app_data_dir"] is None
+            assert (gdir / "antigravity-cli").is_symlink()
+            assert (gdir / "antigravity-cli").resolve() == (
+                fake_gemini / "antigravity-cli"
+            ).resolve()
+            assert sp["mcp_config_mode"] == "0o600"
+            assert (gdir / "GEMINI.md").is_symlink()
+            assert (gdir / "jetski-standalone-oauth-token").is_symlink()
+            assert (gdir / "config" / ".migrated").is_symlink()
+            assert (gdir / "config" / "skills" / "demo-skill" / "SKILL.md").is_file()
+            assert sp["lazy_mcp_config"]["mcpServers"]["rea"] == {
+                "command": "rea-bin",
+                "args": ["--serve"],
+            }
+
+        tokens = {
+            sp["lazy_mcp_config"]["mcpServers"]["kirocrew-core"]["env"]["KIROCREW_SESSION_KEY"]
+            for sp in spawns
+        }
+        assert tokens == {"sess-A", "sess-B"}
+
+    # All temp `--gemini-dir` folders removed on close, user files untouched
+    for gdir in gemini_dirs_seen:
+        assert not gdir.exists()
+    assert skill_md.read_text(encoding="utf-8") == "# Demo Skill\n"
+    assert (fake_gemini / "jetski-standalone-oauth-token").read_text(
+        encoding="utf-8"
+    ) == "oauth-secret"

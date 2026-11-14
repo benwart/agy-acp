@@ -376,9 +376,13 @@ async def test_prompt_isolates_per_session_mcp_token_and_injects_spawn_run_routi
     fake_agy = tmp_path / "agy"
     fake_agy.write_text(
         "#!/usr/bin/env python3\n"
-        "import json, os, sys\n"
+        "import json, os, pathlib, sys\n"
         "sessions = {}\n"
         "seq = 0\n"
+        "gdir = sys.argv[sys.argv.index('--gemini-dir') + 1]"
+        " if '--gemini-dir' in sys.argv else ''\n"
+        "lazy_mcp = json.loads((pathlib.Path(gdir) / 'config' / 'mcp_config.json').read_text())"
+        " if gdir else None\n"
         "for raw in sys.stdin:\n"
         "    line = raw.strip()\n"
         "    if not line:\n"
@@ -424,6 +428,7 @@ async def test_prompt_isolates_per_session_mcp_token_and_injects_spawn_run_routi
         "        resp = json.dumps({\n"
         "            'procStubToken': os.environ.get('KIROCREW_STUB_SESSION_TOKEN'),\n"
         "            'mcpServers': s['mcpServers'],\n"
+        "            'lazyMcpConfig': lazy_mcp,\n"
         "            'systemPromptAppend': s['meta'].get('antigravity', {})"
         ".get('systemPrompt', {}).get('append', ''),\n"
         "            'configs': s['configs'],\n"
@@ -479,9 +484,9 @@ async def test_prompt_isolates_per_session_mcp_token_and_injects_spawn_run_routi
         )
         parent_payload = json.loads(parent_res["response"])
         assert parent_payload["procStubToken"] is None
-        parent_mcp = parent_payload["mcpServers"][0]
-        parent_env = {item["name"]: item["value"] for item in parent_mcp["env"]}
-        assert parent_env["KIROCREW_STUB_SESSION_TOKEN"] == "tok-parent-aaa"
+        assert parent_payload["mcpServers"] == []
+        parent_lazy_mcp = parent_payload["lazyMcpConfig"]["mcpServers"]["kirocrew-core"]
+        assert parent_lazy_mcp["env"]["KIROCREW_STUB_SESSION_TOKEN"] == "tok-parent-aaa"
         assert "spawn_run" in parent_payload["systemPromptAppend"]
         assert "invoke_subagent" in parent_payload["systemPromptAppend"]
         assert parent_payload["promptBlocks"] == [{"type": "text", "text": "Run drift review"}]

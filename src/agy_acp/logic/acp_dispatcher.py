@@ -189,6 +189,31 @@ def _resolve_v2_tool_meta(
     return kiro_tool_name, event.mcp_server_name, kiro_tool_id
 
 
+def _is_mcp_tool_disabled(session: Mapping[str, Any], norm: NormalizedToolEvent) -> bool:
+    """Return True if `norm` targets a disabled MCP server or a tool in `disabledTools`."""
+    if not norm.is_mcp:
+        return False
+    raw_servers = session.get("mcp_servers")
+    if not isinstance(raw_servers, Sequence) or isinstance(raw_servers, (str, bytes)):
+        return False
+    for srv in raw_servers:
+        if not isinstance(srv, Mapping):
+            continue
+        if str(srv.get("name") or "").strip() != norm.mcp_server:
+            continue
+        if srv.get("disabled") is True:
+            return True
+        raw_dt = (
+            srv.get("disabledTools")
+            if srv.get("disabledTools") is not None
+            else srv.get("disabled_tools")
+        )
+        if isinstance(raw_dt, Sequence) and not isinstance(raw_dt, (str, bytes)):
+            if any(str(t).strip() == norm.mcp_tool for t in raw_dt):
+                return True
+    return False
+
+
 def _matches_agent_tool_list(
     patterns: Sequence[str],
     norm: NormalizedToolEvent,
@@ -712,6 +737,9 @@ class AcpDispatcher:
             "edit",
             "delete",
         }:
+            return "deny"
+
+        if _is_mcp_tool_disabled(session, norm):
             return "deny"
 
         excluded_tools: tuple[str, ...] = (

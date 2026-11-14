@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
+import atexit
 import contextlib
+import hashlib
 import json
 import math
 import os
+import shutil
 import signal
 import subprocess
+import tempfile
 from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -124,6 +129,291 @@ def _empty_usage() -> dict[str, int]:
     }
 
 
+_LEGACY_MCP_SHIM_MODULE = "agy_acp.providers.mcp_session_mux"
+
+
+def _strip_jsonc(raw: str) -> str:
+    """Strip `//` and `/* */` comments plus trailing commas outside JSON string literals."""
+    out: list[str] = []
+    i = 0
+    n = len(raw)
+    in_string = False
+    while i < n:
+        ch = raw[i]
+        if in_string:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(raw[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_string = False
+            i += 1
+            continue
+
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == "/" and i + 1 < n and raw[i + 1] == "/":
+            i += 2
+            while i < n and raw[i] not in "\r\n":
+                i += 1
+            continue
+
+        if ch == "/" and i + 1 < n and raw[i + 1] == "*":
+            end = raw.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            continue
+
+        out.append(ch)
+        i += 1
+
+    no_comments = "".join(out)
+    cleaned: list[str] = []
+    i = 0
+    m = len(no_comments)
+    in_string = False
+    while i < m:
+        ch = no_comments[i]
+        if in_string:
+            cleaned.append(ch)
+            if ch == "\\" and i + 1 < m:
+                cleaned.append(no_comments[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_string = False
+            i += 1
+            continue
+
+        if ch == '"':
+            in_string = True
+            cleaned.append(ch)
+            i += 1
+            continue
+
+        if ch == ",":
+            j = i + 1
+            while j < m and no_comments[j] in " \t\r\n":
+                j += 1
+            if j < m and no_comments[j] in "}]":
+                i += 1
+                continue
+
+        cleaned.append(ch)
+        i += 1
+
+    return "".join(cleaned)
+
+
+def _is_legacy_mcp_shim(entry: Mapping[str, Any]) -> bool:
+    """Return True if `entry` invokes the retired `agy_acp.providers.mcp_session_mux` shim."""
+    raw_args = entry.get("args")
+    if isinstance(raw_args, Sequence) and not isinstance(raw_args, (str, bytes)):
+        return any(_LEGACY_MCP_SHIM_MODULE in str(arg) for arg in raw_args)
+    return False
+
+
+def _load_base_mcp_servers(base_gemini_dir: Path | None) -> dict[str, dict[str, Any]]:
+    """Read existing user `mcpServers` from `<base_gemini_dir>/config/mcp_config.json`."""
+    if base_gemini_dir is None:
+        return {}
+    cfg_path = base_gemini_dir / "config" / "mcp_config.json"
+    if not cfg_path.is_file():
+        return {}
+    try:
+        parsed = json.loads(_strip_jsonc(cfg_path.read_text(encoding="utf-8-sig")))
+    except OSError, ValueError:
+        return {}
+    if not isinstance(parsed, Mapping):
+        return {}
+    raw_servers = parsed.get("mcpServers")
+    if not isinstance(raw_servers, Mapping):
+        return {}
+    return {
+        str(k): dict(v)
+        for k, v in raw_servers.items()
+        if str(k).strip() and isinstance(v, Mapping) and not _is_legacy_mcp_shim(v)
+    }
+
+
+def _inject_session_mcp_env(
+    env_map: dict[str, str],
+    session_env: Mapping[str, str] | None,
+) -> dict[str, str]:
+    """Merge per-session Kiro Crew environment keys into `env_map`."""
+    merged = dict(env_map)
+    if session_env is not None:
+        for env_key in (*PER_SESSION_MCP_ENV_KEYS, "KIROCREW_ROUTE_SPAWN_RUN"):
+            val = session_env.get(env_key)
+            if isinstance(val, str) and val:
+                merged[env_key] = val
+    return merged
+
+
+def _extract_disabled_tool_names(raw_srv: Mapping[str, Any]) -> list[str]:
+    """Extract normalized `disabledTools` names from `raw_srv`."""
+    raw_dt = (
+        raw_srv.get("disabledTools")
+        if raw_srv.get("disabledTools") is not None
+        else raw_srv.get("disabled_tools")
+    )
+    if not isinstance(raw_dt, Sequence) or isinstance(raw_dt, (str, bytes)):
+        return []
+    return [str(item).strip() for item in raw_dt if str(item).strip()]
+
+
+def format_lazy_mcp_config(
+    servers: Sequence[Mapping[str, Any]] | None,
+    *,
+    session_env: Mapping[str, str] | None = None,
+    base_mcp_servers: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Build Antigravity `mcp_config.json` payload so `agy acp` loads MCP tools lazily."""
+    merged: dict[str, dict[str, Any]] = {}
+    if base_mcp_servers:
+        for base_name, base_entry in base_mcp_servers.items():
+            clean_name = str(base_name).strip()
+            if (
+                clean_name
+                and isinstance(base_entry, Mapping)
+                and not _is_legacy_mcp_shim(base_entry)
+            ):
+                merged[clean_name] = dict(base_entry)
+
+    if not servers:
+        return {"mcpServers": merged}
+
+    seen_names: set[str] = set()
+    for raw_srv in servers:
+        if not isinstance(raw_srv, Mapping):
+            continue
+        raw_name = str(raw_srv.get("name") or "").strip()
+        if raw_srv.get("disabled") is True:
+            if raw_name:
+                merged.pop(raw_name, None)
+            continue
+
+        translated = translate_mcp_server(dict(raw_srv))
+        name = str(translated.get("name") or raw_name).strip()
+        if not name or name in seen_names:
+            continue
+        if translated.get("disabled") is True:
+            merged.pop(name, None)
+            continue
+
+        disabled_tools = _extract_disabled_tool_names(raw_srv)
+        is_http = (
+            translated.get("type") == "http"
+            or ("url" in raw_srv and "command" not in raw_srv)
+            or ("serverUrl" in raw_srv and "command" not in raw_srv)
+        )
+        if is_http:
+            url = str(translated.get("url") or raw_srv.get("serverUrl") or "").strip()
+            if not url:
+                continue
+            headers_map = _pairs_to_dict(translated.get("headers"))
+            entry: dict[str, Any] = {"url": url}
+            if headers_map:
+                entry["headers"] = headers_map
+            if disabled_tools:
+                entry["disabledTools"] = disabled_tools
+            seen_names.add(name)
+            merged[name] = entry
+            continue
+
+        cmd = str(translated.get("command") or "").strip()
+        if not cmd:
+            continue
+        env_map = _inject_session_mcp_env(_pairs_to_dict(translated.get("env")), session_env)
+        entry = {
+            "command": cmd,
+            "args": [str(arg) for arg in translated.get("args", [])],
+        }
+        raw_cwd = str(raw_srv.get("cwd") or translated.get("cwd") or "").strip()
+        if raw_cwd:
+            entry["cwd"] = str(Path(raw_cwd).expanduser().resolve())
+        if env_map:
+            entry["env"] = env_map
+        if disabled_tools:
+            entry["disabledTools"] = disabled_tools
+        seen_names.add(name)
+        merged[name] = entry
+
+    return {"mcpServers": merged}
+
+
+class _LazyMcpWorkspace:
+    """Isolated `--gemini-dir` directory materializing lazy `mcp_config.json` + user symlinks."""
+
+    def __init__(
+        self,
+        *,
+        lazy_mcp_config: Mapping[str, Any],
+        base_gemini_dir: Path | None,
+    ) -> None:
+        self.gemini_dir = Path(tempfile.mkdtemp(prefix="agy-acp-gemini-"))
+        self._cleaned = False
+        config_dir = self.gemini_dir / "config"
+        config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+        if base_gemini_dir is not None and base_gemini_dir.is_dir():
+            self._symlink_children(base_gemini_dir, self.gemini_dir, skip={"config"})
+            base_cfg_dir = base_gemini_dir / "config"
+            if base_cfg_dir.is_dir():
+                self._symlink_children(
+                    base_cfg_dir,
+                    config_dir,
+                    skip_prefix="mcp_config.json",
+                )
+            self.app_data_dir = base_gemini_dir / "antigravity-cli"
+        else:
+            self.app_data_dir = self.gemini_dir / "antigravity-cli"
+
+        mcp_cfg_file = config_dir / "mcp_config.json"
+        encoded = json.dumps(lazy_mcp_config, indent=2, sort_keys=True).encode("utf-8")
+        fd = os.open(mcp_cfg_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, encoded)
+        finally:
+            os.close(fd)
+
+        atexit.register(self.cleanup)
+
+    @staticmethod
+    def _symlink_children(
+        src_dir: Path,
+        dst_dir: Path,
+        *,
+        skip: set[str] | None = None,
+        skip_prefix: str = "",
+    ) -> None:
+        with contextlib.suppress(OSError):
+            for child in src_dir.iterdir():
+                name = child.name
+                if (skip and name in skip) or (skip_prefix and name.startswith(skip_prefix)):
+                    continue
+                target = dst_dir / name
+                if not target.exists() and not target.is_symlink():
+                    with contextlib.suppress(OSError):
+                        target.symlink_to(child)
+
+    @property
+    def extra_cli_args(self) -> tuple[str, ...]:
+        return ("--gemini-dir", str(self.gemini_dir))
+
+    def cleanup(self) -> None:
+        if self._cleaned:
+            return
+        self._cleaned = True
+        with contextlib.suppress(Exception):
+            atexit.unregister(self.cleanup)
+        shutil.rmtree(self.gemini_dir, ignore_errors=True)
+
+
 def format_acp_mcp_servers(
     servers: Sequence[Mapping[str, Any]] | None,
     *,
@@ -162,12 +452,7 @@ def format_acp_mcp_servers(
         cmd = str(translated.get("command") or "").strip()
         if not cmd:
             continue
-        env_map = _pairs_to_dict(translated.get("env"))
-        if session_env is not None:
-            for env_key in (*PER_SESSION_MCP_ENV_KEYS, "KIROCREW_ROUTE_SPAWN_RUN"):
-                val = session_env.get(env_key)
-                if isinstance(val, str) and val:
-                    env_map[env_key] = val
+        env_map = _inject_session_mcp_env(_pairs_to_dict(translated.get("env")), session_env)
 
         seen_names.add(name)
         formatted.append(
@@ -559,6 +844,8 @@ class _AcpSubprocessConnection:
         bin_path: str,
         env: dict[str, str],
         save_dir_or_db: Path,
+        extra_args: Sequence[str] = (),
+        profile_key: str = "",
         on_server_request: Callable[
             [_AcpSubprocessConnection, dict[str, Any]], Coroutine[Any, Any, None]
         ],
@@ -570,6 +857,8 @@ class _AcpSubprocessConnection:
         self._bin_path = bin_path
         self._env = env
         self._save_dir_or_db = save_dir_or_db
+        self._extra_args: tuple[str, ...] = tuple(str(a) for a in extra_args)
+        self.profile_key = profile_key
         self._on_server_request = on_server_request
         self._on_notification = on_notification
         self._on_disconnect = on_disconnect
@@ -596,6 +885,7 @@ class _AcpSubprocessConnection:
         self.initialized = False
         self.supports_tier = False
         self._tg_stack: contextlib.AsyncExitStack | None = None
+        self._actor_task: asyncio.Task[None] | None = None
 
     @property
     def is_closed(self) -> bool:
@@ -615,9 +905,14 @@ class _AcpSubprocessConnection:
         if supervisor_tg is not None:
             supervisor_tg.start_soon(self._actor_main)
         else:
-            self._tg_stack = contextlib.AsyncExitStack()
-            tg = await self._tg_stack.enter_async_context(anyio.create_task_group())
-            tg.start_soon(self._actor_main)
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                self._tg_stack = contextlib.AsyncExitStack()
+                tg = await self._tg_stack.enter_async_context(anyio.create_task_group())
+                tg.start_soon(self._actor_main)
+            else:
+                self._actor_task = loop.create_task(self._actor_main())
         await self._ready_event.wait()
         if self._spawn_error is not None:
             await self.close()
@@ -631,7 +926,11 @@ class _AcpSubprocessConnection:
             await self._closed_event.wait()
 
     async def close_stack(self) -> None:
-        """Exit any connection-owned `AsyncExitStack` outside active shield scopes."""
+        """Exit any connection-owned background task or `AsyncExitStack` outside shield scopes."""
+        if self._actor_task is not None:
+            task, self._actor_task = self._actor_task, None
+            with contextlib.suppress(BaseException):
+                await task
         if self._tg_stack is not None:
             stack, self._tg_stack = self._tg_stack, None
             with contextlib.suppress(BaseException):
@@ -716,7 +1015,7 @@ class _AcpSubprocessConnection:
         return dict(result) if isinstance(result, Mapping) else {}
 
     async def _actor_main(self) -> None:
-        args = [self._bin_path, "acp", "--stdio", "--process-per-session"]
+        args = [self._bin_path, "acp", "--stdio", "--process-per-session", *self._extra_args]
         try:
             log_acp_event(
                 "agy_acp.spawn",
@@ -891,17 +1190,21 @@ class AgyAcpClientProvider:
         bin_path: str | Path | None = None,
         save_dir: Path | None = None,
         state_store: SqliteStateStoreProvider | None = None,
+        base_gemini_dir: Path | None = None,
         env: Mapping[str, str] | None = None,
         rpc_timeout: float = 60.0,
     ) -> None:
         self._explicit_bin = bin_path
         self._store = state_store or SqliteStateStoreProvider(save_dir)
         self._is_custom_store = self._store.db_path.parent != (Path.home() / ".config" / "agy-acp")
+        self._base_gemini_dir = base_gemini_dir
         self._base_env: dict[str, str] = dict(env) if env is not None else {}
         self._rpc_timeout = rpc_timeout
 
         self._conn_lock = anyio.Lock()
-        self._conn: _AcpSubprocessConnection | None = None
+        self._conns: dict[str, _AcpSubprocessConnection] = {}
+        self._lazy_workspaces: dict[str, _LazyMcpWorkspace] = {}
+        self._session_profiles: dict[str, tuple[str, dict[str, Any] | None]] = {}
         self._retired_conns: list[_AcpSubprocessConnection] = []
         self._tg_stack: contextlib.AsyncExitStack | None = None
         self._supervisor_tg: anyio.abc.TaskGroup | None = None
@@ -912,6 +1215,50 @@ class AgyAcpClientProvider:
         self._session_to_agy_sid: dict[str, str] = {}
         self._turn_states: dict[str, _ActiveTurnState] = {}
         self._steer_queues: dict[str, list[_QueuedAcpSteer]] = {}
+
+    @property
+    def _conn(self) -> _AcpSubprocessConnection | None:
+        default_conn = self._conns.get("")
+        if default_conn is not None and not default_conn.is_closed:
+            return default_conn
+        for conn in reversed(list(self._conns.values())):
+            if not conn.is_closed:
+                return conn
+        return default_conn
+
+    def _effective_base_gemini_dir(self) -> Path | None:
+        if self._base_gemini_dir is not None:
+            return self._base_gemini_dir
+        default_dir = Path.home() / ".gemini"
+        return default_dir if default_dir.is_dir() else None
+
+    def _compute_mcp_profile(
+        self,
+        mcp_servers: Sequence[Mapping[str, Any]] | None,
+        session_env: Mapping[str, str] | None,
+    ) -> tuple[str, dict[str, Any] | None]:
+        if not mcp_servers:
+            return "", None
+        base_servers = _load_base_mcp_servers(self._effective_base_gemini_dir())
+        lazy_cfg = format_lazy_mcp_config(
+            mcp_servers,
+            session_env=session_env,
+            base_mcp_servers=base_servers,
+        )
+        canonical = json.dumps(lazy_cfg, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()[:16], lazy_cfg
+
+    def _conn_for_agy_session(self, agy_session_id: str) -> _AcpSubprocessConnection | None:
+        if agy_session_id:
+            profile_info = self._session_profiles.get(agy_session_id)
+            if profile_info is not None:
+                conn = self._conns.get(profile_info[0])
+                if conn is not None and not conn.is_closed:
+                    return conn
+            for conn in self._conns.values():
+                if not conn.is_closed and agy_session_id in conn.loaded_sessions:
+                    return conn
+        return self._conn
 
     @property
     def state_store(self) -> SqliteStateStoreProvider:
@@ -950,14 +1297,19 @@ class AgyAcpClientProvider:
         await self.close()
 
     async def close(self) -> None:
-        """Shut down the active `agy acp` subprocess cleanly even under task cancellation."""
+        """Shut down active `agy acp` subprocesses and remove isolated `--gemini-dir` folders."""
         with anyio.CancelScope(shield=True):
             async with self._conn_lock:
-                conns = [c for c in (self._conn, *reversed(self._retired_conns)) if c is not None]
-                self._conn = None
+                conns = [*self._conns.values(), *reversed(self._retired_conns)]
+                workspaces = list(self._lazy_workspaces.values())
+                self._conns.clear()
+                self._lazy_workspaces.clear()
+                self._session_profiles.clear()
                 self._retired_conns.clear()
             for c in conns:
                 await c.shutdown()
+            for ws in workspaces:
+                ws.cleanup()
         for c in conns:
             await c.close_stack()
         if self._tg_stack is not None:
@@ -982,23 +1334,40 @@ class AgyAcpClientProvider:
         return await run_agy_slash_json(command, agy_bin=self.bin_path, cwd=cwd, timeout=timeout)
 
     def _on_connection_disconnect(self, conn: _AcpSubprocessConnection) -> None:
-        if self._conn is conn:
-            self._conn = None
-            if conn._tg_stack is not None:
+        if self._conns.get(conn.profile_key) is conn:
+            self._conns.pop(conn.profile_key, None)
+            if conn._tg_stack is not None or conn._actor_task is not None:
                 self._retired_conns.append(conn)
 
-    async def _ensure_connection(self) -> _AcpSubprocessConnection:
-        """Lazily spawn and `initialize` `agy acp`, auto-restarting after exit or EOF."""
+    async def _ensure_connection(
+        self,
+        *,
+        profile_key: str = "",
+        lazy_mcp_config: Mapping[str, Any] | None = None,
+    ) -> _AcpSubprocessConnection:
+        """Lazily spawn and `initialize` `agy acp` for `profile_key`, auto-restarting after EOF."""
         async with self._conn_lock:
-            if self._conn is not None and not self._conn.is_closed and self._conn.initialized:
-                return self._conn
+            existing = self._conns.get(profile_key)
+            if existing is not None and not existing.is_closed and existing.initialized:
+                return existing
 
-            for old_conn in (self._conn, *reversed(self._retired_conns)):
+            for old_conn in (existing, *reversed(self._retired_conns)):
                 if old_conn is not None:
                     with contextlib.suppress(Exception):
                         await old_conn.close()
-            self._conn = None
+            self._conns.pop(profile_key, None)
             self._retired_conns.clear()
+
+            extra_args: tuple[str, ...] = ()
+            if profile_key and lazy_mcp_config is not None:
+                ws = self._lazy_workspaces.get(profile_key)
+                if ws is None or not ws.gemini_dir.is_dir():
+                    ws = _LazyMcpWorkspace(
+                        lazy_mcp_config=lazy_mcp_config,
+                        base_gemini_dir=self._effective_base_gemini_dir(),
+                    )
+                    self._lazy_workspaces[profile_key] = ws
+                extra_args = ws.extra_cli_args
 
             child_env = build_scrubbed_subprocess_env()
             child_env.update(self._base_env)
@@ -1007,6 +1376,8 @@ class AgyAcpClientProvider:
                 bin_path=self.bin_path,
                 env=child_env,
                 save_dir_or_db=self._store.db_path,
+                extra_args=extra_args,
+                profile_key=profile_key,
                 on_server_request=self._handle_server_request,
                 on_notification=self._handle_notification,
                 on_disconnect=self._on_connection_disconnect,
@@ -1031,7 +1402,7 @@ class AgyAcpClientProvider:
                 (isinstance(caps_agy, Mapping) and caps_agy.get("tier"))
                 or (isinstance(top_agy, Mapping) and top_agy.get("tier"))
             )
-            self._conn = conn
+            self._conns[profile_key] = conn
             return conn
 
     async def _rpc_with_reconnect(
@@ -1041,15 +1412,23 @@ class AgyAcpClientProvider:
         *,
         timeout: float | None = None,
         retry_on_disconnect: bool = True,
+        profile_key: str = "",
+        lazy_mcp_config: Mapping[str, Any] | None = None,
     ) -> tuple[_AcpSubprocessConnection, dict[str, Any]]:
         """Execute a JSON-RPC call on `agy acp`, reconnecting once if transport broke."""
-        conn = await self._ensure_connection()
+        conn = await self._ensure_connection(
+            profile_key=profile_key,
+            lazy_mcp_config=lazy_mcp_config,
+        )
         try:
             return conn, await conn.request(method, params, timeout=timeout)
         except AgyAcpTransportError:
             if not retry_on_disconnect:
                 raise
-            conn = await self._ensure_connection()
+            conn = await self._ensure_connection(
+                profile_key=profile_key,
+                lazy_mcp_config=lazy_mcp_config,
+            )
             return conn, await conn.request(method, params, timeout=timeout)
 
     def _cache_models(self, raw_models: Any) -> list[dict[str, str]]:
@@ -1208,22 +1587,30 @@ class AgyAcpClientProvider:
         effort: str | None = "medium",
         session_env: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
-        """Execute `session/new` or `session/load`, cache models, and apply preferences."""
+        """Execute `session/new` or `session/load` with lazy `mcp_config.json` routing."""
+        profile_key, lazy_mcp_config = self._compute_mcp_profile(mcp_servers, session_env)
         params: dict[str, Any] = {
             **({"sessionId": agy_session_id} if agy_session_id else {}),
             "cwd": str(cwd),
-            "mcpServers": format_acp_mcp_servers(mcp_servers, session_env=session_env),
+            "mcpServers": [],
         }
         meta = _build_session_meta(system_prompt_append)
         if meta is not None:
             params["_meta"] = meta
 
-        conn, res = await self._rpc_with_reconnect(rpc_method, params, timeout=self._rpc_timeout)
+        conn, res = await self._rpc_with_reconnect(
+            rpc_method,
+            params,
+            timeout=self._rpc_timeout,
+            profile_key=profile_key,
+            lazy_mcp_config=lazy_mcp_config,
+        )
         sid = str(res.get("sessionId") or (agy_session_id or "")).strip()
         if not sid:
             err_code = -32002 if rpc_method == "session/load" else -32603
             raise AgyAcpRpcError(err_code, f"{rpc_method} returned empty sessionId")
 
+        self._session_profiles[sid] = (profile_key, lazy_mcp_config)
         conn.loaded_sessions.add(sid)
         conn.session_results[sid] = dict(res)
         models_block = res.get("models")
@@ -1316,10 +1703,13 @@ class AgyAcpClientProvider:
 
     async def set_backend_model(self, agy_session_id: str, model_id: str) -> dict[str, Any]:
         """Call `session/set_model` on `agy acp`."""
+        profile_key, lazy_cfg = self._session_profiles.get(agy_session_id, ("", None))
         _, res = await self._rpc_with_reconnect(
             "session/set_model",
             {"sessionId": agy_session_id, "modelId": model_id},
             timeout=self._rpc_timeout,
+            profile_key=profile_key,
+            lazy_mcp_config=lazy_cfg,
         )
         return res
 
@@ -1330,29 +1720,37 @@ class AgyAcpClientProvider:
         value: str,
     ) -> dict[str, Any]:
         """Call `session/set_config_option` (`model`, `thought_level`, `mode`) on `agy acp`."""
+        profile_key, lazy_cfg = self._session_profiles.get(agy_session_id, ("", None))
         _, res = await self._rpc_with_reconnect(
             "session/set_config_option",
             {"sessionId": agy_session_id, "configId": config_id, "value": value},
             timeout=self._rpc_timeout,
+            profile_key=profile_key,
+            lazy_mcp_config=lazy_cfg,
         )
         return res
 
     def evict_backend_session(self, agy_session_id: str) -> None:
         """Synchronously drop `agy_session_id` from loaded session tracking."""
-        if not agy_session_id or self._conn is None:
+        if not agy_session_id:
             return
-        self._conn.loaded_sessions.discard(agy_session_id)
-        self._conn.session_results.pop(agy_session_id, None)
-        self._conn.session_prefs.pop(agy_session_id, None)
+        self._session_profiles.pop(agy_session_id, None)
+        for conn in self._conns.values():
+            conn.loaded_sessions.discard(agy_session_id)
+            conn.session_results.pop(agy_session_id, None)
+            conn.session_prefs.pop(agy_session_id, None)
 
     async def close_backend_session(self, agy_session_id: str) -> dict[str, Any]:
         """Close `agy_session_id` via `session/close` and evict from loaded session set."""
         await anyio.sleep(0)
-        if not agy_session_id or self._conn is None or self._conn.is_closed:
+        if not agy_session_id:
             return {}
+        conn = self._conn_for_agy_session(agy_session_id)
         self.evict_backend_session(agy_session_id)
+        if conn is None or conn.is_closed:
+            return {}
         with contextlib.suppress(AgyAcpError, TimeoutError, OSError):
-            return await self._conn.request(
+            return await conn.request(
                 "session/close",
                 {"sessionId": agy_session_id},
                 timeout=10.0,
@@ -1377,7 +1775,7 @@ class AgyAcpClientProvider:
         self._cancelled_sessions.discard(session_id)
 
     async def _send_agy_cancel(self, agy_sid: str) -> None:
-        conn = self._conn
+        conn = self._conn_for_agy_session(agy_sid)
         if agy_sid and conn is not None and not conn.is_closed:
             with contextlib.suppress(AgyAcpError, OSError):
                 await conn.send_notification("session/cancel", {"sessionId": agy_sid})
@@ -1765,7 +2163,11 @@ class AgyAcpClientProvider:
         effort: str | None,
         env: Mapping[str, str] | None,
     ) -> tuple[_AcpSubprocessConnection, str, str, str]:
-        conn = await self._ensure_connection()
+        profile_key, lazy_cfg = self._compute_mcp_profile(mcp_servers, env)
+        conn = await self._ensure_connection(
+            profile_key=profile_key,
+            lazy_mcp_config=lazy_cfg,
+        )
         if agy_sid and agy_sid in conn.loaded_sessions:
             desired_prefs = (model or "", mode, effort or "")
             if conn.session_prefs.get(agy_sid) == desired_prefs:
@@ -1804,9 +2206,14 @@ class AgyAcpClientProvider:
                 effort=effort,
                 session_env=env,
             )
+        new_sid = str(info["agySessionId"])
+        active_key, active_cfg = self._session_profiles.get(new_sid, (profile_key, lazy_cfg))
         return (
-            await self._ensure_connection(),
-            str(info["agySessionId"]),
+            await self._ensure_connection(
+                profile_key=active_key,
+                lazy_mcp_config=active_cfg,
+            ),
+            new_sid,
             str(info.get("currentModelId") or ""),
             str(info.get("fallbackFromModel") or ""),
         )

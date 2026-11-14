@@ -488,3 +488,84 @@ async def test_live_agy_acp_worker_crash_recovery_and_zero_orphan_processes(
     await _wait_for_process_group_exit(pid2)
     with pytest.raises(ProcessLookupError):
         os.kill(pid2, 0)
+
+
+async def test_live_agy_acp_keeps_oversized_mcp_tool_catalog_lazy_without_truncation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify 120 oversized (>1.5 KB) MCP tools load lazily in `agy acp` with zero truncation."""
+    assert LIVE_AGY_BIN is not None
+    monkeypatch.delenv("AGY_BIN", raising=False)
+
+    heavy_stub = tmp_path / "heavy_mcp_stub.py"
+    heavy_stub.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "PAD = 'Detailed parameter doc. ' * 70\n"
+        "TOOLS = [\n"
+        "    {\n"
+        "        'name': f'heavy_tool_{i:03d}',\n"
+        "        'description': f'Heavy tool {i:03d}. {PAD}',\n"
+        "        'inputSchema': {\n"
+        "            'type': 'object',\n"
+        "            'properties': {'payload': {'type': 'string', 'description': PAD}},\n"
+        "            'required': ['payload'],\n"
+        "        },\n"
+        "    }\n"
+        "    for i in range(120)\n"
+        "]\n"
+        "for raw in sys.stdin:\n"
+        "    line = raw.strip()\n"
+        "    if not line:\n"
+        "        continue\n"
+        "    msg = json.loads(line)\n"
+        "    mid = msg.get('id')\n"
+        "    method = msg.get('method', '')\n"
+        "    if mid is None:\n"
+        "        continue\n"
+        "    if method == 'initialize':\n"
+        "        res = {\n"
+        "            'protocolVersion': '2024-11-05',\n"
+        "            'capabilities': {'tools': {}},\n"
+        "            'serverInfo': {'name': 'heavy-mcp', 'version': '1.0.0'},\n"
+        "        }\n"
+        "    elif method == 'tools/list':\n"
+        "        res = {'tools': TOOLS}\n"
+        "    else:\n"
+        "        res = {}\n"
+        "    sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': mid, 'result': res}) + '\\n')\n"
+        "    sys.stdout.flush()\n",
+        encoding="utf-8",
+    )
+    heavy_stub.chmod(heavy_stub.stat().st_mode | stat.S_IEXEC)
+
+    srv_name = f"agy-acp-lazy-verify-{os.getpid()}"
+    schema_dir = Path.home() / ".gemini" / "antigravity-cli" / "mcp" / srv_name
+    shutil.rmtree(schema_dir, ignore_errors=True)
+    try:
+        async with AgyAcpClientProvider(bin_path=LIVE_AGY_BIN, save_dir=tmp_path) as provider:
+            created = await provider.create_backend_session(
+                cwd=str(tmp_path),
+                mcp_servers=[
+                    {
+                        "name": srv_name,
+                        "command": sys.executable,
+                        "args": [str(heavy_stub)],
+                    }
+                ],
+            )
+            sid = str(created["agySessionId"])
+            assert sid
+
+            deadline = time.monotonic() + 8.0
+            while time.monotonic() < deadline:
+                if schema_dir.is_dir() and len(list(schema_dir.glob("heavy_tool_*.json"))) == 120:
+                    break
+                await anyio.sleep(0.1)
+
+            schema_files = sorted(p.name for p in schema_dir.glob("heavy_tool_*.json"))
+            assert len(schema_files) == 120
+            await provider.close_backend_session(sid)
+    finally:
+        shutil.rmtree(schema_dir, ignore_errors=True)
