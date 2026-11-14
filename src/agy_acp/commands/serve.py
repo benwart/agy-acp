@@ -16,12 +16,13 @@ from agy_acp.logic.acp_dispatcher import AcpDispatcher
 from agy_acp.logic.auth_manager import AuthManager, ensure_kiro_identity_store
 from agy_acp.logic.quota_tracker import QuotaTracker
 from agy_acp.logic.session_manager import SessionManager
+from agy_acp.logic.tool_classifier import VALID_EFFORTS
 from agy_acp.logic.wire import EngineWireAdapter, create_wire_adapter
 from agy_acp.providers.acp_logger import log_acp_event, snapshot_relevant_env
 from agy_acp.providers.telemetry import get_telemetry
 
 AGENT_ENGINE_HELP = "Engine [possible values: v2, v3]."
-_V2_ENGINE_ALIASES: frozenset[str] = frozenset({"", "default", "v2", "kiro"})
+_V2_ENGINE_ALIASES: frozenset[str] = frozenset({"", "default", "v1", "v2", "kiro"})
 _V3_ENGINE_ALIASES: frozenset[str] = frozenset({"v3", "kas"})
 
 
@@ -33,6 +34,17 @@ def normalize_agent_engine(agent_engine: str | None) -> Literal["v2", "v3"]:
     if cleaned in _V3_ENGINE_ALIASES:
         return "v3"
     raise ValueError(f"Unsupported --agent-engine {agent_engine!r}. Expected 'v2' or 'v3'.")
+
+
+def normalize_effort(effort: str | None) -> str | None:
+    """Validate and normalize optional `--effort` flag (`low`, `medium`, `high`, `xhigh`, `max`)."""
+    if effort is None or not effort.strip():
+        return None
+    cleaned = effort.strip().lower()
+    if cleaned in VALID_EFFORTS:
+        return cleaned
+    choices = ", ".join(sorted(VALID_EFFORTS))
+    raise ValueError(f"Unsupported --effort {effort!r}. Expected one of: {choices}.")
 
 
 def _is_valid_rpc_id(value: Any) -> bool:
@@ -277,20 +289,31 @@ async def default(
     model: str | None = None,
     with_builtin: str | None = None,
     agent_engine: Annotated[str | None, Parameter(help=AGENT_ENGINE_HELP)] = None,
-    auth_method: str | None = None,
+    auth_method: Annotated[
+        str | None,
+        Parameter(name=["--auth-method", "--authMethod"]),
+    ] = None,
     auth_file: Path | None = None,
     save_dir: Path | None = None,
     stdio: bool = False,
     experimental_acp: bool = False,
-    verbose: bool = False,
+    verbose: Annotated[bool, Parameter(name=["--verbose", "-v"], negative=())] = False,
     debug: bool = False,
     quiet: bool = False,
+    effort: str | None = None,
+    trust_all_tools: Annotated[
+        bool,
+        Parameter(name=["--trust-all-tools", "-a"], negative=()),
+    ] = False,
+    trust_tools: str | None = None,
+    login: bool = False,
     *extra_args: str,
     **extra_kwargs: Any,
 ) -> int:
     """Start the Agent Client Protocol (ACP) JSON-RPC 2.0 server over stdio."""
     try:
         normalized_engine = normalize_agent_engine(agent_engine)
+        normalized_effort = normalize_effort(effort)
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(2)
@@ -307,6 +330,7 @@ async def default(
             "patch": str(patch) if patch else None,
             "agent": agent,
             "model": model,
+            "effort": normalized_effort,
             "with_builtin": with_builtin,
             "agent_engine": agent_engine,
             "normalized_agent_engine": normalized_engine,
@@ -315,6 +339,9 @@ async def default(
             "save_dir": str(save_dir) if save_dir else None,
             "stdio": stdio,
             "experimental_acp": experimental_acp,
+            "trust_all_tools": trust_all_tools,
+            "trust_tools": trust_tools,
+            "login": login,
             "verbose": verbose,
             "debug": debug,
             "quiet": quiet,
@@ -329,6 +356,7 @@ async def default(
         save_dir=save_dir,
         default_agent=agent,
         default_model=model,
+        default_effort=normalized_effort,
         wire_adapter=wire_adapter,
     )
     auth_manager = AuthManager(auth_file=auth_file) if auth_file is not None else None

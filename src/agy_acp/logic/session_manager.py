@@ -25,6 +25,7 @@ from agy_acp.logic.mcp_catalog_prober import McpCatalogProber
 from agy_acp.logic.tool_classifier import (
     FALLBACK_MODELS,
     PER_SESSION_MCP_ENV_KEYS,
+    VALID_EFFORTS,
     ToolCallEvent,
     _dedupe_mcp_servers,
     _pairs_to_dict,
@@ -458,9 +459,13 @@ class SessionManager:
         cli_provider: AgyAcpClientProvider | None = None,
         default_agent: str | None = None,
         default_model: str | None = None,
+        default_effort: str | None = None,
         wire_adapter: EngineWireAdapter | None = None,
         mcp_prober: McpCatalogProber | None = None,
     ) -> None:
+        cleaned_effort = default_effort.strip().lower() if default_effort else None
+        if cleaned_effort and cleaned_effort not in VALID_EFFORTS:
+            raise ValueError(f"Unsupported effort {default_effort!r}.")
         self._store = state_store or (
             cli_provider.state_store
             if cli_provider is not None
@@ -469,6 +474,7 @@ class SessionManager:
         self._cli = cli_provider or AgyAcpClientProvider(state_store=self._store)
         self._default_agent = default_agent
         self._default_model = default_model
+        self._default_effort = cleaned_effort
         self._wire_adapter: EngineWireAdapter = wire_adapter or V2KiroWireAdapter()
         self._mcp_prober: McpCatalogProber = mcp_prober or McpCatalogProber()
         self._cancel_scopes: dict[str, anyio.CancelScope] = {}
@@ -1075,7 +1081,9 @@ class SessionManager:
             "mode": str(source.get("mode", "auto")),
             "agent": agent,
             "model": str(source.get("model", self._default_model or DEFAULT_MODEL_ID)),
-            "reasoning_effort": str(source.get("reasoning_effort", DEFAULT_REASONING_EFFORT)),
+            "reasoning_effort": str(
+                source.get("reasoning_effort", self._default_effort or DEFAULT_REASONING_EFFORT)
+            ),
             "cancelled": bool(source.get("cancelled", False)),
         }
         if agent and wire_custom_agents is not None:
@@ -1132,7 +1140,7 @@ class SessionManager:
             "agent": self._default_agent,
             "model": initial_model,
             "modelPinnedByUser": bool(self._default_model),
-            "reasoning_effort": DEFAULT_REASONING_EFFORT,
+            "reasoning_effort": self._default_effort or DEFAULT_REASONING_EFFORT,
             "cancelled": False,
         }
         self._apply_agent_profile(

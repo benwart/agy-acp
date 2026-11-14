@@ -19,6 +19,7 @@ REDACTED_PLACEHOLDER = "[REDACTED]"
 
 _RELEVANT_ENV_PREFIXES: tuple[str, ...] = (
     "KIRO",
+    "ASBX_KIRO",
     "GOOSE",
     "ACP",
     "AGY",

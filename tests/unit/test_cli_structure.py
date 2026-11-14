@@ -15,13 +15,13 @@ from agy_acp.commands.docs import build as docs_build_cmd
 def test_cli_scaffold_help_and_version(capsys: pytest.CaptureFixture[str]) -> None:
     """Verify Cyclopts scaffold registers subcommands, group docstrings, and version."""
     assert __version__ == "1.3.2"
-    assert KIRO_CLI_COMPAT_VERSION == "3.1.0"
+    assert KIRO_CLI_COMPAT_VERSION == "3.3.0"
     app(["--version"], result_action="return_value")
     version_out = capsys.readouterr().out.strip()
-    assert "1.3.2 kiro-cli 3.1.0" in version_out
+    assert "1.3.2 kiro-cli 3.3.0" in version_out
     last_token = version_out.split()[-1]
     major, minor, patch = (int(part) for part in last_token.split(".")[:3])
-    assert (major, minor, patch) >= (3, 1, 0)
+    assert (major, minor, patch) >= (3, 3, 0)
 
     app(["--help"], result_action="return_value")
     root_help = capsys.readouterr().out
@@ -56,7 +56,7 @@ def test_update_command_refreshes_wrapper_mtime(
     assert rc == 0
     out = capsys.readouterr().out
     assert "1.3.2" in out
-    assert "3.1.0" in out
+    assert "3.3.0" in out
     assert fake_bin.stat().st_mtime > 1_700_000_000
 
 
@@ -97,7 +97,7 @@ async def test_normalize_agent_engine_and_cli_validation(
     from agy_acp.commands.serve import default as serve_default
     from agy_acp.commands.serve import normalize_agent_engine
 
-    for raw_v2 in (None, "", "  ", "default", "v2", "V2", "kiro", "KIRO"):
+    for raw_v2 in (None, "", "  ", "default", "v1", "V1", "v2", "V2", "kiro", "KIRO"):
         assert normalize_agent_engine(raw_v2) == "v2"
     for raw_v3 in ("v3", "V3", "kas", "KAS", " v3 "):
         assert normalize_agent_engine(raw_v3) == "v3"
@@ -146,10 +146,59 @@ async def test_acp_serve_accepts_kirocrew_flags(tmp_path: Path) -> None:
         ["acp"],
         ["acp", "--with-builtin", "developer"],
         ["acp", "--agent", "kirocrew", "--model", "gemini-3.7-pro"],
+        ["acp", "--agent-engine", "v3", "--authMethod", "client"],
+        ["acp", "--effort", "high", "-a", "--trust-tools", "fs_read"],
         ["acp", "serve", "--custom-flag", "123"],
     ):
         cmd_rc = int(app(tokens, result_action="return_int_as_exit_code_else_zero"))
         assert cmd_rc == 0
+
+
+async def test_default_effort_and_asbx_kiro_env_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify `--effort` seeds new session effort, rejects invalid effort, and logs ASBX_KIRO_*."""
+    from agy_acp.commands.serve import normalize_effort
+    from agy_acp.logic.session_manager import SessionManager
+    from agy_acp.logic.wire import create_wire_adapter
+    from agy_acp.providers.acp_logger import snapshot_relevant_env
+
+    for valid in ("low", "medium", "high", "xhigh", "max", " HIGH "):
+        assert normalize_effort(valid) == valid.strip().lower()
+    assert normalize_effort(None) is None
+    assert normalize_effort("  ") is None
+    with pytest.raises(ValueError, match="turbo"):
+        normalize_effort("turbo")
+
+    v2_mgr = SessionManager(save_dir=tmp_path / "v2", default_effort="high")
+    v2_desc = await v2_mgr.create_session(cwd=str(tmp_path), mcp_servers=[])
+    v2_opt = next(opt for opt in v2_desc["configOptions"] if opt["category"] == "thought_level")
+    assert v2_opt["currentValue"] == "high"
+    await v2_mgr.close()
+
+    v3_mgr = SessionManager(
+        save_dir=tmp_path / "v3",
+        default_effort="xhigh",
+        wire_adapter=create_wire_adapter("v3"),
+    )
+    v3_desc = await v3_mgr.create_session(cwd=str(tmp_path), mcp_servers=[])
+    v3_opt = next(opt for opt in v3_desc["configOptions"] if opt["category"] == "thought_level")
+    assert v3_opt["currentValue"] == "xhigh"
+    await v3_mgr.close()
+
+    with pytest.raises(SystemExit) as cli_exc:
+        app(
+            ["acp", "--effort", "turbo", "--save-dir", str(tmp_path)],
+            result_action="return_int_as_exit_code_else_zero",
+        )
+    assert cli_exc.value.code == 2
+    assert "turbo" in capsys.readouterr().err
+
+    monkeypatch.setenv("ASBX_KIRO_MANDATORY_MCPS", "")
+    snap = snapshot_relevant_env()
+    assert "ASBX_KIRO_MANDATORY_MCPS" in snap
 
 
 def test_commands_hierarchy_and_docstrings(tmp_path: Path) -> None:

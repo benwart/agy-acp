@@ -21,7 +21,7 @@ from agy_acp.logic.wire.base import (
 from agy_acp.logic.wire.v2_kiro import V2KiroWireAdapter
 from agy_acp.logic.wire.v3_kas import KAS_EXTENSION_METHODS, V3KasWireAdapter
 
-_V2_KEYS: frozenset[str] = frozenset({"", "default", "v2", "kiro"})
+_V2_KEYS: frozenset[str] = frozenset({"", "default", "v1", "v2", "kiro"})
 _V3_KEYS: frozenset[str] = frozenset({"v3", "kas"})
 
 

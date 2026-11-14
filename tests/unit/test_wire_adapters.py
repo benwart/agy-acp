@@ -19,7 +19,7 @@ from agy_acp.logic.wire import (
 
 def test_create_wire_adapter_factory_dispatch_and_rejection() -> None:
     """Verify factory selects V2 or V3 strategy and rejects unknown engine identifiers."""
-    for v2_key in (None, "", "default", "v2", "kiro", "V2"):
+    for v2_key in (None, "", "default", "v1", "V1", "v2", "kiro", "V2"):
         adapter = create_wire_adapter(v2_key)
         assert isinstance(adapter, V2KiroWireAdapter)
         assert adapter.engine_id == "v2"

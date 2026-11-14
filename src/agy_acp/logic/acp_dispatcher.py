@@ -2235,7 +2235,8 @@ class AcpDispatcher:
     ) -> dict[str, Any]:
         if "protocolVersion" in params and params["protocolVersion"] is not None:
             pv = params["protocolVersion"]
-            if not (isinstance(pv, int) and not isinstance(pv, bool) and pv >= 1):
+            valid_int_pv = isinstance(pv, int) and not isinstance(pv, bool) and pv >= 1
+            if not (valid_int_pv or pv == "2025-08-22"):
                 return _jsonrpc_error(
                     msg_id,
                     -32602,

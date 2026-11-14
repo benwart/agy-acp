@@ -41,10 +41,12 @@ async def test_req_acp_002_kirocrew_cli_invocation_variants(
             "KIROCREW_DSH_GATE_MARKER": str(marker),
         },
     )
-    await harness.send_request(
+    init_resp = await harness.send_request(
         "initialize",
         {"protocolVersion": "2025-08-22", "clientCapabilities": {}},
     )
+    assert "result" in init_resp
+    assert init_resp["result"]["protocolVersion"] == 1
     session_resp = await harness.send_request(
         "session/new",
         {"cwd": str(tmp_path), "mcpServers": []},
