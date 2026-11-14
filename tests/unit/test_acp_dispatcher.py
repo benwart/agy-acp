@@ -2217,10 +2217,12 @@ async def test_wave5b_turn1_credit_baseline_ttft_gating_context_breakdown_and_ev
         )
     )
     dispatcher.pop_post_response_notifications()
+    await dispatcher.wait_background_tasks()
+    assert usage_calls == 1
     emitted.clear()
     usage_calls = 0
 
-    # Turn 1: no ttft requested, no contextBreakdown requested -> Turn 1 delta_credits == 2.0!
+    # Turn 1: zero synchronous /usage calls on prompt path -> delta reported after bg refresh
     await dispatcher.handle_message(
         json.dumps(
             {
@@ -2234,8 +2236,7 @@ async def test_wave5b_turn1_credit_baseline_ttft_gating_context_breakdown_and_ev
             }
         )
     )
-    # 1 usage fetch in seed_session_baseline + 1 usage fetch in build_turn_telemetry = 2 total
-    assert usage_calls == 2
+    assert usage_calls == 0
     updates_t1 = [n["params"]["update"] for n in emitted if n.get("method") == "session/update"]
     for u in updates_t1:
         if u.get("sessionUpdate") in {"agent_thought_chunk", "agent_message_chunk"}:
@@ -2247,10 +2248,13 @@ async def test_wave5b_turn1_credit_baseline_ttft_gating_context_breakdown_and_ev
         if u.get("sessionUpdate") == "session_info_update"
         and u.get("_meta", {}).get("kiro", {}).get("kind") == "turn_completion"
     )
-    assert completion_t1["promptTurnSummaries"] == [{"unit": "credit", "usage": 2.0}]
+    assert completion_t1["promptTurnSummaries"] == [{"unit": "credit", "usage": 0.0}]
     assert "contextBreakdown" not in completion_t1
 
-    # Turn 2: ttft=True + contextBreakdown="summary" -> single /usage & epoch-ms ttft on thought!
+    await dispatcher.wait_background_tasks()
+    assert usage_calls == 1
+
+    # Turn 2: ttft=True + contextBreakdown="summary" -> conserved 2.0 delta & 0 blocking /usage!
     emitted.clear()
     usage_calls = 0
     await dispatcher.handle_message(
@@ -2267,7 +2271,7 @@ async def test_wave5b_turn1_credit_baseline_ttft_gating_context_breakdown_and_ev
             }
         )
     )
-    assert usage_calls == 1
+    assert usage_calls == 0
     updates_t2 = [n["params"]["update"] for n in emitted if n.get("method") == "session/update"]
     thought_chunk = next(u for u in updates_t2 if u.get("sessionUpdate") == "agent_thought_chunk")
     msg_chunk = next(u for u in updates_t2 if u.get("sessionUpdate") == "agent_message_chunk")
@@ -2280,6 +2284,7 @@ async def test_wave5b_turn1_credit_baseline_ttft_gating_context_breakdown_and_ev
         if u.get("sessionUpdate") == "session_info_update"
         and u.get("_meta", {}).get("kiro", {}).get("kind") == "turn_completion"
     )
+    assert completion_t2["promptTurnSummaries"] == [{"unit": "credit", "usage": 2.0}]
     cb = completion_t2["contextBreakdown"]
     assert cb == {
         "schema": 1,
@@ -2290,6 +2295,7 @@ async def test_wave5b_turn1_credit_baseline_ttft_gating_context_breakdown_and_ev
             "history": {"chars": len("12345") + len("Answer text.")},
         },
     }
+    await dispatcher.wait_background_tasks()
 
     # Delete session evicts QuotaTracker tracking
     assert qt.get_session_context_tokens(sid) == 1200
@@ -4160,15 +4166,32 @@ async def test_acp_dispatcher_default_quota_tracker_uses_session_tier_credits(
     assert new_resp is not None
     sid = new_resp["result"]["sessionId"]
     dispatcher.pop_post_response_notifications()
+    await dispatcher.wait_background_tasks()
     emitted.clear()
 
-    prompt_resp = await dispatcher.handle_message(
+    turn1_resp = await dispatcher.handle_message(
         json.dumps(
             {
                 "jsonrpc": "2.0",
                 "id": 2,
                 "method": "session/prompt",
                 "params": {"sessionId": sid, "prompt": [{"type": "text", "text": "hello"}]},
+            }
+        )
+    )
+    assert turn1_resp is not None
+    assert turn1_resp["result"]["stopReason"] == "end_turn"
+    await dispatcher.wait_background_tasks()
+    dispatcher.pop_post_response_notifications()
+    emitted.clear()
+
+    prompt_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "session/prompt",
+                "params": {"sessionId": sid, "prompt": [{"type": "text", "text": "hello 2"}]},
             }
         )
     )
@@ -4195,6 +4218,7 @@ async def test_acp_dispatcher_default_quota_tracker_uses_session_tier_credits(
         ]
         assert len(turn_completions) == 1
         assert turn_completions[0]["promptTurnSummaries"] == [{"unit": "credit", "usage": 8.0}]
+    await dispatcher.aclose()
 
 
 async def test_kas_v3_emits_live_mid_turn_usage_updates_without_cost_and_avoids_sum_fallback(
@@ -4436,3 +4460,167 @@ def test_should_deny_lazy_call_mcp_tool_when_tool_or_server_disabled(tmp_path: P
         )
         == "allow"
     )
+
+
+@pytest.mark.parametrize("engine_name", ["v2", "v3"])
+async def test_session_prompt_never_blocks_on_slow_quota_provider_and_conserves_kirocrew_credits(
+    tmp_path: Path,
+    engine_name: str,
+) -> None:
+    """Verify `session/prompt` completes without awaiting slow `/usage` & `/credits` CLI spawns."""
+    import time
+
+    import anyio
+
+    from agy_acp.logic.wire import create_wire_adapter
+    from agy_acp.providers.state_store import SqliteStateStoreProvider
+
+    class _SlowQuotaCli(_StubAgyAcpClientProvider):
+        def __init__(self, store: SqliteStateStoreProvider) -> None:
+            super().__init__(state_store=store)
+            self._fractions = [0.95, 0.94, 0.93]
+
+        async def run_slash_command(
+            self,
+            command: str,
+            *,
+            cwd: str | None = None,
+            session_id: str | None = None,
+            timeout: float = 30.0,
+        ) -> dict[str, Any]:
+            _ = (cwd, session_id, timeout)
+            await anyio.sleep(0.35)
+            if command.lstrip("/") == "usage":
+                frac = self._fractions.pop(0) if self._fractions else 0.93
+                return {
+                    "status": "SUCCESS",
+                    "command": {
+                        "name": "usage",
+                        "data": {
+                            "groups": [
+                                {
+                                    "name": "Gemini Models",
+                                    "buckets": [
+                                        {
+                                            "id": "gemini-5h",
+                                            "name": "Five Hour Limit Remaining",
+                                            "window": "5h",
+                                            "remaining_fraction": frac,
+                                            "reset_time": "2026-10-24T07:52:04Z",
+                                        },
+                                        {
+                                            "id": "gemini-weekly",
+                                            "name": "Weekly Limit Remaining",
+                                            "window": "weekly",
+                                            "remaining_fraction": 0.90,
+                                            "reset_time": "2026-10-24T12:34:28Z",
+                                        },
+                                    ],
+                                }
+                            ]
+                        },
+                    },
+                }
+            return {
+                "status": "SUCCESS",
+                "command": {
+                    "name": "credits",
+                    "data": {"remaining_credits": 0, "upgrade_uri": ""},
+                },
+            }
+
+    store = SqliteStateStoreProvider(tmp_path / f"slow-quota-{engine_name}")
+    store.save_tier({"id": "g1-ultra-tier", "name": "Google AI Ultra", "upgradeUri": ""})
+    cli = _SlowQuotaCli(store)
+    adapter = create_wire_adapter(engine_name)
+    emitted: list[dict[str, Any]] = []
+
+    async def _sink(frame: dict[str, Any]) -> None:
+        emitted.append(frame)
+
+    dispatcher = AcpDispatcher(
+        notification_sink=_sink,
+        session_manager=SessionManager(cli_provider=cli, state_store=store, wire_adapter=adapter),
+        wire_adapter=adapter,
+    )
+
+    t0 = time.perf_counter()
+    new_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "session/new",
+                "params": {"cwd": str(tmp_path), "mcpServers": []},
+            }
+        )
+    )
+    assert time.perf_counter() - t0 < 0.15
+    assert new_resp is not None
+    sid = new_resp["result"]["sessionId"]
+    dispatcher.pop_post_response_notifications()
+    await dispatcher.wait_background_tasks()
+    emitted.clear()
+
+    # Turn 1 must NOT block on the 0.35s QuotaProvider!
+    t1_start = time.perf_counter()
+    p1 = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/prompt",
+                "params": {"sessionId": sid, "prompt": [{"type": "text", "text": "fast turn 1"}]},
+            }
+        )
+    )
+    t1_elapsed = time.perf_counter() - t1_start
+    assert p1 is not None and p1["result"]["stopReason"] == "end_turn"
+    assert t1_elapsed < 0.15, f"session/prompt Turn 1 blocked for {t1_elapsed:.3f}s!"
+
+    # Let post-turn background refresh finish between Turn 1 and Turn 2 (0.95 -> 0.94 => -8.0)
+    await dispatcher.wait_background_tasks()
+    emitted.clear()
+    dispatcher.pop_post_response_notifications()
+
+    # Turn 2 also completes in < 0.15s AND delivers conserved 8.0 credits to KiroCrew!
+    t2_start = time.perf_counter()
+    p2 = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "session/prompt",
+                "params": {"sessionId": sid, "prompt": [{"type": "text", "text": "fast turn 2"}]},
+            }
+        )
+    )
+    t2_elapsed = time.perf_counter() - t2_start
+    assert p2 is not None and p2["result"]["stopReason"] == "end_turn"
+    assert t2_elapsed < 0.15, f"session/prompt Turn 2 blocked for {t2_elapsed:.3f}s!"
+
+    post = dispatcher.pop_post_response_notifications()
+    if engine_name == "v2":
+        meta_frames = [n for n in [*emitted, *post] if n.get("method") == "_kiro.dev/metadata"]
+        assert len(meta_frames) == 1
+        meta = meta_frames[0]["params"]
+        assert meta["creditsCapacity"] == 800.0
+        assert meta["credits"] == 752.0
+        assert meta["meteringUsage"] == [{"unit": "credit", "unitPlural": "credits", "value": 8.0}]
+        assert meta["planTierId"] == "g1-ultra-tier"
+    else:
+        turn_completions = [
+            n["params"]["update"]["_meta"]["kiro"]
+            for n in emitted
+            if n.get("method") == "session/update"
+            and n["params"]["update"].get("sessionUpdate") == "session_info_update"
+            and n["params"]["update"].get("_meta", {}).get("kiro", {}).get("kind")
+            == "turn_completion"
+        ]
+        assert len(turn_completions) == 1
+        assert turn_completions[0]["promptTurnSummaries"] == [{"unit": "credit", "usage": 8.0}]
+
+    # Shutdown cancels any in-flight 0.35s background refresh immediately
+    close_start = time.perf_counter()
+    await dispatcher.aclose()
+    assert time.perf_counter() - close_start < 0.15

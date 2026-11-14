@@ -16,6 +16,8 @@ from anyio.streams.buffered import BufferedByteReceiveStream
 from agy_acp.logic.tool_classifier import build_scrubbed_subprocess_env, resolve_agy_binary
 from agy_acp.providers.telemetry import get_telemetry
 
+DEFAULT_QUOTA_RPC_TIMEOUT_SECONDS: float = 6.0
+
 
 async def run_agy_slash_json(
     command: str,
@@ -83,7 +85,7 @@ def _supports_tier_capability(init_res: Mapping[str, Any]) -> bool:
 async def run_agy_acp_tier_json(
     *,
     agy_bin: str | Path | None = None,
-    timeout: float = 15.0,
+    timeout: float = DEFAULT_QUOTA_RPC_TIMEOUT_SECONDS,
 ) -> dict[str, str] | None:
     """Probe `agy acp --stdio` via `initialize` + `authenticate` for `_meta.antigravity.tier`."""
     bin_path = resolve_agy_binary(agy_bin)
@@ -151,14 +153,20 @@ class QuotaProvider:
         *,
         cli_provider: Any | None = None,
         agy_bin: str | Path | None = None,
+        timeout: float = DEFAULT_QUOTA_RPC_TIMEOUT_SECONDS,
     ) -> None:
         self._cli = cli_provider
         self._agy_bin = agy_bin
+        self._timeout = timeout
 
     async def _run_slash(self, command: str) -> dict[str, Any]:
         if self._cli is not None:
             return await self._cli.run_slash_command(command)
-        return await run_agy_slash_json(command, agy_bin=self._agy_bin)
+        return await run_agy_slash_json(
+            command,
+            agy_bin=self._agy_bin,
+            timeout=self._timeout,
+        )
 
     async def fetch_quota_groups(self) -> list[dict[str, Any]]:
         """Query `agy -p /usage --output-format json` and return normalized quota groups."""

@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
-from collections.abc import Mapping
+import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, tzinfo
 from typing import Any
+
+import anyio
 
 from agy_acp.providers.quota_provider import QuotaProvider
 from agy_acp.providers.state_store import SqliteStateStoreProvider
@@ -191,6 +195,8 @@ class QuotaTracker:
         self._provider = provider or QuotaProvider()
         self._cached_tier: dict[str, str] | None = None
         self._tier_probed: bool = False
+        self._cached_quota_groups: list[dict[str, Any]] | None = None
+        self._cached_credits: dict[str, Any] | None = None
         initial = (
             self._store.get_token_ledger()
             if self._store is not None
@@ -210,6 +216,11 @@ class QuotaTracker:
         self._total_tokens: int = self.total_tokens
         self._session_context_tokens: dict[str, int] = {}
         self._last_session_effective_credits: dict[str, float] = {}
+        self._pending_baseline_models: dict[str, str | None] = {}
+        self._refresh_in_flight: bool = False
+        self._refresh_pending: bool = False
+        self._refresh_done_events: list[anyio.Event] = []
+        self._last_refresh_monotonic: float | None = None
         self._last_otel_buckets: list[dict[str, Any]] = []
         self._last_otel_remaining_credits: float | None = None
         self._last_otel_capacity_credits: float | None = None
@@ -268,6 +279,22 @@ class QuotaTracker:
                     )
         return derived, self._last_otel_remaining_credits, self._last_otel_capacity_credits
 
+    def _resolve_cached_tier(self) -> dict[str, str] | None:
+        """Return active Antigravity plan tier from SQLite or memory without network I/O."""
+        if self._store is not None:
+            stored = self._store.load_tier()
+            if stored is not None:
+                self._cached_tier = stored
+                return stored
+        if self._cached_tier is not None:
+            return self._cached_tier
+        if self._store is not None:
+            stale = self._store.load_tier(max_age_seconds=None)
+            if stale is not None:
+                self._cached_tier = stale
+                return stale
+        return None
+
     async def _resolve_tier(self) -> dict[str, str] | None:
         """Resolve active Antigravity plan tier from SQLite cache, provider probe, or fallback."""
         if self._store is not None:
@@ -295,12 +322,7 @@ class QuotaTracker:
                                 self._store.save_tier(normalized)
                             self._cached_tier = normalized
                             return normalized
-        if self._store is not None:
-            stale = self._store.load_tier(max_age_seconds=None)
-            if stale is not None:
-                self._cached_tier = stale
-                return stale
-        return None
+        return self._resolve_cached_tier()
 
     def evict_session(self, session_id: str) -> None:
         """Evict per-session token and credit baseline tracking for `session_id`."""
@@ -308,6 +330,120 @@ class QuotaTracker:
             return
         self._session_context_tokens.pop(session_id, None)
         self._last_session_effective_credits.pop(session_id, None)
+        self._pending_baseline_models.pop(session_id, None)
+
+    def has_cached_snapshot(self) -> bool:
+        """Return True when a non-empty quota bucket snapshot exists in memory or SQLite."""
+        groups = self._load_cached_quota_groups()
+        return bool(groups)
+
+    def last_refresh_age_seconds(self) -> float | None:
+        """Return monotonic seconds elapsed since the last live `refresh_snapshot`, if any."""
+        if self._last_refresh_monotonic is None:
+            return None
+        return max(0.0, time.monotonic() - self._last_refresh_monotonic)
+
+    def seed_session_baseline_from_cache(
+        self,
+        session_id: str,
+        *,
+        model_id: str | None = None,
+    ) -> bool:
+        """Seed pre-turn effective credits synchronously from cache without network I/O."""
+        if not session_id:
+            return True
+        if session_id in self._last_session_effective_credits:
+            self._pending_baseline_models.pop(session_id, None)
+            return True
+        active_tier = self._resolve_cached_tier()
+        five_hour, seven_day, credits_info = self._read_cached_quotas_and_credits(
+            tier=active_tier,
+        )
+        if not five_hour["buckets"] and not seven_day["buckets"]:
+            self._pending_baseline_models[session_id] = model_id
+            return False
+        g1_overage = int(credits_info.get("remaining_credits", 0))
+        kiro_credits = self.calculate_effective_kiro_credits(
+            five_hour["buckets"],
+            seven_day["buckets"],
+            model_id=model_id,
+            g1_overage_credits=g1_overage,
+            tier=active_tier,
+        )
+        self._last_session_effective_credits[session_id] = float(kiro_credits["effective_credits"])
+        self._pending_baseline_models.pop(session_id, None)
+        return True
+
+    async def refresh_snapshot(
+        self,
+        *,
+        seed_session_ids: Sequence[str] = (),
+        model_id: str | None = None,
+    ) -> bool:
+        """Refresh quota/credit cache in single-flight mode without clobbering billed baselines."""
+        for sid in seed_session_ids:
+            if sid and sid not in self._last_session_effective_credits:
+                self._pending_baseline_models[sid] = model_id
+
+        if self._refresh_in_flight:
+            self._refresh_pending = True
+            waiter = anyio.Event()
+            self._refresh_done_events.append(waiter)
+            await waiter.wait()
+            return self.has_cached_snapshot()
+
+        self._refresh_in_flight = True
+        refreshed_any = False
+        try:
+            while True:
+                self._refresh_pending = False
+                try:
+                    active_tier = await self._resolve_tier()
+                    five_hour, seven_day, credits_info = await self._fetch_quotas_and_credits(
+                        tier=active_tier,
+                    )
+                except Exception:
+                    break
+
+                self._last_refresh_monotonic = time.monotonic()
+                refreshed_any = True
+                g1_overage = int(credits_info.get("remaining_credits", 0))
+                default_kiro = self.calculate_effective_kiro_credits(
+                    five_hour["buckets"],
+                    seven_day["buckets"],
+                    model_id=model_id,
+                    g1_overage_credits=g1_overage,
+                    tier=active_tier,
+                )
+                self._update_otel_quota_snapshot(
+                    five_hour["buckets"],
+                    seven_day["buckets"],
+                    default_kiro,
+                )
+                if five_hour["buckets"] or seven_day["buckets"]:
+                    for sid, pending_model in list(self._pending_baseline_models.items()):
+                        if sid not in self._last_session_effective_credits:
+                            seeded = self.calculate_effective_kiro_credits(
+                                five_hour["buckets"],
+                                seven_day["buckets"],
+                                model_id=pending_model or model_id,
+                                g1_overage_credits=g1_overage,
+                                tier=active_tier,
+                            )
+                            self._last_session_effective_credits[sid] = float(
+                                seeded["effective_credits"]
+                            )
+                        self._pending_baseline_models.pop(sid, None)
+                if not self._refresh_pending:
+                    break
+        finally:
+            self._refresh_in_flight = False
+            self._refresh_pending = False
+            waiters = list(self._refresh_done_events)
+            self._refresh_done_events.clear()
+            for waiter in waiters:
+                waiter.set()
+        return refreshed_any
 
     async def seed_session_baseline(
         self,
@@ -320,8 +456,9 @@ class QuotaTracker:
             return
         with contextlib.suppress(Exception):
             active_tier = await self._resolve_tier()
-            five_hour, seven_day = await self._fetch_both_quotas(tier=active_tier)
-            credits_info = await self._provider.fetch_credits()
+            five_hour, seven_day, credits_info = await self._fetch_quotas_and_credits(
+                tier=active_tier,
+            )
             g1_overage = int(credits_info.get("remaining_credits", 0))
             kiro_credits = self.calculate_effective_kiro_credits(
                 five_hour["buckets"],
@@ -412,10 +549,77 @@ class QuotaTracker:
         )
         self._total_tokens = self.total_tokens
 
+    def _load_cached_quota_groups(self) -> list[dict[str, Any]] | None:
+        """Return persisted SQLite quota groups or in-memory fallback snapshot, if any."""
+        if self._store is not None:
+            stored = self._store.load_quota_groups()
+            if stored is not None:
+                self._cached_quota_groups = stored
+                return stored
+        return self._cached_quota_groups
+
+    def _load_cached_credits(self) -> dict[str, Any] | None:
+        """Return persisted SQLite G1 credits or in-memory fallback snapshot, if any."""
+        if self._store is not None:
+            stored = self._store.load_credits()
+            if stored is not None:
+                self._cached_credits = stored
+                return stored
+        return self._cached_credits
+
+    async def _fetch_quota_groups(self) -> list[dict[str, Any]]:
+        """Fetch live quota groups, persisting non-empty results and falling back on failure."""
+        try:
+            groups = await self._provider.fetch_quota_groups()
+        except Exception:
+            cached = self._load_cached_quota_groups()
+            if cached is not None:
+                return cached
+            raise
+
+        has_buckets = any(
+            (isinstance(entry.get("buckets"), list) and len(entry["buckets"]) > 0)
+            or "remaining_fraction" in entry
+            for entry in groups
+            if isinstance(entry, Mapping)
+        )
+        if has_buckets:
+            normalized = [dict(g) for g in groups if isinstance(g, Mapping)]
+            self._cached_quota_groups = normalized
+            if self._store is not None:
+                self._store.save_quota_groups(normalized)
+            return groups
+
+        cached = self._load_cached_quota_groups()
+        return cached if cached is not None else groups
+
+    async def _fetch_credits(self) -> dict[str, Any]:
+        """Fetch live G1 credits, persisting valid snapshots and falling back on failure."""
+        try:
+            credits = await self._provider.fetch_credits()
+        except Exception:
+            cached = self._load_cached_credits()
+            if cached is not None:
+                return cached
+            raise
+
+        if isinstance(credits, Mapping) and "remaining_credits" in credits:
+            normalized = {
+                **credits,
+                "remaining_credits": int(credits.get("remaining_credits", 0)),
+            }
+            self._cached_credits = dict(normalized)
+            if self._store is not None:
+                self._store.save_credits(normalized)
+            return normalized
+
+        cached = self._load_cached_credits()
+        return cached if cached is not None else dict(credits)
+
     async def _extract_raw_buckets(self, *, group: str | None = None) -> list[dict[str, Any]]:
         """Flatten quota groups into raw bucket dicts, optionally filtered by group."""
         raw_buckets: list[dict[str, Any]] = []
-        for entry in await self._provider.fetch_quota_groups():
+        for entry in await self._fetch_quota_groups():
             nested = entry.get("buckets")
             candidates = nested if isinstance(nested, list) else [entry]
             for candidate in candidates:
@@ -576,6 +780,62 @@ class QuotaTracker:
             result["tier_name"] = tier_name or resolve_plan_credit_spec(tier_id).label
         return result
 
+    def _partition_quota_groups(
+        self,
+        groups: Sequence[Mapping[str, Any]],
+        *,
+        group: str | None = None,
+        tier: Mapping[str, Any] | str | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Partition quota groups into formatted `5h` and `7d` bucket snapshots."""
+        raw_buckets: list[dict[str, Any]] = []
+        for entry in groups:
+            nested = entry.get("buckets")
+            candidates = nested if isinstance(nested, list) else [entry]
+            for candidate in candidates:
+                if not isinstance(candidate, Mapping) or "remaining_fraction" not in candidate:
+                    continue
+                bucket_group = str(
+                    candidate.get("group") or entry.get("group") or entry.get("name") or ""
+                )
+                if group is not None and bucket_group.lower() != group.lower():
+                    continue
+                raw_buckets.append({**candidate, "group": bucket_group})
+
+        five_hour_buckets = [
+            self._format_bucket(bucket, window="5h", tier=tier)
+            for bucket in raw_buckets
+            if bucket.get("window") == "5h"
+        ]
+        seven_day_buckets = [
+            self._format_bucket(bucket, window="7d", tier=tier)
+            for bucket in raw_buckets
+            if bucket.get("window") in {"weekly", "7d"}
+        ]
+        return (
+            {"window": "5h", "buckets": five_hour_buckets},
+            {"window": "7d", "buckets": seven_day_buckets},
+        )
+
+    def _read_cached_quotas_and_credits(
+        self,
+        *,
+        group: str | None = None,
+        tier: Mapping[str, Any] | str | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """Read 5h/7d quotas and G1 credits strictly from SQLite/in-memory cache without I/O."""
+        cached_groups = self._load_cached_quota_groups() or []
+        five_hour, seven_day = self._partition_quota_groups(
+            cached_groups,
+            group=group,
+            tier=tier,
+        )
+        cached_credits = self._load_cached_credits() or {
+            "remaining_credits": 0,
+            "upgrade_uri": None,
+        }
+        return five_hour, seven_day, cached_credits
+
     async def _fetch_both_quotas(
         self,
         *,
@@ -584,21 +844,28 @@ class QuotaTracker:
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Fetch raw quota groups once and partition into formatted 5h and 7d snapshots."""
         active_tier = tier if tier is not None else await self._resolve_tier()
-        raw = await self._extract_raw_buckets(group=group)
-        five_hour_buckets = [
-            self._format_bucket(bucket, window="5h", tier=active_tier)
-            for bucket in raw
-            if bucket.get("window") == "5h"
-        ]
-        seven_day_buckets = [
-            self._format_bucket(bucket, window="7d", tier=active_tier)
-            for bucket in raw
-            if bucket.get("window") in {"weekly", "7d"}
-        ]
-        return (
-            {"window": "5h", "buckets": five_hour_buckets},
-            {"window": "7d", "buckets": seven_day_buckets},
-        )
+        groups = await self._fetch_quota_groups()
+        return self._partition_quota_groups(groups, group=group, tier=active_tier)
+
+    async def _fetch_quotas_and_credits(
+        self,
+        *,
+        group: str | None = None,
+        tier: Mapping[str, Any] | str | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """Fetch 5h/7d quotas and G1 credits concurrently inside KiroCrew's scrape timeout."""
+        active_tier = tier if tier is not None else await self._resolve_tier()
+        q_task = asyncio.create_task(self._fetch_both_quotas(group=group, tier=active_tier))
+        c_task = asyncio.create_task(self._fetch_credits())
+        try:
+            (five_hour, seven_day), credits_result = await asyncio.gather(q_task, c_task)
+        except BaseException:
+            for t in (q_task, c_task):
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(q_task, c_task, return_exceptions=True)
+            raise
+        return five_hour, seven_day, credits_result
 
     async def get_five_hour_quota(self, *, group: str | None = None) -> dict[str, Any]:
         """Return 5-hour rolling quota buckets and reset times."""
@@ -623,8 +890,10 @@ class QuotaTracker:
     async def get_credits_and_tokens(self, *, group: str | None = None) -> dict[str, Any]:
         """Return G1 credit balance, converted Kiro quota credits, and session token ledger."""
         active_tier = await self._resolve_tier()
-        credits = await self._provider.fetch_credits()
-        five_hour, seven_day = await self._fetch_both_quotas(group=group, tier=active_tier)
+        five_hour, seven_day, credits = await self._fetch_quotas_and_credits(
+            group=group,
+            tier=active_tier,
+        )
         g1_overage = int(credits.get("remaining_credits", 0))
         kiro_credits = self.calculate_effective_kiro_credits(
             five_hour["buckets"],
@@ -655,8 +924,10 @@ class QuotaTracker:
     async def get_unified_status(self, *, group: str | None = None) -> dict[str, Any]:
         """Return combined 5-hour, 7-day, credit, and token usage snapshot."""
         active_tier = await self._resolve_tier()
-        five_hour, seven_day = await self._fetch_both_quotas(group=group, tier=active_tier)
-        raw_credits = await self._provider.fetch_credits()
+        five_hour, seven_day, raw_credits = await self._fetch_quotas_and_credits(
+            group=group,
+            tier=active_tier,
+        )
         g1_overage = int(raw_credits.get("remaining_credits", 0))
         kiro_credits = self.calculate_effective_kiro_credits(
             five_hour["buckets"],
@@ -687,7 +958,7 @@ class QuotaTracker:
             },
         }
 
-    async def build_turn_telemetry(
+    def build_cached_turn_telemetry(
         self,
         *,
         session_id: str,
@@ -698,7 +969,82 @@ class QuotaTracker:
         thinking_tokens: int = 0,
         context_tokens: int | None = None,
     ) -> TurnTelemetry:
+        """Build `TurnTelemetry` synchronously from SQLite/in-memory cache with zero network I/O."""
+        active_tier = self._resolve_cached_tier()
+        five_hour, seven_day, credits_info = self._read_cached_quotas_and_credits(
+            tier=active_tier,
+        )
+        return self._assemble_turn_telemetry(
+            session_id=session_id,
+            model_id=model_id,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_read_tokens=cached_read_tokens,
+            thinking_tokens=thinking_tokens,
+            context_tokens=context_tokens,
+            active_tier=active_tier,
+            five_hour=five_hour,
+            seven_day=seven_day,
+            credits_info=credits_info,
+        )
+
+    async def build_turn_telemetry(
+        self,
+        *,
+        session_id: str,
+        model_id: str,
+        input_tokens: int,
+        output_tokens: int,
+        cached_read_tokens: int = 0,
+        thinking_tokens: int = 0,
+        context_tokens: int | None = None,
+        allow_network: bool = True,
+    ) -> TurnTelemetry:
         """Record turn tokens and return structured engine-neutral `TurnTelemetry`."""
+        if not allow_network:
+            return self.build_cached_turn_telemetry(
+                session_id=session_id,
+                model_id=model_id,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cached_read_tokens=cached_read_tokens,
+                thinking_tokens=thinking_tokens,
+                context_tokens=context_tokens,
+            )
+        active_tier = await self._resolve_tier()
+        five_hour, seven_day, credits_info = await self._fetch_quotas_and_credits(
+            tier=active_tier,
+        )
+        return self._assemble_turn_telemetry(
+            session_id=session_id,
+            model_id=model_id,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_read_tokens=cached_read_tokens,
+            thinking_tokens=thinking_tokens,
+            context_tokens=context_tokens,
+            active_tier=active_tier,
+            five_hour=five_hour,
+            seven_day=seven_day,
+            credits_info=credits_info,
+        )
+
+    def _assemble_turn_telemetry(
+        self,
+        *,
+        session_id: str,
+        model_id: str,
+        input_tokens: int,
+        output_tokens: int,
+        cached_read_tokens: int,
+        thinking_tokens: int,
+        context_tokens: int | None,
+        active_tier: dict[str, str] | None,
+        five_hour: dict[str, Any],
+        seven_day: dict[str, Any],
+        credits_info: Mapping[str, Any],
+    ) -> TurnTelemetry:
+        """Assemble `TurnTelemetry`, conserving unbilled credit deltas when cache is cold."""
         self.record_token_usage(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
@@ -715,9 +1061,6 @@ class QuotaTracker:
             context_tokens=active_context_tokens,
         )
 
-        active_tier = await self._resolve_tier()
-        five_hour, seven_day = await self._fetch_both_quotas(tier=active_tier)
-        credits_info = await self._provider.fetch_credits()
         g1_overage = int(credits_info.get("remaining_credits", 0))
         kiro_credits = self.calculate_effective_kiro_credits(
             five_hour["buckets"],
@@ -728,18 +1071,24 @@ class QuotaTracker:
         )
         context_usage_pct = round((active_context_tokens / self.CONTEXT_WINDOW_SIZE) * 100.0, 4)
         effective_credits = float(kiro_credits["effective_credits"])
+        all_buckets = [*five_hour["buckets"], *seven_day["buckets"]]
+        has_snapshot = bool(all_buckets)
         prev_credits = self._last_session_effective_credits.get(session_id)
-        self._last_session_effective_credits[session_id] = effective_credits
-        delta_credits = (
-            round(prev_credits - effective_credits, 4)
-            if prev_credits is not None and prev_credits > effective_credits
-            else 0.0
-        )
-        self._update_otel_quota_snapshot(
-            five_hour["buckets"],
-            seven_day["buckets"],
-            kiro_credits,
-        )
+        if has_snapshot:
+            self._last_session_effective_credits[session_id] = effective_credits
+            self._pending_baseline_models.pop(session_id, None)
+            delta_credits = (
+                round(prev_credits - effective_credits, 4)
+                if prev_credits is not None and prev_credits > effective_credits
+                else 0.0
+            )
+            self._update_otel_quota_snapshot(
+                five_hour["buckets"],
+                seven_day["buckets"],
+                kiro_credits,
+            )
+        else:
+            delta_credits = 0.0
         otel = get_telemetry(self._store.db_path if self._store is not None else None)
         otel.record_tokens(
             model_id,
@@ -787,7 +1136,6 @@ class QuotaTracker:
                 active_tier.get("name") or resolve_plan_credit_spec(active_tier).label
             )
 
-        all_buckets = [*five_hour["buckets"], *seven_day["buckets"]]
         exhausted = [bucket for bucket in all_buckets if float(bucket["remaining_fraction"]) <= 0.0]
         rate_limit_message: str | None = None
         rate_limit_params: dict[str, Any] | None = None
@@ -866,23 +1214,40 @@ class QuotaTracker:
         *,
         now: datetime | None = None,
         local_tz: tzinfo | None = None,
+        status: Mapping[str, Any] | None = None,
     ) -> str:
         """Render `/quota`, `/usage`, or `/credits` Markdown table for KiroCrew chat."""
         normalized = command.strip().lower() or "/quota"
         if not normalized.startswith("/"):
             normalized = f"/{normalized}"
 
-        active_tier = await self._resolve_tier()
-        five_hour_snap, seven_day_snap = await self._fetch_both_quotas(tier=active_tier)
-        five_hour = five_hour_snap["buckets"]
-        seven_day = seven_day_snap["buckets"]
-        credits = await self._provider.fetch_credits()
+        resolved_status = status if status is not None else await self.get_unified_status()
+        raw_tier = resolved_status.get("tier")
+        active_tier = raw_tier if isinstance(raw_tier, Mapping) else None
+        five_hour_snap = resolved_status.get("five_hour")
+        seven_day_snap = resolved_status.get("seven_day")
+        five_hour = (
+            list(five_hour_snap.get("buckets", [])) if isinstance(five_hour_snap, Mapping) else []
+        )
+        seven_day = (
+            list(seven_day_snap.get("buckets", [])) if isinstance(seven_day_snap, Mapping) else []
+        )
+        credits = (
+            dict(resolved_status["credits"])
+            if isinstance(resolved_status.get("credits"), Mapping)
+            else {}
+        )
         g1_overage = int(credits.get("remaining_credits", 0))
-        kiro_credits = self.calculate_effective_kiro_credits(
-            five_hour,
-            seven_day,
-            g1_overage_credits=g1_overage,
-            tier=active_tier,
+        raw_kiro = credits.get("kiro_credits")
+        kiro_credits = (
+            dict(raw_kiro)
+            if isinstance(raw_kiro, Mapping)
+            else self.calculate_effective_kiro_credits(
+                five_hour,
+                seven_day,
+                g1_overage_credits=g1_overage,
+                tier=active_tier,
+            )
         )
         tokens = {
             "input_tokens": self.input_tokens,

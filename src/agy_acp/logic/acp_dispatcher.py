@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import contextvars
 import json
 import os
@@ -47,6 +49,8 @@ from agy_acp.providers.quota_provider import QuotaProvider
 from agy_acp.providers.telemetry import get_telemetry
 
 MAX_FRAME_SIZE_BYTES = 16 * 1024 * 1024
+QUOTA_SESSION_OPEN_STALE_SECONDS: float = 15.0
+QUOTA_MID_TURN_REFRESH_INTERVAL_SECONDS: float = 30.0
 SLASH_QUOTA_COMMANDS = frozenset({"/quota", "/usage", "/credits"})
 SLASH_RESET_COMMANDS = frozenset({"/clear", "/reset"})
 AVAILABLE_SLASH_COMMANDS: list[dict[str, str]] = [
@@ -562,11 +566,78 @@ class AcpDispatcher:
         )
         self._mcp_status_cache: dict[str, dict[str, McpServerStatus]] = {}
         self._client_opens_external_url: bool = False
+        self._bg_tasks: set[asyncio.Task[Any]] = set()
+        self._closed: bool = False
 
     @property
     def wire_adapter(self) -> EngineWireAdapter:
         """Return the active `EngineWireAdapter` strategy."""
         return self._wire_adapter
+
+    def _spawn_background(self, coro_fn: Callable[[], Awaitable[Any]]) -> None:
+        """Spawn a tracked background coroutine on the active asyncio loop if open."""
+        if self._closed:
+            return
+        with contextlib.suppress(RuntimeError):
+            loop = asyncio.get_running_loop()
+
+            async def _runner() -> None:
+                with contextlib.suppress(Exception):
+                    await coro_fn()
+
+            task = loop.create_task(_runner())
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
+
+    async def wait_background_tasks(self) -> None:
+        """Wait for all currently scheduled background tasks to settle."""
+        while self._bg_tasks:
+            await asyncio.gather(*list(self._bg_tasks), return_exceptions=True)
+
+    async def aclose(self) -> None:
+        """Cancel and drain any in-flight background tasks on dispatcher shutdown."""
+        self._closed = True
+        tasks = list(self._bg_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._bg_tasks.clear()
+
+    def _schedule_quota_refresh(
+        self,
+        *,
+        seed_session_id: str = "",
+        model_id: str | None = None,
+    ) -> None:
+        """Trigger a non-blocking single-flight `QuotaTracker.refresh_snapshot` in background."""
+        seed_ids = (seed_session_id,) if seed_session_id else ()
+        self._spawn_background(
+            lambda: self._quota_tracker.refresh_snapshot(
+                seed_session_ids=seed_ids,
+                model_id=model_id,
+            )
+        )
+
+    def _prime_session_quota(self, session_id: str) -> None:
+        """Seed session credit baseline from cache and schedule background refresh if stale/cold."""
+        model_id = self._resolve_session_model(session_id)
+        seeded = self._quota_tracker.seed_session_baseline_from_cache(
+            session_id,
+            model_id=model_id,
+        )
+        age = self._quota_tracker.last_refresh_age_seconds()
+        if not seeded or age is None or age >= QUOTA_SESSION_OPEN_STALE_SECONDS:
+            self._schedule_quota_refresh(seed_session_id=session_id, model_id=model_id)
+
+    def _maybe_refresh_quota_mid_turn(self, session_id: str) -> None:
+        """Refresh quota snapshot in background during multi-step turns if cache is stale."""
+        age = self._quota_tracker.last_refresh_age_seconds()
+        if age is None or age >= QUOTA_MID_TURN_REFRESH_INTERVAL_SECONDS:
+            self._schedule_quota_refresh(
+                seed_session_id=session_id,
+                model_id=self._resolve_session_model(session_id),
+            )
 
     def _queue_post_response_notifications(self, frames: Sequence[dict[str, Any]]) -> None:
         bucket = self._post_response_ctx.get()
@@ -856,8 +927,9 @@ class AcpDispatcher:
         context_tokens: int | None = None,
         turn_id: str = "",
         context_breakdown: dict[str, Any] | None = None,
+        schedule_refresh: bool = True,
     ) -> TurnTelemetry:
-        telemetry = await self._quota_tracker.build_turn_telemetry(
+        telemetry = self._quota_tracker.build_cached_turn_telemetry(
             session_id=session_id,
             model_id=model_id,
             input_tokens=input_tokens,
@@ -866,6 +938,8 @@ class AcpDispatcher:
             thinking_tokens=thinking_tokens,
             context_tokens=context_tokens,
         )
+        if schedule_refresh:
+            self._schedule_quota_refresh(seed_session_id=session_id, model_id=model_id)
         if self._wire_adapter.engine_id == "v3":
             wire_tel = _to_wire_turn_telemetry(
                 telemetry,
@@ -1039,10 +1113,7 @@ class AcpDispatcher:
             return _jsonrpc_error(message_id, -32002, str(exc))
 
         if self._session_manager.consume_cancellation(session_id):
-            await self._quota_tracker.seed_session_baseline(
-                session_id,
-                model_id=self._resolve_session_model(session_id),
-            )
+            self._prime_session_quota(session_id)
             return await self._finish_cancelled_prompt(message_id, session_id=session_id)
 
         prompt_blocks: list[dict[str, Any]] = [b for b in raw_prompt if isinstance(b, dict)]
@@ -1093,6 +1164,7 @@ class AcpDispatcher:
                 output_tokens=output_tokens,
                 cached_read_tokens=0,
                 context_tokens=self._quota_tracker.get_session_context_tokens(session_id),
+                schedule_refresh=False,
             )
             return _prompt_turn_result(
                 message_id,
@@ -1123,10 +1195,7 @@ class AcpDispatcher:
         tool_start_times: dict[str, float] = {}
         tool_spans: dict[str, Span] = {}
 
-        await self._quota_tracker.seed_session_baseline(
-            session_id,
-            model_id=self._resolve_session_model(session_id),
-        )
+        self._prime_session_quota(session_id)
 
         for start_frame in self._wire_adapter.build_turn_start_notifications(
             session_id,
@@ -1252,6 +1321,7 @@ class AcpDispatcher:
 
         async def _on_usage(ctx_tokens: int) -> None:
             await self._emit_persisted_usage_update(session_id, ctx_tokens)
+            self._maybe_refresh_quota_mid_turn(session_id)
 
         async def _on_steer_consumed(raw_content: str) -> None:
             if raw_content.strip():
@@ -1485,6 +1555,7 @@ class AcpDispatcher:
         include_persisted_usage: bool = True,
     ) -> None:
         """Emit available commands, MCP readiness, and optional persisted usage on session open."""
+        self._prime_session_quota(session_id)
         if self._wire_adapter.engine_id == "v2":
             await self._emit_available_commands_update(session_id)
         await self._emit_or_queue_mcp_readiness(
@@ -1748,14 +1819,16 @@ class AcpDispatcher:
                 summary=summary_text,
             )
         )
-        telemetry = await self._quota_tracker.build_turn_telemetry(
+        active_model = self._resolve_session_model(session_id)
+        telemetry = self._quota_tracker.build_cached_turn_telemetry(
             session_id=session_id,
-            model_id=self._resolve_session_model(session_id),
+            model_id=active_model,
             input_tokens=max(1, int(compact_res.get("inputTokens", 1))),
             output_tokens=max(1, int(compact_res.get("outputTokens", 1))),
             cached_read_tokens=0,
             context_tokens=int(compact_res.get("contextTokens", 0)),
         )
+        self._schedule_quota_refresh(seed_session_id=session_id, model_id=active_model)
         await self._emit_persisted_usage_update(session_id, telemetry.context_tokens)
         if self._wire_adapter.engine_id == "v3":
             await self._emit_notification(

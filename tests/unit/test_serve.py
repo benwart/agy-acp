@@ -467,3 +467,64 @@ async def test_run_stdio_server_closes_session_manager_on_exit(tmp_path: Path) -
     )
     assert rc == 0
     assert closed_calls == [True]
+
+
+async def test_run_stdio_server_cancels_slow_background_quota_refresh_on_eof(
+    tmp_path: Path,
+) -> None:
+    """Verify `run_stdio_server` cancels slow background quota refreshes promptly on EOF."""
+    import time
+
+    class _SlowUsageCli(_ServeStubCliProvider):
+        async def run_slash_command(
+            self,
+            command: str,
+            *,
+            cwd: str | None = None,
+            session_id: str | None = None,
+            timeout: float = 30.0,
+        ) -> dict[str, Any]:
+            _ = (command, cwd, session_id, timeout)
+            await anyio.sleep(5.0)
+            return {"status": "SUCCESS", "command": {"name": "usage", "data": {"groups": []}}}
+
+    adapter = create_wire_adapter("v3")
+    cli = _SlowUsageCli(save_dir=tmp_path)
+    mgr = SessionManager(save_dir=tmp_path, cli_provider=cli, wire_adapter=adapter)
+    qt = QuotaTracker(provider=QuotaProvider(cli_provider=cli), state_store=cli.state_store)
+    send_in, recv_in = anyio.create_memory_object_stream[str](8)
+
+    async def _readline() -> str:
+        try:
+            return await recv_in.receive()
+        except anyio.EndOfStream:
+            return ""
+
+    async def _noop_write(_frame: bytes) -> None:
+        await anyio.sleep(0)
+
+    await send_in.send(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "session/new",
+                "params": {"cwd": str(tmp_path), "mcpServers": []},
+            }
+        )
+        + "\n"
+    )
+    await send_in.aclose()
+
+    t0 = time.perf_counter()
+    rc = await run_stdio_server(
+        session_manager=mgr,
+        wire_adapter=create_wire_adapter("v3"),
+        quota_tracker=qt,
+        save_dir=tmp_path,
+        stdin_readline=_readline,
+        stdout_write=_noop_write,
+    )
+    await recv_in.aclose()
+    assert rc == 0
+    assert time.perf_counter() - t0 < 0.5

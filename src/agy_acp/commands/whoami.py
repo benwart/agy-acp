@@ -21,6 +21,8 @@ async def default(
     ensure_kiro_identity_store()
     identity = {
         "email": "antigravity@google.com",
+        "accountType": "Antigravity",
+        "startUrl": "https://one.google.com/ai",
         "account_type": "Antigravity",
         "start_url": "https://one.google.com/ai",
     }

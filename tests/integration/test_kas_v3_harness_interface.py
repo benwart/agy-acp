@@ -1388,7 +1388,26 @@ async def test_kas_v3_multi_turn_credit_deltas_telemetry_order_breakdown_and_ttf
     await harness.send_request("session/set_mode", {"sessionId": sid, "modeId": "telemetry-agent"})
     await _read_next_notifications(harness, count=2)
 
-    # Turn 1: omit _meta.kiro.ttft and _meta.kiro.contextBreakdown -> delta_credits == 2.0
+    import anyio
+
+    from agy_acp.providers.state_store import SqliteStateStoreProvider
+
+    state_reader = SqliteStateStoreProvider(tmp_path / "store")
+
+    async def _wait_cached_fraction(expected_frac: float) -> None:
+        with anyio.fail_after(4.0):
+            while True:
+                groups = state_reader.load_quota_groups() or []
+                if groups and groups[0].get("buckets"):
+                    frac = float(groups[0]["buckets"][0]["remaining_fraction"])
+                    if abs(frac - expected_frac) < 1e-6:
+                        return
+                await anyio.sleep(0.02)
+
+    # Session open background refresh seeds baseline fraction 0.96 (192.0 credits)
+    await _wait_cached_fraction(0.96)
+
+    # Turn 1: omit _meta.kiro.ttft and _meta.kiro.contextBreakdown; non-blocking cache read (0.0)
     harness.notifications.clear()
     turn1_resp = await harness.send_request(
         "session/prompt",
@@ -1398,12 +1417,15 @@ async def test_kas_v3_multi_turn_credit_deltas_telemetry_order_breakdown_and_ttf
     assert turn1_resp["result"]["stopReason"] == "end_turn"
     _assert_kas_v3_turn_telemetry_frames(
         harness.notifications,
-        expected_credits=2.0,
+        expected_credits=0.0,
         expect_breakdown=False,
         expect_ttft=False,
     )
 
-    # Turn 2: request _meta.kiro.ttft=True and contextBreakdown="summary" -> delta_credits == 2.0
+    # Wait for Turn 1 post-turn background refresh (0.95 -> 190.0 credits)
+    await _wait_cached_fraction(0.95)
+
+    # Turn 2: request _meta.kiro.ttft=True and contextBreakdown="summary" -> conserved delta 2.0
     harness.notifications.clear()
     turn2_resp = await harness.send_request(
         "session/prompt",

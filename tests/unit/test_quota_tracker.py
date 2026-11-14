@@ -1137,3 +1137,186 @@ async def test_run_agy_acp_tier_json_and_quota_provider_fetch_tier(tmp_path: Any
         "name": "Google AI Pro",
         "upgradeUri": "",
     }
+
+
+async def test_quota_tracker_falls_back_to_sqlite_snapshot_after_wake_failure(
+    tmp_path: Any,
+) -> None:
+    """Verify `QuotaTracker` serves persisted SQLite quota/credits when post-wake fetches fail."""
+    import pytest
+
+    from agy_acp.providers.state_store import SqliteStateStoreProvider
+
+    class _WakeOfflineProvider(QuotaProvider):
+        async def fetch_quota_groups(self) -> list[dict[str, Any]]:
+            raise RuntimeError("agy command '/usage' exited with code 1: network unreachable")
+
+        async def fetch_credits(self) -> dict[str, Any]:
+            raise TimeoutError("timed out waiting for /credits after sleep")
+
+    class _EmptyWakeProvider(QuotaProvider):
+        async def fetch_quota_groups(self) -> list[dict[str, Any]]:
+            return []
+
+        async def fetch_credits(self) -> dict[str, Any]:
+            return {"remaining_credits": 1000, "upgrade_uri": "https://one.google.com/ai"}
+
+    cold_store = SqliteStateStoreProvider(tmp_path / "cold.db")
+    cold_tracker = QuotaTracker(provider=_WakeOfflineProvider(), state_store=cold_store)
+    with pytest.raises(RuntimeError, match="network unreachable"):
+        await cold_tracker.get_unified_status()
+
+    # Seed SQLite snapshot via a healthy pre-sleep QuotaTracker instance
+    warm_store = SqliteStateStoreProvider(tmp_path / "warm.db")
+    warm_Store_tier = {"id": "g1-ultra-tier", "name": "Google AI Ultra", "upgradeUri": ""}
+    warm_store.save_tier(warm_Store_tier)
+    healthy_tracker = QuotaTracker(
+        provider=QuotaProvider(cli_provider=_StubSlashRunner()),
+        state_store=warm_store,
+    )
+    baseline = await healthy_tracker.get_unified_status()
+    assert baseline["credits"]["kiro_credits"]["quota_credits"] == 760.0
+    assert baseline["credits"]["remaining_credits"] == 1000
+
+    # Simulate a fresh subprocess after wake-from-sleep while Wi-Fi is still reconnecting
+    wake_tracker = QuotaTracker(provider=_WakeOfflineProvider(), state_store=warm_store)
+    wake_status = await wake_tracker.get_unified_status()
+    assert wake_status["five_hour"] == baseline["five_hour"]
+    assert wake_status["seven_day"] == baseline["seven_day"]
+    assert wake_status["credits"] == baseline["credits"]
+
+    five_h = await wake_tracker.get_five_hour_quota(group="Gemini Models")
+    assert len(five_h["buckets"]) == 1
+    assert five_h["buckets"][0]["remaining_fraction"] == 0.95
+
+    seven_d = await wake_tracker.get_seven_day_quota(group="Gemini Models")
+    assert len(seven_d["buckets"]) == 1
+    assert seven_d["buckets"][0]["remaining_fraction"] == 0.39
+
+    credits_snap = await wake_tracker.get_credits_and_tokens(group="Gemini Models")
+    assert credits_snap["remaining_credits"] == 1000
+    assert credits_snap["kiro_credits"]["effective_credits"] == 1760.0
+
+    telemetry = await wake_tracker.build_turn_telemetry(
+        session_id="sess-after-wake",
+        model_id="gemini-3.7-pro",
+        input_tokens=100,
+        output_tokens=25,
+        context_tokens=500,
+    )
+    assert telemetry.metadata_params["credits"] == 1760.0
+    assert telemetry.metadata_params["quotaCredits"] == 760.0
+
+    md = await wake_tracker.format_slash_command_response("/usage")
+    assert "95.0%" in md
+    assert "1760.0 / 1800" in md
+
+    # Degraded wake returning empty groups (exit 0) also preserves cached buckets instead of 0%
+    empty_wake_tracker = QuotaTracker(provider=_EmptyWakeProvider(), state_store=warm_store)
+    empty_wake_status = await empty_wake_tracker.get_unified_status()
+    assert empty_wake_status["credits"]["kiro_credits"]["quota_credits"] == 760.0
+
+
+async def test_nonblocking_turn_telemetry_conserves_background_credit_deltas(
+    tmp_path: Any,
+) -> None:
+    """Verify `allow_network=False` never calls provider I/O and conserves background deltas."""
+    import anyio
+
+    from agy_acp.providers.state_store import SqliteStateStoreProvider
+
+    class _CountingProvider(QuotaProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.usage_calls = 0
+            self.credits_calls = 0
+            self.tier_calls = 0
+            self.fractions = [0.95, 0.94, 0.91]
+
+        async def fetch_quota_groups(self) -> list[dict[str, Any]]:
+            self.usage_calls += 1
+            await anyio.sleep(0.01)
+            frac = self.fractions.pop(0) if self.fractions else 0.91
+            return [
+                {
+                    "group": "Gemini Models",
+                    "buckets": [
+                        {
+                            "id": "gemini-5h",
+                            "group": "Gemini Models",
+                            "name": "Five Hour Limit Remaining",
+                            "window": "5h",
+                            "remaining_fraction": frac,
+                            "reset_time": "2026-10-24T07:52:04Z",
+                        },
+                        {
+                            "id": "gemini-weekly",
+                            "group": "Gemini Models",
+                            "name": "Weekly Limit Remaining",
+                            "window": "weekly",
+                            "remaining_fraction": 0.90,
+                            "reset_time": "2026-10-24T12:34:28Z",
+                        },
+                    ],
+                }
+            ]
+
+        async def fetch_credits(self) -> dict[str, Any]:
+            self.credits_calls += 1
+            await anyio.sleep(0.01)
+            return {"remaining_credits": 0, "upgrade_uri": "https://one.google.com/ai"}
+
+        async def fetch_tier(self) -> dict[str, str] | None:
+            self.tier_calls += 1
+            return {"id": "g1-ultra-tier", "name": "Google AI Ultra", "upgradeUri": ""}
+
+    store = SqliteStateStoreProvider(tmp_path / "nonblocking.db")
+    provider = _CountingProvider()
+    tracker = QuotaTracker(provider=provider, state_store=store)
+
+    # 1. Cold cache: non-blocking seed & telemetry make ZERO provider calls and don't poison 0.0
+    assert tracker.seed_session_baseline_from_cache("sess-nb", model_id="gemini-3.7-pro") is False
+    cold_tel = await tracker.build_turn_telemetry(
+        session_id="sess-nb",
+        model_id="gemini-3.7-pro",
+        input_tokens=50,
+        output_tokens=10,
+        context_tokens=500,
+        allow_network=False,
+    )
+    assert provider.usage_calls == 0
+    assert provider.credits_calls == 0
+    assert provider.tier_calls == 0
+    assert cold_tel.delta_credits == 0.0
+    assert "sess-nb" not in tracker._last_session_effective_credits
+
+    # 2. Background refresh warms SQLite & seeds unseeded session (0.95 * 800 = 760.0)
+    ok = await tracker.refresh_snapshot(seed_session_ids=("sess-nb",), model_id="gemini-3.7-pro")
+    assert ok is True
+    assert provider.usage_calls == 1
+    assert provider.credits_calls == 1
+    assert provider.tier_calls == 1
+    assert tracker._last_session_effective_credits["sess-nb"] == 760.0
+
+    # 3. Subsequent background refresh (0.94 * 800 = 752.0) updates cache WITHOUT overwriting 760.0
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(tracker.refresh_snapshot)
+        tg.start_soon(tracker.refresh_snapshot)
+    assert tracker._last_session_effective_credits["sess-nb"] == 760.0
+
+    # 4. Next non-blocking turn telemetry reads cached 752.0 (or 728.0 if trailing ran) with 0 I/O!
+    calls_before = (provider.usage_calls, provider.credits_calls, provider.tier_calls)
+    warm_tel = await tracker.build_turn_telemetry(
+        session_id="sess-nb",
+        model_id="gemini-3.7-pro",
+        input_tokens=120,
+        output_tokens=40,
+        context_tokens=1200,
+        allow_network=False,
+    )
+    assert (provider.usage_calls, provider.credits_calls, provider.tier_calls) == calls_before
+    expected_now = float(warm_tel.metadata_params["credits"])
+    assert expected_now in {752.0, 728.0}
+    assert warm_tel.delta_credits == round(760.0 - expected_now, 4)
+    assert warm_tel.metadata_params["planTierId"] == "g1-ultra-tier"
+    assert tracker._last_session_effective_credits["sess-nb"] == expected_now

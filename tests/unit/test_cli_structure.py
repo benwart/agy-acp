@@ -412,3 +412,87 @@ async def test_run_stdio_server_batches_response_and_post_notifications_atomical
         "_kiro/mcp/status",
         "_kiro/tools/didChange",
     ]
+
+
+def test_whoami_emits_kirocrew_camelcase_and_snakecase_identity_keys(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify `whoami` emits camelCase keys for KiroCrew's `parse_whoami_output` plus snake_case."""
+    import json
+
+    from agy_acp.cli import main
+
+    rc = main(["whoami", "--format", "json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["email"] == "antigravity@google.com"
+    assert payload["accountType"] == "Antigravity"
+    assert payload["startUrl"] == "https://one.google.com/ai"
+    assert payload["account_type"] == "Antigravity"
+    assert payload["start_url"] == "https://one.google.com/ai"
+
+
+async def test_chat_usage_scrape_offline_wake_fallback_and_single_fetch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify `chat /usage` fetches once when online and falls back to SQLite after sleep."""
+    from typing import Any
+
+    from agy_acp.commands import chat as chat_cmd
+    from agy_acp.logic.quota_tracker import QuotaTracker
+    from agy_acp.providers.quota_provider import QuotaProvider
+    from agy_acp.providers.state_store import SqliteStateStoreProvider
+
+    store = SqliteStateStoreProvider(tmp_path / "wake_state.db")
+    store.save_tier({"id": "g1-ultra-tier", "name": "Google AI Ultra", "upgradeUri": ""})
+    calls = {"usage": 0, "credits": 0, "offline": False}
+
+    class _ToggleWakeProvider(QuotaProvider):
+        async def fetch_quota_groups(self) -> list[dict[str, Any]]:
+            calls["usage"] += 1
+            if calls["offline"]:
+                raise RuntimeError("Wi-Fi reconnecting after sleep")
+            return [
+                {
+                    "group": "Gemini Models",
+                    "buckets": [
+                        {
+                            "id": "gemini-5h",
+                            "group": "Gemini Models",
+                            "name": "Five Hour Limit Remaining",
+                            "window": "5h",
+                            "remaining_fraction": 0.95,
+                            "reset_time": "2026-11-14T08:00:00Z",
+                        }
+                    ],
+                }
+            ]
+
+        async def fetch_credits(self) -> dict[str, Any]:
+            calls["credits"] += 1
+            if calls["offline"]:
+                raise RuntimeError("Wi-Fi reconnecting after sleep")
+            return {"remaining_credits": 0, "upgrade_uri": "https://one.google.com/ai"}
+
+    monkeypatch.setattr(
+        chat_cmd,
+        "QuotaTracker",
+        lambda: QuotaTracker(provider=_ToggleWakeProvider(), state_store=store),
+    )
+
+    rc_online = await chat_cmd.default("/usage", no_interactive=True)
+    assert rc_online == 0
+    online_out = capsys.readouterr().out
+    assert "(40.0 of 800.0 covered in plan)" in online_out
+    assert calls["usage"] == 1
+    assert calls["credits"] == 1
+
+    # Simulate KiroCrew running `kiro-cli chat /usage` immediately on wake before Wi-Fi is up
+    calls["offline"] = True
+    rc_wake = await chat_cmd.default("/usage", no_interactive=True)
+    assert rc_wake == 0
+    wake_out = capsys.readouterr().out
+    assert "Estimated Usage | resets on " in wake_out
+    assert "(40.0 of 800.0 covered in plan)" in wake_out

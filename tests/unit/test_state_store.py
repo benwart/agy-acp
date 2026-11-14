@@ -332,3 +332,62 @@ def test_sqlite_context_paths_knowledge_entries_and_revert_turns_from_message_id
     remaining = store.get_session_turns("sess-0121")
     assert len(remaining) == 1
     assert remaining[0]["user_message_id"] == "m-0"
+
+
+def test_save_and_load_quota_groups_and_credits_with_ttl(tmp_path: Path) -> None:
+    """Verify `SqliteStateStoreProvider` persists quota groups and G1 credits with TTL bounds."""
+    from datetime import UTC, datetime, timedelta
+
+    from agy_acp.providers.state_store import (
+        QUOTA_SNAPSHOT_TTL_SECONDS,
+        SqliteStateStoreProvider,
+    )
+
+    db_path = tmp_path / "state.db"
+    store = SqliteStateStoreProvider(db_path)
+    assert store.load_quota_groups() is None
+    assert store.load_credits() is None
+
+    sample_groups = [
+        {
+            "group": "Gemini Models",
+            "buckets": [
+                {
+                    "id": "gemini-5h",
+                    "group": "Gemini Models",
+                    "name": "Five Hour Limit Remaining",
+                    "window": "5h",
+                    "remaining_fraction": 0.96,
+                    "reset_time": "2026-11-14T08:00:00Z",
+                }
+            ],
+        }
+    ]
+    sample_credits = {"remaining_credits": 250, "upgrade_uri": "https://one.google.com/ai"}
+
+    saved_groups = store.save_quota_groups(sample_groups)
+    saved_credits = store.save_credits(sample_credits)
+    assert saved_groups == sample_groups
+    assert saved_credits == sample_credits
+
+    reloaded_store = SqliteStateStoreProvider(db_path)
+    assert reloaded_store.load_quota_groups() == sample_groups
+    assert reloaded_store.load_credits() == sample_credits
+
+    # Empty/degraded writes must not clobber valid cached snapshots
+    assert reloaded_store.save_quota_groups([]) is None
+    assert reloaded_store.save_quota_groups([{"group": "Gemini Models", "buckets": []}]) is None
+    assert reloaded_store.save_credits({}) is None
+    assert reloaded_store.load_quota_groups() == sample_groups
+    assert reloaded_store.load_credits() == sample_credits
+
+    # Expire timestamps beyond QUOTA_SNAPSHOT_TTL_SECONDS
+    expired_ts = (
+        datetime.now(UTC) - timedelta(seconds=QUOTA_SNAPSHOT_TTL_SECONDS + 60)
+    ).isoformat()
+    reloaded_store.set_kv("quota_groups", {"groups": sample_groups, "updated_at": expired_ts})
+    reloaded_store.set_kv("quota_credits", {**sample_credits, "updated_at": expired_ts})
+    assert reloaded_store.load_quota_groups() is None
+    assert reloaded_store.load_credits() is None
+    assert reloaded_store.load_quota_groups(max_age_seconds=None) == sample_groups
+    assert reloaded_store.load_credits(max_age_seconds=None) == sample_credits

@@ -276,6 +276,7 @@ async def run_stdio_server(
                 _wake_all_pending_rpcs()
     finally:
         with anyio.CancelScope(shield=True):
+            await dispatcher.aclose()
             await active_session_manager.close()
 
     log_acp_event("serve.stop", save_dir_or_db=save_dir)

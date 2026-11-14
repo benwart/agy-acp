@@ -64,7 +64,7 @@ async def default(
         plan_credits = round(capacity, 1)
         raw_reset = str(kiro_credits.get("reset_time", "") or "")
         reset_date = format_local_reset_date(raw_reset) or "2026-10-24"
-        md = await tracker.format_slash_command_response(prompt_text or "/usage")
+        md = await tracker.format_slash_command_response(prompt_text or "/usage", status=status)
         print(
             f"Estimated Usage | resets on {reset_date} | Antigravity\n"
             f"Credits used: 0.0\n"

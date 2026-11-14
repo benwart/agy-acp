@@ -7,14 +7,17 @@ import json
 import os
 import sqlite3
 import time
-from collections.abc import Generator, Mapping
+from collections.abc import Generator, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 MODELS_CACHE_TTL_SECONDS: float = 86_400.0
 TIER_CACHE_TTL_SECONDS: float = 86_400.0
+QUOTA_SNAPSHOT_TTL_SECONDS: float = 7 * 86_400.0
 _ACCOUNT_TIER_KV_KEY: str = "account_tier"
+_QUOTA_GROUPS_KV_KEY: str = "quota_groups"
+_QUOTA_CREDITS_KV_KEY: str = "quota_credits"
 
 
 def _is_cache_timestamp_expired(raw_updated_at: Any, *, max_age_seconds: float) -> bool:
@@ -783,4 +786,94 @@ class SqliteStateStoreProvider:
             "id": tier_id,
             "name": str(raw.get("name") or "").strip(),
             "upgradeUri": str(raw.get("upgradeUri") or "").strip(),
+        }
+
+    def save_quota_groups(
+        self,
+        groups: Sequence[Mapping[str, Any]] | None,
+    ) -> list[dict[str, Any]] | None:
+        """Persist non-empty Antigravity quota groups in `kv_state` for offline/wake fallback."""
+        if not groups:
+            return None
+        normalized_groups: list[dict[str, Any]] = []
+        bucket_count = 0
+        for entry in groups:
+            if not isinstance(entry, Mapping):
+                continue
+            raw_buckets = entry.get("buckets")
+            if isinstance(raw_buckets, list):
+                buckets = [dict(b) for b in raw_buckets if isinstance(b, Mapping)]
+                bucket_count += len(buckets)
+                group_name = str(entry.get("group") or entry.get("name") or "")
+                normalized_groups.append({"group": group_name, "buckets": buckets})
+            elif "remaining_fraction" in entry:
+                bucket_count += 1
+                normalized_groups.append(dict(entry))
+        if bucket_count == 0:
+            return None
+        self.set_kv(
+            _QUOTA_GROUPS_KV_KEY,
+            {
+                "groups": normalized_groups,
+                "updated_at": datetime.now(UTC).isoformat(),
+            },
+        )
+        return normalized_groups
+
+    def load_quota_groups(
+        self,
+        *,
+        max_age_seconds: float | None = QUOTA_SNAPSHOT_TTL_SECONDS,
+    ) -> list[dict[str, Any]] | None:
+        """Load cached Antigravity quota groups when non-empty and within `max_age_seconds`."""
+        raw = self.get_kv(_QUOTA_GROUPS_KV_KEY)
+        if not isinstance(raw, Mapping):
+            return None
+        groups = raw.get("groups")
+        if not isinstance(groups, list) or not groups:
+            return None
+        if max_age_seconds is not None and _is_cache_timestamp_expired(
+            raw.get("updated_at"),
+            max_age_seconds=max_age_seconds,
+        ):
+            return None
+        return [dict(g) for g in groups if isinstance(g, Mapping)]
+
+    def save_credits(
+        self,
+        credits: Mapping[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Persist G1 remaining credit balance in `kv_state` for offline/wake fallback."""
+        if not isinstance(credits, Mapping) or "remaining_credits" not in credits:
+            return None
+        normalized: dict[str, Any] = {
+            "remaining_credits": int(credits.get("remaining_credits", 0)),
+            "upgrade_uri": credits.get("upgrade_uri"),
+        }
+        self.set_kv(
+            _QUOTA_CREDITS_KV_KEY,
+            {
+                **normalized,
+                "updated_at": datetime.now(UTC).isoformat(),
+            },
+        )
+        return normalized
+
+    def load_credits(
+        self,
+        *,
+        max_age_seconds: float | None = QUOTA_SNAPSHOT_TTL_SECONDS,
+    ) -> dict[str, Any] | None:
+        """Load cached G1 credits when present and within `max_age_seconds`."""
+        raw = self.get_kv(_QUOTA_CREDITS_KV_KEY)
+        if not isinstance(raw, Mapping) or "remaining_credits" not in raw:
+            return None
+        if max_age_seconds is not None and _is_cache_timestamp_expired(
+            raw.get("updated_at"),
+            max_age_seconds=max_age_seconds,
+        ):
+            return None
+        return {
+            "remaining_credits": int(raw.get("remaining_credits", 0)),
+            "upgrade_uri": raw.get("upgrade_uri"),
         }
