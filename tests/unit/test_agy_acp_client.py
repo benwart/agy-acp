@@ -1570,6 +1570,81 @@ def test_normalize_tool_arguments_populates_tool_use_purpose_and_task_commands()
     assert norm_input["command"] == "send_command_input cmd-9"
 
 
+def test_normalize_tool_arguments_canonicalizes_document_body_and_target_file_keys() -> None:
+    """Verify non-shell PascalCase body keys and `TargetFile` map to KiroCrew `tool_paths` keys."""
+    from agy_acp.providers.agy_acp_client import _normalize_tool_arguments
+
+    norm_write = _normalize_tool_arguments(
+        {"Path": "/repo/doc.md", "Content": "# Heading\n"},
+        tool_name="write_file",
+    )
+    assert norm_write["path"] == "/repo/doc.md"
+    assert norm_write["content"] == "# Heading\n"
+    assert "Content" not in norm_write
+
+    norm_code = _normalize_tool_arguments(
+        {"TargetFile": "/repo/mod.py", "CodeContent": "x = 1\n"},
+        tool_name="write_to_file",
+    )
+    assert norm_code["path"] == "/repo/mod.py"
+    assert norm_code["targetFile"] == "/repo/mod.py"
+    assert norm_code["content"] == "x = 1\n"
+    assert "CodeContent" not in norm_code
+
+    norm_edit = _normalize_tool_arguments(
+        {"Path": "/repo/mod.py", "Target": "x = 1", "Replacement": ""},
+        tool_name="edit_file",
+    )
+    assert norm_edit["oldStr"] == "x = 1"
+    assert norm_edit["newStr"] == ""
+    assert "Target" not in norm_edit
+    assert "Replacement" not in norm_edit
+
+    norm_replace_content = _normalize_tool_arguments(
+        {
+            "TargetFile": "/repo/mod.py",
+            "TargetContent": "old_block",
+            "ReplacementContent": "new_block",
+        },
+        tool_name="replace_file_content",
+    )
+    assert norm_replace_content["targetFile"] == "/repo/mod.py"
+    assert norm_replace_content["oldStr"] == "old_block"
+    assert norm_replace_content["newStr"] == "new_block"
+    assert "TargetContent" not in norm_replace_content
+    assert "ReplacementContent" not in norm_replace_content
+
+    orig_chunk = {
+        "TargetContent": "chunk_old",
+        "ReplacementContent": "chunk_new",
+        "AllowMultiple": False,
+        "StartLine": 10,
+    }
+    norm_chunks = _normalize_tool_arguments(
+        {"TargetFile": "/repo/multi.py", "ReplacementChunks": [orig_chunk]},
+        tool_name="multi_replace_file_content",
+    )
+    assert norm_chunks["targetFile"] == "/repo/multi.py"
+    assert norm_chunks["ReplacementChunks"] == [
+        {
+            "oldText": "chunk_old",
+            "newText": "chunk_new",
+            "AllowMultiple": False,
+            "StartLine": 10,
+        }
+    ]
+    assert "TargetContent" in orig_chunk
+
+    # Shell calls must NOT rewrite PascalCase keys into DOCUMENT_BODY_KEYS
+    norm_shell = _normalize_tool_arguments(
+        {"CommandLine": "echo ok", "Content": "keep_visible"},
+        tool_name="run_command",
+    )
+    assert norm_shell["command"] == "echo ok"
+    assert norm_shell["Content"] == "keep_visible"
+    assert "content" not in norm_shell
+
+
 async def test_discover_models_refreshes_when_cache_older_than_one_day(tmp_path: Path) -> None:
     """Verify `discover_models` refreshes expired cache and falls back to stale rows on error."""
     from datetime import UTC, datetime, timedelta

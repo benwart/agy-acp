@@ -35,6 +35,7 @@ from agy_acp.logic.tool_classifier import (
     ToolCallEvent,
     _extract_first_str,
     _pairs_to_dict,
+    _resolve_builtin_triple,
     build_scrubbed_subprocess_env,
     classify_tool_call_step,
     resolve_agy_binary,
@@ -599,16 +600,26 @@ def _normalize_tool_arguments(
             return dict(inner)
 
     normalized = dict(arguments)
-    if "command" not in normalized:
-        cmd_val = _extract_first_str(normalized, ("CommandLine", "cmd", "Command")) or (
+    existing_cmd = normalized.get("command")
+    cmd_source = existing_cmd if isinstance(existing_cmd, str) and existing_cmd else ""
+    if not cmd_source:
+        cmd_source = _extract_first_str(normalized, ("CommandLine", "cmd", "Command")) or (
             synthesize_task_command(tool_name, normalized)
         )
-        if cmd_val:
-            normalized["command"] = cmd_val
+        if cmd_source:
+            normalized["command"] = cmd_source
+
+    target_file = normalized.get("TargetFile")
+    if isinstance(target_file, str) and target_file:
+        normalized.setdefault("targetFile", target_file)
     if "path" not in normalized:
         path_val = _extract_first_str(normalized, PATH_ARGUMENT_KEYS)
         if path_val:
             normalized["path"] = path_val
+
+    _, _, acp_kind = _resolve_builtin_triple(tool_name.strip().lower(), arguments)
+    if acp_kind != "execute" and not cmd_source:
+        _canonicalize_document_body_keys(normalized)
 
     purpose = _extract_first_str(normalized, ("toolSummary",)).strip() or (
         _extract_first_str(normalized, ("Role",)).strip()
@@ -619,6 +630,38 @@ def _normalize_tool_arguments(
         normalized.setdefault("description", purpose)
         normalized.setdefault("__toolUsePurpose", purpose)
     return normalized
+
+
+def _canonicalize_document_body_keys(normalized: dict[str, Any]) -> None:
+    """Rewrite `agy` PascalCase document body keys to KiroCrew `DOCUMENT_BODY_KEYS`."""
+    for src_keys, dst_key in (
+        (("Content", "CodeContent"), "content"),
+        (("Target", "TargetContent"), "oldStr"),
+        (("Replacement", "ReplacementContent"), "newStr"),
+    ):
+        for src_key in src_keys:
+            val = normalized.get(src_key)
+            if isinstance(val, str):
+                normalized.setdefault(dst_key, val)
+                normalized.pop(src_key, None)
+
+    chunks = normalized.get("ReplacementChunks")
+    if isinstance(chunks, list):
+        normalized["ReplacementChunks"] = [
+            _canonicalize_replacement_chunk(chunk) if isinstance(chunk, Mapping) else chunk
+            for chunk in chunks
+        ]
+
+
+def _canonicalize_replacement_chunk(chunk: Mapping[str, Any]) -> dict[str, Any]:
+    """Rewrite a `ReplacementChunks` entry to `oldText`/`newText`."""
+    out = dict(chunk)
+    for src_key, dst_key in (("TargetContent", "oldText"), ("ReplacementContent", "newText")):
+        val = out.get(src_key)
+        if isinstance(val, str):
+            out.setdefault(dst_key, val)
+            out.pop(src_key, None)
+    return out
 
 
 def _extract_tool_output(record: Mapping[str, Any]) -> str:
