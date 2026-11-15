@@ -246,12 +246,63 @@ def test_acp_logs_command_displays_and_clears_log(
 
 def test_kirocrew_prerequisite_and_dashboard_cli_commands(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Verify whoami, agent validate, and chat (--list-models and /usage) CLI commands."""
     import json
 
     from agy_acp.cli import main
+    from agy_acp.commands import chat as chat_cmd
+    from agy_acp.logic.quota_tracker import QuotaTracker
+    from agy_acp.providers.quota_provider import QuotaProvider
+    from agy_acp.providers.state_store import SqliteStateStoreProvider
+
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    state_db = tmp_path / "state.db"
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("AGY_ACP_STATE_DB", str(state_db))
+    monkeypatch.setenv("AGY_BIN", str(tmp_path / "missing-agy"))
+
+    store = SqliteStateStoreProvider(state_db)
+    store.save_models(
+        [
+            {
+                "modelId": "gemini-3.7-pro",
+                "name": "Gemini 3.7 Pro",
+                "description": "Google Antigravity Pro model",
+            }
+        ]
+    )
+    store.save_tier({"id": "g1-ultra-tier", "name": "Google AI Ultra", "upgradeUri": ""})
+
+    class _IsolatedQuotaProvider(QuotaProvider):
+        async def fetch_quota_groups(self) -> list[dict[str, object]]:
+            return [
+                {
+                    "group": "Gemini Models",
+                    "buckets": [
+                        {
+                            "id": "gemini-5h",
+                            "group": "Gemini Models",
+                            "name": "Five Hour Limit Remaining",
+                            "window": "5h",
+                            "remaining_fraction": 0.95,
+                            "reset_time": "2026-11-14T08:00:00Z",
+                        }
+                    ],
+                }
+            ]
+
+        async def fetch_credits(self) -> dict[str, object]:
+            return {"remaining_credits": 0, "upgrade_uri": "https://one.google.com/ai"}
+
+    monkeypatch.setattr(
+        chat_cmd,
+        "QuotaTracker",
+        lambda: QuotaTracker(provider=_IsolatedQuotaProvider(), state_store=store),
+    )
 
     rc_whoami = main(["whoami", "--format", "json"])
     assert rc_whoami == 0
@@ -283,6 +334,70 @@ def test_kirocrew_prerequisite_and_dashboard_cli_commands(
     usage_out = capsys.readouterr().out
     assert "Estimated Usage" in usage_out
     assert "covered in plan" in usage_out
+
+
+async def test_missing_agy_binary_falls_back_cleanly_in_quota_provider_and_chat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify QuotaProvider and chat CLI gracefully fall back when `agy` is absent on PATH."""
+    import json
+
+    from agy_acp.commands import chat as chat_cmd
+    from agy_acp.providers.quota_provider import QuotaProvider
+    from agy_acp.providers.state_store import SqliteStateStoreProvider
+
+    fake_home = tmp_path / "empty-home"
+    fake_home.mkdir()
+    cold_db = tmp_path / "cold-state.db"
+    missing_bin = tmp_path / "nonexistent-agy"
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("AGY_ACP_STATE_DB", str(cold_db))
+    monkeypatch.setenv("AGY_BIN", str(missing_bin))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+    provider = QuotaProvider(agy_bin=missing_bin)
+    assert await provider.fetch_quota_groups() == []
+    assert await provider.fetch_credits() == {}
+    assert await provider.fetch_tier() is None
+
+    rc_models = await chat_cmd.default(list_models=True, format="json", no_interactive=True)
+    assert rc_models == 0
+    models_payload = json.loads(capsys.readouterr().out)
+    assert len(models_payload["models"]) >= 1
+
+    rc_cold_usage = await chat_cmd.default("/usage", no_interactive=True, agent_engine="v2")
+    assert rc_cold_usage == 0
+    cold_out = capsys.readouterr().out
+    assert "Estimated Usage" in cold_out
+    assert "covered in plan" in cold_out
+
+    warm_store = SqliteStateStoreProvider(cold_db)
+    warm_store.save_tier({"id": "g1-ultra-tier", "name": "Google AI Ultra", "upgradeUri": ""})
+    warm_store.save_quota_groups(
+        [
+            {
+                "group": "Gemini Models",
+                "buckets": [
+                    {
+                        "id": "gemini-5h",
+                        "group": "Gemini Models",
+                        "name": "Five Hour Limit Remaining",
+                        "window": "5h",
+                        "remaining_fraction": 0.95,
+                        "reset_time": "2026-11-14T08:00:00Z",
+                    }
+                ],
+            }
+        ]
+    )
+    warm_store.save_credits({"remaining_credits": 0, "upgrade_uri": "https://one.google.com/ai"})
+
+    rc_warm_usage = await chat_cmd.default("/usage", no_interactive=True, agent_engine="v2")
+    assert rc_warm_usage == 0
+    warm_out = capsys.readouterr().out
+    assert "(40.0 of 800.0 covered in plan)" in warm_out
 
 
 async def test_chat_usage_scrape_uses_local_reset_date(

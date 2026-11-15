@@ -921,13 +921,17 @@ class QuotaTracker:
             },
         }
 
-    async def get_unified_status(self, *, group: str | None = None) -> dict[str, Any]:
-        """Return combined 5-hour, 7-day, credit, and token usage snapshot."""
-        active_tier = await self._resolve_tier()
-        five_hour, seven_day, raw_credits = await self._fetch_quotas_and_credits(
-            group=group,
-            tier=active_tier,
-        )
+    def _assemble_unified_status(
+        self,
+        *,
+        five_hour: dict[str, Any],
+        seven_day: dict[str, Any],
+        raw_credits: Mapping[str, Any],
+        active_tier: dict[str, str] | None,
+        group: str | None = None,
+        record_otel: bool = False,
+    ) -> dict[str, Any]:
+        """Assemble unified 5-hour, 7-day, credit, and token ledger status payload."""
         g1_overage = int(raw_credits.get("remaining_credits", 0))
         kiro_credits = self.calculate_effective_kiro_credits(
             five_hour["buckets"],
@@ -936,11 +940,12 @@ class QuotaTracker:
             g1_overage_credits=g1_overage,
             tier=active_tier,
         )
-        self._update_otel_quota_snapshot(
-            five_hour["buckets"],
-            seven_day["buckets"],
-            kiro_credits,
-        )
+        if record_otel:
+            self._update_otel_quota_snapshot(
+                five_hour["buckets"],
+                seven_day["buckets"],
+                kiro_credits,
+            )
         return {
             "five_hour": five_hour,
             "seven_day": seven_day,
@@ -957,6 +962,37 @@ class QuotaTracker:
                 "total_tokens": self.total_tokens,
             },
         }
+
+    def get_cached_status(self, *, group: str | None = None) -> dict[str, Any]:
+        """Return combined 5-hour, 7-day, credit, and token snapshot strictly from local cache."""
+        active_tier = self._resolve_cached_tier()
+        five_hour, seven_day, raw_credits = self._read_cached_quotas_and_credits(
+            group=group,
+            tier=active_tier,
+        )
+        return self._assemble_unified_status(
+            five_hour=five_hour,
+            seven_day=seven_day,
+            raw_credits=raw_credits,
+            active_tier=active_tier,
+            group=group,
+        )
+
+    async def get_unified_status(self, *, group: str | None = None) -> dict[str, Any]:
+        """Return combined 5-hour, 7-day, credit, and token usage snapshot."""
+        active_tier = await self._resolve_tier()
+        five_hour, seven_day, raw_credits = await self._fetch_quotas_and_credits(
+            group=group,
+            tier=active_tier,
+        )
+        return self._assemble_unified_status(
+            five_hour=five_hour,
+            seven_day=seven_day,
+            raw_credits=raw_credits,
+            active_tier=active_tier,
+            group=group,
+            record_otel=True,
+        )
 
     def build_cached_turn_telemetry(
         self,

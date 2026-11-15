@@ -56,7 +56,10 @@ async def default(
     prompt_text = " ".join(prompts).strip()
     if prompt_text in {"/usage", "/quota", "/credits"} or not prompt_text:
         tracker = QuotaTracker()
-        status = await tracker.get_unified_status()
+        try:
+            status = await tracker.get_unified_status()
+        except OSError, RuntimeError, TimeoutError:
+            status = tracker.get_cached_status()
         kiro_credits = status.get("credits", {}).get("kiro_credits", {})
         capacity = float(kiro_credits.get("credit_capacity", 200.0) or 200.0)
         remaining = float(kiro_credits.get("effective_credits", capacity))
