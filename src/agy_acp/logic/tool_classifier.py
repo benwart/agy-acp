@@ -386,8 +386,8 @@ def _extract_diff_content(
     if not path_val:
         return []
     if kas_builtin_id == "str_replace":
-        target_keys = ("Target", "TargetContent", "old_str", "oldText")
-        replacement_keys = ("Replacement", "ReplacementContent", "new_str", "newText")
+        target_keys = ("Target", "TargetContent", "oldStr", "old_str", "oldText")
+        replacement_keys = ("Replacement", "ReplacementContent", "newStr", "new_str", "newText")
         old_val = next(
             (arguments[k] for k in target_keys if isinstance(arguments.get(k), str)), None
         )
@@ -403,12 +403,23 @@ def _extract_diff_content(
                 {
                     "type": "diff",
                     "path": path_val,
-                    "oldText": str(chunk.get("TargetContent", "")),
-                    "newText": str(chunk.get("ReplacementContent", "")),
+                    "oldText": str(
+                        chunk.get("TargetContent")
+                        if "TargetContent" in chunk
+                        else chunk.get("oldText", "")
+                    ),
+                    "newText": str(
+                        chunk.get("ReplacementContent")
+                        if "ReplacementContent" in chunk
+                        else chunk.get("newText", "")
+                    ),
                 }
                 for chunk in chunks
-                if isinstance(chunk, dict)
-                and ("TargetContent" in chunk or "ReplacementContent" in chunk)
+                if isinstance(chunk, Mapping)
+                and any(
+                    k in chunk
+                    for k in ("TargetContent", "ReplacementContent", "oldText", "newText")
+                )
             ]
     elif kas_builtin_id == "fs_write":
         for content_key in ("Content", "CodeContent", "content"):
@@ -445,9 +456,11 @@ def _build_builtin_title(
     """Format a human-readable ACP tool call title for a built-in step."""
     label = raw_name or "Tool call"
     if acp_kind == "execute":
-        return f"Running `{cmd_val[:80]}`" if cmd_val else "Execute command"
+        if not cmd_val:
+            return "Execute command"
+        return f"Running: {cmd_val[:197]}..." if len(cmd_val) > 200 else f"Running: {cmd_val}"
     if acp_kind == "read":
-        return f"Viewing {path_val}" if path_val else f"Reading ({label})"
+        return f"Reading {path_val}" if path_val else f"Reading ({label})"
     if acp_kind == "edit":
         return f"Editing {path_val}" if path_val else f"Editing ({label})"
     if acp_kind == "delete":

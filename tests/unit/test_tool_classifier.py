@@ -194,8 +194,31 @@ def test_diff_builtin_triple_and_title_helpers() -> None:
     )
     assert _resolve_builtin_triple("unknown_xyz", {}) == ("unknown_xyz", "unknown_xyz", "other")
 
-    assert _build_builtin_title("read", "read_file", "/a/b.py", "", {}) == "Viewing /a/b.py"
+    assert _build_builtin_title("read", "read_file", "/a/b.py", "", {}) == "Reading /a/b.py"
+    assert _build_builtin_title("read", "read_file", "", "", {}) == "Reading (read_file)"
+    assert _build_builtin_title("execute", "run_command", "", "", {}) == "Execute command"
+    short_cmd = "x" * 200
+    assert (
+        _build_builtin_title("execute", "run_command", "", short_cmd, {}) == f"Running: {short_cmd}"
+    )
+    long_cmd = "y" * 201
+    assert (
+        _build_builtin_title("execute", "run_command", "", long_cmd, {})
+        == f"Running: {'y' * 197}..."
+    )
+    assert "`" not in _build_builtin_title("execute", "run_command", "", "pytest -q", {})
     assert _build_builtin_title("delete", "delete_file", "/a/b.py", "", {}) == "Deleting /a/b.py"
+
+    assert _extract_diff_content(
+        "str_replace",
+        "/repo/norm.py",
+        {"oldStr": "before", "newStr": "after"},
+    ) == [{"type": "diff", "path": "/repo/norm.py", "oldText": "before", "newText": "after"}]
+    assert _extract_diff_content(
+        "str_replace",
+        "/repo/norm_chunks.py",
+        {"ReplacementChunks": [{"oldText": "c1", "newText": "c2"}]},
+    ) == [{"type": "diff", "path": "/repo/norm_chunks.py", "oldText": "c1", "newText": "c2"}]
     assert (
         _build_builtin_title("search", "grep_search", "", "", {"Query": "TODO"}) == "Searching TODO"
     )
@@ -375,7 +398,7 @@ def test_kas_tool_classification_table_and_task_commands() -> None:
     assert cls_list.v2_tool_name == "execute_bash"
     assert cls_list.acp_kind == "execute"
     assert cls_list.command == "manage_task list"
-    assert cls_list.title == "Running `manage_task list`"
+    assert cls_list.title == "Running: manage_task list"
 
     cls_status = classify_tool_call_step(
         "tool",
@@ -383,7 +406,7 @@ def test_kas_tool_classification_table_and_task_commands() -> None:
         {"Action": "status", "TaskId": "task-42"},
     )
     assert cls_status.command == "manage_task status task-42"
-    assert cls_status.title == "Running `manage_task status task-42`"
+    assert cls_status.title == "Running: manage_task status task-42"
 
     cls_input = classify_tool_call_step(
         "tool",

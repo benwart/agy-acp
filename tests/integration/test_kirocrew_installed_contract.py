@@ -8,7 +8,7 @@ import json
 import os
 import re
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,10 +16,16 @@ from typing import Any
 import pytest
 
 from agy_acp import KIRO_CLI_COMPAT_VERSION
-from agy_acp.logic.acp_dispatcher import AcpDispatcher
+from agy_acp.logic.acp_dispatcher import AcpDispatcher, _to_normalized_tool_event
 from agy_acp.logic.session_manager import SessionManager
 from agy_acp.logic.tool_classifier import classify_tool_call_step
-from agy_acp.logic.wire import V2KiroWireAdapter, V3KasWireAdapter, WireTurnTelemetry
+from agy_acp.logic.wire import (
+    EngineWireAdapter,
+    V2KiroWireAdapter,
+    V3KasWireAdapter,
+    WireTurnTelemetry,
+)
+from agy_acp.providers.agy_acp_client import _build_tool_event_from_record
 from agy_acp.providers.state_store import SqliteStateStoreProvider
 from tests.integration.conftest import CliResult, HarnessFactory
 
@@ -660,3 +666,268 @@ async def test_installed_kirocrew_wire_methods_tool_mappings_and_kas_discriminan
             f"KAS tool {cls.kas_builtin_id!r} resolves to policy {policy_name!r}, "
             f"expected {cls.v2_tool_name!r}"
         )
+
+
+def _import_installed_kirocrew_modules() -> dict[str, Any]:
+    """Import live permission, identity, tool_paths, and security modules from `KiroCrew.app`."""
+    import importlib
+
+    pkg_dir = _resolve_kirocrew_pkg_dir()
+    site_packages = str(pkg_dir.parent)
+    if site_packages not in sys.path:
+        sys.path.append(site_packages)
+    return {
+        "dispatch": importlib.import_module("kiro_crew.acp._dispatch"),
+        "types": importlib.import_module("kiro_crew.acp.types"),
+        "tool_identity": importlib.import_module("kiro_crew.hook_runtime.tool_identity"),
+        "tool_input_denials": importlib.import_module(
+            "kiro_crew.llm_helpers_parts.tool_input_denials"
+        ),
+        "tool_paths": importlib.import_module("kiro_crew.platform.tool_paths"),
+        "security": importlib.import_module("kiro_crew.security"),
+    }
+
+
+def _roundtrip_permission_event(
+    kc_mods: Mapping[str, Any],
+    adapter: EngineWireAdapter,
+    session_id: str,
+    record: Mapping[str, Any],
+    *,
+    req_id: int = 1,
+) -> Any:
+    """Run `_build_tool_event_from_record` -> wire frames -> `kiro_crew` permission parser."""
+    tc_id = str(record.get("toolCallId") or "tc-contract-1")
+    _, _, tc_event = _build_tool_event_from_record(
+        tc_id,
+        record,
+        known_mcp_servers=(),
+    )
+    norm_event = _to_normalized_tool_event(tc_event)
+    tc_frame = adapter.build_tool_call_update(session_id, norm_event)
+    perm_params = adapter.build_permission_request_params(session_id, norm_event)
+
+    is_kas = adapter.engine_id == "v3"
+    tool_input_cache: dict[str, str] = {}
+    shell_cache: dict[str, bool] = {}
+    raw_params_cache: dict[str, dict[str, Any]] = {}
+    mcp_server_name_cache: dict[str, str] = {}
+    tool_name_cache: dict[str, str] = {}
+    tool_input_redacted_cache: dict[str, bool] = {}
+    diff_path_cache: dict[str, str] = {}
+    harness_tool_name_cache: dict[str, str] = {}
+    tool_kind_cache: dict[str, str] | None = {} if is_kas else None
+    cache_overflow: set[str] | None = set() if is_kas else None
+    identity_unreadable_cache: dict[str, bool] | None = {} if is_kas else None
+
+    dispatch_mod = kc_mods["dispatch"]
+    dispatch_mod.parse_session_update(
+        tc_frame["params"]["update"],
+        tool_input_cache=tool_input_cache,
+        shell_cache=shell_cache,
+        raw_params_cache=raw_params_cache,
+        mcp_server_name_cache=mcp_server_name_cache,
+        tool_name_cache=tool_name_cache,
+        cache_scope=session_id,
+        tool_input_redacted_cache=tool_input_redacted_cache,
+        diff_path_cache=diff_path_cache,
+        harness_tool_name_cache=harness_tool_name_cache,
+        tool_kind_cache=tool_kind_cache,
+        cache_overflow=cache_overflow,
+        identity_unreadable_cache=identity_unreadable_cache,
+    )
+    msg = kc_mods["types"].JsonRpcMessage(
+        id=req_id,
+        method="session/request_permission",
+        params=perm_params,
+    )
+    perm_event, _ = dispatch_mod.build_permission_event(
+        msg,
+        tool_input_cache=tool_input_cache,
+        shell_cache=shell_cache,
+        raw_params_cache=raw_params_cache,
+        mcp_server_name_cache=mcp_server_name_cache,
+        tool_name_cache=tool_name_cache,
+        cache_scope=session_id,
+        tool_input_redacted_cache=tool_input_redacted_cache,
+        diff_path_cache=diff_path_cache,
+        harness_tool_name_cache=harness_tool_name_cache,
+        tool_kind_cache=tool_kind_cache,
+        identity_unreadable_cache=identity_unreadable_cache,
+    )
+    assert perm_event is not None
+    return perm_event
+
+
+@pytest.mark.parametrize(
+    "adapter",
+    [V3KasWireAdapter(), V2KiroWireAdapter()],
+    ids=["v3_kas", "v2_kiro"],
+)
+def test_installed_kirocrew_long_shell_permission_title_and_git_publish_gate(
+    adapter: EngineWireAdapter,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify >200-char `run_command` titles untrunate cleanly without backtick/80-char block."""
+    kc = _import_installed_kirocrew_modules()
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "kc_home"))
+    monkeypatch.setattr(kc["security"], "_emit_deny_event", lambda *a, **kw: None)
+    monkeypatch.setattr(kc["security"], "_schedule_push_allow_audit", lambda *a, **kw: None)
+
+    long_worktree = (
+        "/Users/developer/.kiro/crew/workspace-member-agy-acp-bot/"
+        "worktrees/agy-acp-bot/deeply-nested-feature-worktree-" + ("a" * 95)
+    )
+    feature_push_cmd = (
+        f"git -C {long_worktree} push --force-with-lease origin crew/agy-acp-bot/feat-sync"
+    )
+    assert len(feature_push_cmd) > 200
+
+    feat_perm = _roundtrip_permission_event(
+        kc,
+        adapter,
+        "sess-shell-1",
+        {
+            "toolCallId": "tc-push-feat",
+            "name": "run_command",
+            "kind": "execute",
+            "raw_args": {
+                "CommandLine": feature_push_cmd,
+                "toolSummary": "Push feature branch",
+            },
+        },
+    )
+    assert feat_perm.is_shell is True
+    assert feat_perm.shell_command == feature_push_cmd
+    assert feat_perm.title.startswith("Running: ")
+    assert feat_perm.title.endswith("...")
+    assert "`" not in feat_perm.title
+
+    judged_feat = kc["tool_identity"].untruncated_shell_title(
+        feat_perm.title,
+        feat_perm.shell_command,
+    )
+    assert judged_feat == f"Running: {feature_push_cmd}"
+    assert (
+        kc["tool_input_denials"]._is_exempt_command_text(
+            judged_feat,
+            feat_perm.shell_command,
+        )
+        is True
+    )
+    assert kc["security"].is_denied(judged_feat) is None
+
+    # Protected-branch push >200 chars must still hit gated protected-branch deny (not unverifiable)
+    main_push_cmd = f"git -C {long_worktree} push origin main"
+    assert len(main_push_cmd) > 200
+    main_perm = _roundtrip_permission_event(
+        kc,
+        adapter,
+        "sess-shell-2",
+        {
+            "toolCallId": "tc-push-main",
+            "name": "run_command",
+            "kind": "execute",
+            "raw_args": {"CommandLine": main_push_cmd},
+        },
+    )
+    judged_main = kc["tool_identity"].untruncated_shell_title(
+        main_perm.title,
+        main_perm.shell_command,
+    )
+    assert judged_main == f"Running: {main_push_cmd}"
+    main_denial = kc["security"].is_denied(judged_main)
+    assert main_denial is not None
+    assert "git-publish-target-unverifiable" not in main_denial
+
+
+def test_installed_kirocrew_document_body_keys_and_edit_target_candidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify >25 KiB `write_file` and `edit_file` bodies skip `command_shaped_strings`."""
+    kc = _import_installed_kirocrew_modules()
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "kc_home"))
+
+    adapter = V3KasWireAdapter()
+    target_doc = str(tmp_path / "GUIDE.md")
+    large_prose_body = (
+        "# Deployment Guide\n\nExample forbidden command in docs: `git push origin main`\n"
+        + ("Documentation paragraph explaining ACP wire framing.\n" * 520)
+    )
+    assert len(large_prose_body) > 25 * 1024
+
+    write_perm = _roundtrip_permission_event(
+        kc,
+        adapter,
+        "sess-doc-1",
+        {
+            "toolCallId": "tc-write-large",
+            "name": "write_file",
+            "kind": "edit",
+            "raw_args": {
+                "Path": target_doc,
+                "Content": large_prose_body,
+            },
+        },
+    )
+    assert write_perm.raw_params_trusted is True
+    write_scanned = kc["tool_paths"].command_shaped_strings(write_perm.raw_tool_params)
+    assert not write_scanned.truncated
+    assert large_prose_body not in write_scanned
+    assert all(len(s) < 1024 for s in write_scanned)
+    assert kc["tool_input_denials"]._first_tool_input_denial(write_scanned, None) is None
+
+    write_targets = kc["tool_paths"].edit_target_candidates(
+        write_perm.raw_tool_params,
+        write_perm.diff_path,
+        tool_kind=write_perm.tool_kind,
+    )
+    assert not write_targets.truncated
+    assert not write_targets.unanchored
+    assert list(write_targets) == [target_doc]
+
+    target_mod = str(tmp_path / "module.py")
+    old_snippet = "os.system('git push origin main')"
+    new_snippet = "os.system('git push origin crew/bot/feat')"
+    chunk_old = "subprocess.run(['kirocrew', 'restart'])"
+    chunk_new = "subprocess.run(['kirocrew', 'status'])"
+
+    edit_perm = _roundtrip_permission_event(
+        kc,
+        adapter,
+        "sess-doc-2",
+        {
+            "toolCallId": "tc-edit-chunks",
+            "name": "edit_file",
+            "kind": "edit",
+            "raw_args": {
+                "TargetFile": target_mod,
+                "Target": old_snippet,
+                "Replacement": new_snippet,
+                "ReplacementChunks": [
+                    {
+                        "TargetContent": chunk_old,
+                        "ReplacementContent": chunk_new,
+                        "AllowMultiple": False,
+                    }
+                ],
+            },
+        },
+    )
+    assert edit_perm.raw_params_trusted is True
+    edit_scanned = kc["tool_paths"].command_shaped_strings(edit_perm.raw_tool_params)
+    assert not edit_scanned.truncated
+    for body_str in (old_snippet, new_snippet, chunk_old, chunk_new):
+        assert body_str not in edit_scanned
+    assert kc["tool_input_denials"]._first_tool_input_denial(edit_scanned, None) is None
+
+    edit_targets = kc["tool_paths"].edit_target_candidates(
+        edit_perm.raw_tool_params,
+        edit_perm.diff_path,
+        tool_kind=edit_perm.tool_kind,
+    )
+    assert not edit_targets.truncated
+    assert not edit_targets.unanchored
+    assert list(edit_targets) == [target_mod]
