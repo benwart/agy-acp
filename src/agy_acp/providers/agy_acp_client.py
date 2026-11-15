@@ -821,6 +821,32 @@ def _extract_chunk_text(update: Mapping[str, Any]) -> str:
     return str(update.get("text") or "")
 
 
+def _meta_has_replay(meta: Any) -> bool:
+    if not isinstance(meta, Mapping):
+        return False
+    if meta.get("replay") is True:
+        return True
+    for ns in ("kiro", "antigravity"):
+        nested = meta.get(ns)
+        if isinstance(nested, Mapping) and nested.get("replay") is True:
+            return True
+    return False
+
+
+def _is_replay_session_update(msg: Mapping[str, Any]) -> bool:
+    if _meta_has_replay(msg.get("_meta")):
+        return True
+    params = msg.get("params")
+    if not isinstance(params, Mapping):
+        return False
+    if params.get("replay") is True or _meta_has_replay(params.get("_meta")):
+        return True
+    update = params.get("update")
+    if not isinstance(update, Mapping):
+        return False
+    return update.get("replay") is True or _meta_has_replay(update.get("_meta"))
+
+
 @dataclass
 class _QueuedAcpSteer:
     """Internal steer entry pairing `QueuedSteer` metadata with native ACP `content_blocks`."""
@@ -901,6 +927,7 @@ class _AcpSubprocessConnection:
             [_AcpSubprocessConnection, dict[str, Any]], Coroutine[Any, Any, None]
         ],
         on_disconnect: Callable[[_AcpSubprocessConnection], None],
+        accept_notification: Callable[[dict[str, Any]], bool] | None = None,
     ) -> None:
         self._bin_path = bin_path
         self._env = env
@@ -910,6 +937,7 @@ class _AcpSubprocessConnection:
         self._on_server_request = on_server_request
         self._on_notification = on_notification
         self._on_disconnect = on_disconnect
+        self._accept_notification = accept_notification
 
         self._write_lock = anyio.Lock()
         self._next_id = 0
@@ -1241,6 +1269,10 @@ class _AcpSubprocessConnection:
             return
 
         if has_method:
+            if _is_replay_session_update(msg):
+                return
+            if self._accept_notification is not None and not self._accept_notification(msg):
+                return
             self._begin_frame()
             try:
                 self._notif_send.send_nowait(msg)
@@ -1406,6 +1438,25 @@ class AgyAcpClientProvider:
             if conn._tg_stack is not None or conn._actor_task is not None:
                 self._retired_conns.append(conn)
 
+    def _resolve_live_turn_update(
+        self,
+        msg: Mapping[str, Any],
+    ) -> tuple[_ActiveTurnState, str, Mapping[str, Any]] | None:
+        if msg.get("method") != "session/update" or _is_replay_session_update(msg):
+            return None
+        params = msg.get("params")
+        update = params.get("update") if isinstance(params, Mapping) else None
+        if not isinstance(params, Mapping) or not isinstance(update, Mapping):
+            return None
+        kind = str(update.get("sessionUpdate") or "")
+        if not kind or kind == "available_commands_update":
+            return None
+        turn = self._turn_states.get(str(params.get("sessionId") or "").strip())
+        return (turn, kind, update) if turn is not None else None
+
+    def _should_accept_notification(self, msg: dict[str, Any]) -> bool:
+        return self._resolve_live_turn_update(msg) is not None
+
     async def _ensure_connection(
         self,
         *,
@@ -1448,6 +1499,7 @@ class AgyAcpClientProvider:
                 on_server_request=self._handle_server_request,
                 on_notification=self._handle_notification,
                 on_disconnect=self._on_connection_disconnect,
+                accept_notification=self._should_accept_notification,
             )
             await conn.start(supervisor_tg=self._supervisor_tg)
             try:
@@ -1673,6 +1725,7 @@ class AgyAcpClientProvider:
             profile_key=profile_key,
             lazy_mcp_config=lazy_mcp_config,
         )
+        await conn.wait_idle()
         sid = str(res.get("sessionId") or (agy_session_id or "")).strip()
         if not sid:
             err_code = -32002 if rpc_method == "session/load" else -32603
@@ -1695,6 +1748,7 @@ class AgyAcpClientProvider:
             effort=effort,
             available_models=models,
         )
+        await conn.wait_idle()
         conn.session_prefs[sid] = (model or "", mode, effort or "")
         extracted_tier = self._extract_tier(res)
         self._cache_tier(extracted_tier)
@@ -2061,20 +2115,10 @@ class AgyAcpClientProvider:
     ) -> None:
         """Handle inbound `session/update` notifications spawned via `tg.start_soon`."""
         _ = conn
-        if msg.get("method") != "session/update":
+        resolved = self._resolve_live_turn_update(msg)
+        if resolved is None:
             return
-        params = msg.get("params")
-        update = params.get("update") if isinstance(params, Mapping) else None
-        if not isinstance(params, Mapping) or not isinstance(update, Mapping):
-            return
-
-        kind = str(update.get("sessionUpdate") or "")
-        if kind == "available_commands_update":
-            return
-
-        turn = self._turn_states.get(str(params.get("sessionId") or "").strip())
-        if turn is None:
-            return
+        turn, kind, update = resolved
 
         turn.handler_enter()
         notif_tok = otel_context.attach(turn.otel_ctx)
@@ -2379,6 +2423,7 @@ class AgyAcpClientProvider:
                     outcome_error = str(exc)
                     break
 
+                await conn.wait_idle()
                 self._session_to_agy_sid[sid] = resolved_agy_sid
                 turn_state = _ActiveTurnState(
                     session_id=sid,
