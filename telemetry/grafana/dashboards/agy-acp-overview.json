@@ -237,15 +237,251 @@
       "id": 6,
       "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
       "targets": [
-        { "expr": "max(agy_acp_quota_remaining_credits)", "legendFormat": "Remaining", "refId": "A" },
-        { "expr": "max(agy_acp_quota_capacity_credits)", "legendFormat": "Capacity", "refId": "B" }
+        { "expr": "max(agy_acp_quota_remaining_credits)", "legendFormat": "Effective Remaining", "refId": "A" },
+        { "expr": "max(agy_acp_quota_capacity_credits)", "legendFormat": "Effective Capacity", "refId": "B" },
+        { "expr": "max(agy_acp_g1_overage_credits)", "legendFormat": "G1 Overage", "refId": "C" },
+        { "expr": "max by (quota_group, window) (agy_acp_quota_bucket_remaining_credits)", "legendFormat": "{{quota_group}} ({{window}})", "refId": "D" }
       ],
-      "title": "Google AI Plan Credits",
+      "title": "Plan, Window & G1 Overage Credits",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Current quota burn rate divided by sustainable rate to scheduled reset (< 1.0x = safe until reset; > 1.0x = will exhaust early).",
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.85 },
+              { "color": "red", "value": 1.0 }
+            ]
+          },
+          "unit": "x"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 6 },
+      "id": 30,
+      "options": { "colorMode": "background", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [
+        {
+          "expr": "(sum by (quota_group, window) (rate(agy_acp_quota_fraction_burnt_total[1h])) or (0 * max by (quota_group, window) (agy_acp_quota_remaining_fraction))) / clamp_min(max by (quota_group, window) (agy_acp_quota_remaining_fraction) / clamp_min(max by (quota_group, window) (agy_acp_quota_reset_timestamp_seconds) - time(), 1), 1e-9)",
+          "legendFormat": "{{quota_group}} ({{window}})",
+          "refId": "A"
+        }
+      ],
+      "title": "Will I Run Out? — Burn Pace Ratio (< 1.0x Safe vs. > 1.0x Exhaustion Risk)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Time remaining until scheduled reset vs. net exhaustion safety margin (+s safe headroom past reset; negative = deficit before reset).",
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0 },
+              { "color": "green", "value": 3600 }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 6 },
+      "id": 31,
+      "options": { "colorMode": "value", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [
+        {
+          "expr": "clamp_min(max by (quota_group, window) (agy_acp_quota_reset_timestamp_seconds) - time(), 0)",
+          "legendFormat": "reset in: {{quota_group}} ({{window}})",
+          "refId": "A"
+        },
+        {
+          "expr": "clamp_max(max by (quota_group, window) (agy_acp_quota_remaining_fraction) / clamp_min(sum by (quota_group, window) (rate(agy_acp_quota_fraction_burnt_total[1h])), 1e-7), 604800) - clamp_min(max by (quota_group, window) (agy_acp_quota_reset_timestamp_seconds) - time(), 0)",
+          "legendFormat": "margin: {{quota_group}} ({{window}})",
+          "refId": "B"
+        }
+      ],
+      "title": "Scheduled Reset Countdown & Exhaustion Safety Margin",
       "type": "stat"
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 12 },
+      "id": 150,
+      "panels": [],
+      "title": "1B. Cross-Window (5h vs. 7d) Quota Equivalency & Predictive Burn",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Empirical number of full 5h quotas required to exhaust 100% of one 7d quota (compared against 33.6 five-hour windows per 7-day week).",
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "orange", "value": null },
+              { "color": "yellow", "value": 10 },
+              { "color": "green", "value": 33.6 }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 13 },
+      "id": 32,
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [
+        {
+          "expr": "max by (quota_group) (agy_acp_quota_5h_per_7d_ratio)",
+          "legendFormat": "R persisted ({{quota_group}})",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (quota_group) (rate(agy_acp_quota_fraction_burnt_total{window=\"5h\"}[6h])) / clamp_min(sum by (quota_group) (rate(agy_acp_quota_fraction_burnt_total{window=\"7d\"}[6h])), 1e-9)",
+          "legendFormat": "R live 6h ({{quota_group}})",
+          "refId": "B"
+        }
+      ],
+      "title": "How Many 5h Quotas Exhaust One 7d Quota (R)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Full 5h-equivalent budgets left inside the 7d weekly cap (remaining_7d * R) vs. calendar 5h windows remaining before 7d reset.",
+      "fieldConfig": { "defaults": { "decimals": 2, "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 13 },
+      "id": 33,
+      "targets": [
+        {
+          "expr": "max by (quota_group) (agy_acp_quota_remaining_fraction{window=\"7d\"}) * max by (quota_group) (agy_acp_quota_5h_per_7d_ratio)",
+          "legendFormat": "5h budgets left in 7d ({{quota_group}})",
+          "refId": "A"
+        },
+        {
+          "expr": "clamp_min((max by (quota_group) (agy_acp_quota_reset_timestamp_seconds{window=\"7d\"}) - time()) / 18000, 0)",
+          "legendFormat": "calendar 5h cycles left ({{quota_group}})",
+          "refId": "B"
+        }
+      ],
+      "title": "7d Budget in 5h Quotas vs. Remaining 5h Cycles",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Maximum sustainable average 5h utilization percentage per remaining 5h cycle so the 7d quota does not hit zero early.",
+      "fieldConfig": {
+        "defaults": {
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 25 },
+              { "color": "green", "value": 50 }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 13 },
+      "id": 34,
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "showThresholdLabels": false, "showThresholdMarkers": true },
+      "targets": [
+        {
+          "expr": "clamp_max(100 * (max by (quota_group) (agy_acp_quota_remaining_fraction{window=\"7d\"}) * max by (quota_group) (agy_acp_quota_5h_per_7d_ratio)) / clamp_min((max by (quota_group) (agy_acp_quota_reset_timestamp_seconds{window=\"7d\"}) - time()) / 18000, 1), 100)",
+          "legendFormat": "sustainable 5h ceiling ({{quota_group}})",
+          "refId": "A"
+        }
+      ],
+      "title": "Max Sustainable 5h Usage % per Remaining Cycle",
+      "type": "gauge"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Credits burnt per hour and cumulative burn by quota pool, window, and model. Click exemplar stars/diamonds to open the exact Tempo turn trace.",
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 20 },
+      "id": 35,
+      "targets": [
+        {
+          "exemplar": true,
+          "expr": "sum by (quota_group, window, model_id) (rate(agy_acp_credits_burnt_total[$__rate_interval])) * 3600",
+          "legendFormat": "credits/hr {{model_id}} [{{quota_group}} {{window}}]",
+          "refId": "A"
+        },
+        {
+          "exemplar": true,
+          "expr": "sum by (quota_group, window, model_id) (agy_acp_credits_burnt_total)",
+          "legendFormat": "total burnt {{model_id}} [{{quota_group}} {{window}}]",
+          "refId": "B"
+        }
+      ],
+      "title": "Credits Burnt Over Time by Pool & Model (+ Exemplars)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Live remaining %, consumed %, and 6h ahead linear trajectory forecast (predict_linear) toward zero across Google AI and Anthropic AI pools.",
+      "fieldConfig": { "defaults": { "max": 100, "min": 0, "unit": "percent" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 20 },
+      "id": 36,
+      "targets": [
+        {
+          "expr": "max by (quota_group, window) (agy_acp_quota_remaining_fraction) * 100",
+          "legendFormat": "remaining % {{quota_group}} ({{window}})",
+          "refId": "A"
+        },
+        {
+          "expr": "max by (quota_group, window) (agy_acp_quota_used_fraction) * 100",
+          "legendFormat": "used % {{quota_group}} ({{window}})",
+          "refId": "B"
+        },
+        {
+          "expr": "clamp_min(clamp_max(max by (quota_group, window) (predict_linear(agy_acp_quota_remaining_fraction[1h], 21600)) * 100, 100), 0)",
+          "legendFormat": "+6h forecast % {{quota_group}} ({{window}})",
+          "refId": "C"
+        }
+      ],
+      "title": "Quota Remaining Trajectory & 6h predict_linear Forecast",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Reset-immune quota fraction burn rate (%/hr) by pool, window, and model, plus normalized 5h-equivalent burn/hr.",
+      "fieldConfig": { "defaults": { "unit": "percent" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 20 },
+      "id": 37,
+      "targets": [
+        {
+          "exemplar": true,
+          "expr": "sum by (quota_group, window, model_id) (rate(agy_acp_quota_fraction_burnt_total[$__rate_interval])) * 360000",
+          "legendFormat": "%/hr {{model_id}} [{{quota_group}} {{window}}]",
+          "refId": "A"
+        },
+        {
+          "expr": "(sum by (quota_group) (rate(agy_acp_quota_fraction_burnt_total{window=\"7d\"}[$__rate_interval])) * max by (quota_group) (agy_acp_quota_5h_per_7d_ratio)) * 360000",
+          "legendFormat": "normalized 5h-eq %/hr ({{quota_group}})",
+          "refId": "B"
+        }
+      ],
+      "title": "Quota Burn Rate (%/hr) by Model & Window (+ Exemplars)",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 28 },
       "id": 200,
       "panels": [],
       "title": "2. ACP JSON-RPC Wire & Stdio Framing",
@@ -255,7 +491,7 @@
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "description": "JSON-RPC 2.0 request throughput by method/engine and error rate by method/code.",
       "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 7 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 29 },
       "id": 7,
       "links": [
         {
@@ -288,7 +524,7 @@
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "description": "ACP JSON-RPC latency quantiles. Click diamond exemplars to jump straight to the Tempo trace.",
       "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 7 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 29 },
       "id": 8,
       "links": [
         {
@@ -324,7 +560,7 @@
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "description": "Raw stdio NDJSON frame sizes (p95) and byte rate across inbound stdin and outbound stdout.",
       "fieldConfig": { "defaults": { "unit": "bytes" }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 7 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 29 },
       "id": 9,
       "targets": [
         {
@@ -344,7 +580,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 37 },
       "id": 300,
       "panels": [],
       "title": "3. Prompt Turns, TTFT, Context Window & Steering",
@@ -354,7 +590,7 @@
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "description": "Completed turns, mid-turn steers, context compactions, and automatic model fallbacks.",
       "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 38 },
       "id": 10,
       "links": [
         {
@@ -392,7 +628,7 @@
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "description": "End-to-end prompt turn duration and Time-to-First-Token (TTFT) with clickable Tempo trace exemplars.",
       "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 38 },
       "id": 11,
       "links": [
         {
@@ -434,7 +670,7 @@
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "description": "Active context window utilization percentage and context token count (p95) per model.",
       "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 16 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 38 },
       "id": 12,
       "targets": [
         {
@@ -445,9 +681,15 @@
         },
         {
           "exemplar": true,
+          "expr": "histogram_quantile(0.95, sum by (le, quota_group, model_id) (rate(agy_acp_context_window_utilization_ratio_bucket[$__rate_interval]))) * 100",
+          "legendFormat": "utilization ratio % p95 ({{model_id}})",
+          "refId": "B"
+        },
+        {
+          "exemplar": true,
           "expr": "histogram_quantile(0.95, sum by (le, model) (rate(agy_acp_context_tokens_bucket[$__rate_interval])))",
           "legendFormat": "context tokens p95 ({{model}})",
-          "refId": "B"
+          "refId": "C"
         }
       ],
       "title": "Context Window Utilization (% & Tokens p95)",
@@ -455,7 +697,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 24 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 46 },
       "id": 400,
       "panels": [],
       "title": "4. Tokens, Plan Credits, Quota Fetch & SQLite Persistence",
@@ -465,12 +707,13 @@
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "description": "Token processing rate by model/type alongside persisted SQLite cumulative ledger totals.",
       "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 25 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 47 },
       "id": 13,
       "targets": [
         {
-          "expr": "sum by (model, token_type) (rate(agy_acp_tokens_total[$__rate_interval]))",
-          "legendFormat": "tokens/s {{model}} ({{token_type}})",
+          "exemplar": true,
+          "expr": "sum by (quota_group, model_id, token_type) (rate(agy_acp_tokens_total[$__rate_interval]))",
+          "legendFormat": "tokens/s {{model_id}} [{{quota_group}}/{{token_type}}]",
           "refId": "A"
         },
         {
@@ -486,7 +729,7 @@
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "description": "Estimated Google AI plan credits consumed per window and cumulative session total.",
       "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 25 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 47 },
       "id": 14,
       "targets": [
         {
@@ -507,7 +750,7 @@
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "description": "SQLite WAL state-store operation latency and Antigravity quota/credits CLI fetch latency.",
       "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 25 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 47 },
       "id": 15,
       "links": [
         {
@@ -535,7 +778,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 33 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 55 },
       "id": 500,
       "panels": [],
       "title": "5. Agent Tool Calls, Permission Gate & MCP Discovery",
@@ -545,7 +788,7 @@
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "description": "Agent tool invocations by tool/status and real-time permission gate decisions (allow_once / reject_once).",
       "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 34 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 56 },
       "id": 16,
       "links": [
         {
@@ -578,7 +821,7 @@
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "description": "Agent tool call execution latency (p50 / p95) with clickable trace exemplars.",
       "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 34 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 56 },
       "id": 17,
       "links": [
         {
@@ -608,7 +851,7 @@
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "description": "Discovered MCP tool counts per server, catalog probe outcomes, and p95 probe latency.",
       "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 34 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 56 },
       "id": 18,
       "links": [
         {
@@ -640,7 +883,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 42 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 64 },
       "id": 600,
       "panels": [],
       "title": "6. Backend Subprocess Lifecycle & Live Correlated Traces + Logs",
@@ -650,7 +893,7 @@
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "description": "Persistent agy acp subprocess spawns, exits, and automatic crash/EOF reconnections.",
       "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 43 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 65 },
       "id": 19,
       "links": [
         {
@@ -683,7 +926,7 @@
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "description": "Upstream agy acp child-process JSON-RPC latency (p50 / p95) with clickable Tempo exemplars.",
       "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 43 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 65 },
       "id": 20,
       "links": [
         {
@@ -713,7 +956,7 @@
       "datasource": { "type": "tempo", "uid": "tempo" },
       "description": "Live TraceQL search over agy-acp spans. Click any Trace ID to inspect waterfall & jump to Loki logs.",
       "fieldConfig": { "defaults": {}, "overrides": [] },
-      "gridPos": { "h": 10, "w": 10, "x": 0, "y": 51 },
+      "gridPos": { "h": 10, "w": 10, "x": 0, "y": 73 },
       "id": 21,
       "options": { "showHeader": true },
       "targets": [
@@ -732,7 +975,7 @@
       "datasource": { "type": "loki", "uid": "loki" },
       "description": "Redacted structured ACP diagnostic events streamed over OTLP Logs (disk logging disabled by default). Expand any line and click View in Tempo on TraceID.",
       "fieldConfig": { "defaults": {}, "overrides": [] },
-      "gridPos": { "h": 10, "w": 14, "x": 10, "y": 51 },
+      "gridPos": { "h": 10, "w": 14, "x": 10, "y": 73 },
       "id": 22,
       "options": {
         "dedupStrategy": "none",

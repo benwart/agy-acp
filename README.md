@@ -25,16 +25,16 @@ pre-commit install
 - `agy-acp agent validate`: Validate `.kiro/agents` JSON and Markdown custom agent specifications.
 - `agy-acp auth login | logout | status` & `agy-acp whoami | status`: Out-of-band authentication with zero-downtime hot-reload in connected ACP servers.
 - `agy-acp quota status | five-hour | seven-day | credits`: Inspect 5-hour and 7-day rolling quotas, G1 credits, and SQLite session token usage.
-- `agy-acp telemetry status | enable | disable`: Inspect or persist OpenTelemetry export settings (`telemetry.json`) and optional `acp.log` disk logging (`--disk-logs`).
+- `agy-acp telemetry up | status | down | logs | enable | disable`: Start/stop the localhost Docker Compose stack, inspect health/logs, or persist OpenTelemetry export settings (`telemetry.json`) and optional `acp.log` disk logging (`--disk-logs`).
 - `agy-acp docs build | serve`: Build and serve the Zensical documentation site (`zensical.toml` / `docs/`).
 
 ## OpenTelemetry & Docker Compose Stack
 
-Telemetry (34 metrics, distributed traces, and redacted structured logs) is enabled by default targeting `http://127.0.0.1:4318`, and diagnostic `acp.log` disk writes are disabled by default. When the local collector is down, `agy-acp` probes `127.0.0.1:4318` non-blockingly with zero `stderr` output, buffers recent spans and logs in RAM, and flushes cumulative metrics, live gauges, and buffered spans/logs automatically within seconds of starting Docker Compose—without restarting `agy-acp`:
+Telemetry (43 metrics including Google AI vs. Anthropic AI quota burn pace, `5h`/`7d` capacity ratio `R`, and `predict_linear` forecasts, plus distributed traces and redacted structured logs) is enabled by default targeting `http://127.0.0.1:4318`, and diagnostic `acp.log` disk writes are disabled by default. When the local collector is down, `agy-acp` probes `127.0.0.1:4318` non-blockingly with zero `stderr` output, buffers recent spans and logs in RAM, and flushes cumulative metrics, live gauges, and buffered spans/logs automatically within seconds of starting Docker Compose—without restarting `agy-acp`:
 
 ```bash
-docker compose up -d
+agy-acp telemetry up
 agy-acp telemetry status
 # Open Grafana -> http://127.0.0.1:3000 (Antigravity ACP — Telemetry, Traces & Logs)
-docker compose down
+agy-acp telemetry down
 ```

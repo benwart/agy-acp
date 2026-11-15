@@ -53,6 +53,12 @@ from opentelemetry.sdk.trace.export import (
 from opentelemetry.trace import Span, SpanKind, Status, StatusCode
 
 from agy_acp import KIRO_CLI_COMPAT_VERSION, __version__
+from agy_acp.logic.quota_burn import (
+    DEFAULT_5H_PER_7D_RATIO,
+    classify_model_quota_group,
+    normalize_quota_group,
+    parse_reset_epoch_seconds,
+)
 from agy_acp.providers.state_store import resolve_state_db_path
 
 DEFAULT_OTLP_ENDPOINT = "http://127.0.0.1:4318"
@@ -121,6 +127,20 @@ PERCENT_BUCKETS: tuple[float, ...] = (
     95.0,
     100.0,
 )
+RATIO_BUCKETS: tuple[float, ...] = (
+    0.05,
+    0.1,
+    0.2,
+    0.3,
+    0.4,
+    0.5,
+    0.6,
+    0.7,
+    0.8,
+    0.9,
+    0.95,
+    1.0,
+)
 
 SUPPORTED_METRIC_NAMES: tuple[str, ...] = (
     "agy_acp.rpc.requests",
@@ -136,8 +156,10 @@ SUPPORTED_METRIC_NAMES: tuple[str, ...] = (
     "agy_acp.model.fallbacks",
     "agy_acp.tokens",
     "agy_acp.credits.consumed",
+    "agy_acp.credits.burnt",
     "agy_acp.context.tokens",
     "agy_acp.context.usage_percent",
+    "agy_acp.context.window_utilization",
     "agy_acp.tool.calls",
     "agy_acp.tool.duration",
     "agy_acp.tool.permissions",
@@ -151,8 +173,15 @@ SUPPORTED_METRIC_NAMES: tuple[str, ...] = (
     "agy_acp.mcp.tools_discovered",
     "agy_acp.quota.fetch.duration",
     "agy_acp.quota.remaining_percent",
+    "agy_acp.quota.remaining_fraction",
+    "agy_acp.quota.used_fraction",
     "agy_acp.quota.remaining_credits",
+    "agy_acp.quota.bucket_remaining_credits",
     "agy_acp.quota.capacity_credits",
+    "agy_acp.quota.reset_timestamp",
+    "agy_acp.quota.5h_per_7d_ratio",
+    "agy_acp.quota.fraction_burnt",
+    "agy_acp.g1.overage_credits",
     "agy_acp.sessions.count",
     "agy_acp.ledger.tokens",
     "agy_acp.sqlite.duration",
@@ -185,8 +214,21 @@ class TelemetryCallbacks:
     quota_metrics: (
         Callable[[], tuple[Sequence[Mapping[str, Any]], float | None, float | None]] | None
     ) = None
+    quota_extended_metrics: Callable[[], Mapping[str, Any]] | None = None
     ledger_tokens: Callable[[], Mapping[str, int]] | None = None
     mcp_tools_discovered: Callable[[], Mapping[str, int]] | None = None
+
+
+@contextmanager
+def _bind_optional_context(ctx: Context | None) -> Generator[None]:
+    if ctx is None:
+        yield
+        return
+    token = otel_context.attach(ctx)
+    try:
+        yield
+    finally:
+        otel_context.detach(token)
 
 
 def _parse_bool_env(raw: str | None) -> bool | None:
@@ -772,6 +814,10 @@ class TelemetryManager:
                 instrument_name="agy_acp.context.usage_percent",
                 aggregation=ExplicitBucketHistogramAggregation(PERCENT_BUCKETS),
             ),
+            View(
+                instrument_name="agy_acp.context.window_utilization",
+                aggregation=ExplicitBucketHistogramAggregation(RATIO_BUCKETS),
+            ),
         ]
         self._meter_provider = MeterProvider(
             resource=resource,
@@ -851,6 +897,16 @@ class TelemetryManager:
             unit="{credit}",
             description="Estimated Google AI plan credits consumed.",
         )
+        self._credits_burnt = meter.create_counter(
+            "agy_acp.credits.burnt",
+            unit="{credit}",
+            description="Monotonic quota credits burnt by quota_group, window, and model_id.",
+        )
+        self._quota_fraction_burnt = meter.create_counter(
+            "agy_acp.quota.fraction_burnt",
+            unit="{fraction}",
+            description="Monotonic non-resetting quota fraction burnt by pool, window, and model.",
+        )
         self._context_tokens = meter.create_histogram(
             "agy_acp.context.tokens",
             unit="{token}",
@@ -859,6 +915,11 @@ class TelemetryManager:
         self._context_usage_percent = meter.create_histogram(
             "agy_acp.context.usage_percent",
             description="Active conversation context window utilization percentage.",
+        )
+        self._context_window_utilization = meter.create_histogram(
+            "agy_acp.context.window_utilization",
+            unit="1",
+            description="Active conversation context window fill ratio (0.0 to 1.0).",
         )
         self._tool_calls = meter.create_counter(
             "agy_acp.tool.calls",
@@ -936,16 +997,49 @@ class TelemetryManager:
             description="Remaining Antigravity rolling quota percentage by group and window.",
         )
         meter.create_observable_gauge(
+            "agy_acp.quota.remaining_fraction",
+            callbacks=[self._observe_quota_remaining_fraction],
+            description="Live remaining quota fraction (0.0 to 1.0) per provider pool and window.",
+        )
+        meter.create_observable_gauge(
+            "agy_acp.quota.used_fraction",
+            callbacks=[self._observe_quota_used_fraction],
+            description="Live consumed quota fraction (0.0 to 1.0) per provider pool and window.",
+        )
+        meter.create_observable_gauge(
             "agy_acp.quota.remaining_credits",
             callbacks=[self._observe_quota_remaining_credits],
             unit="{credit}",
             description="Estimated remaining Google AI plan credits.",
         )
         meter.create_observable_gauge(
+            "agy_acp.quota.bucket_remaining_credits",
+            callbacks=[self._observe_quota_bucket_remaining_credits],
+            unit="{credit}",
+            description="Remaining quota credits per provider pool and rolling window.",
+        )
+        meter.create_observable_gauge(
             "agy_acp.quota.capacity_credits",
             callbacks=[self._observe_quota_capacity_credits],
             unit="{credit}",
             description="Estimated total Google AI plan credit capacity.",
+        )
+        meter.create_observable_gauge(
+            "agy_acp.quota.reset_timestamp",
+            callbacks=[self._observe_quota_reset_timestamp],
+            unit="s",
+            description="Scheduled quota reset Unix timestamp in seconds by pool and window.",
+        )
+        meter.create_observable_gauge(
+            "agy_acp.quota.5h_per_7d_ratio",
+            callbacks=[self._observe_quota_5h_per_7d_ratio],
+            description="Empirical number of 5h quotas equal to 1 full 7d quota per pool.",
+        )
+        meter.create_observable_gauge(
+            "agy_acp.g1.overage_credits",
+            callbacks=[self._observe_g1_overage_credits],
+            unit="{credit}",
+            description="Remaining Google One / G1 overage credit balance.",
         )
         meter.create_observable_gauge(
             "agy_acp.ledger.tokens",
@@ -981,6 +1075,8 @@ class TelemetryManager:
                 self._callbacks.session_counts = callbacks.session_counts
             if callbacks.quota_metrics is not None:
                 self._callbacks.quota_metrics = callbacks.quota_metrics
+            if callbacks.quota_extended_metrics is not None:
+                self._callbacks.quota_extended_metrics = callbacks.quota_extended_metrics
             if callbacks.ledger_tokens is not None:
                 self._callbacks.ledger_tokens = callbacks.ledger_tokens
             if callbacks.mcp_tools_discovered is not None:
@@ -1051,6 +1147,149 @@ class TelemetryManager:
             if capacity is not None:
                 return (Observation(float(capacity)),)
         return ()
+
+    def _resolve_extended_quota_payload(self) -> dict[str, Any] | None:
+        with self._callbacks_lock:
+            ext_fn = self._callbacks.quota_extended_metrics
+            base_fn = self._callbacks.quota_metrics
+        if ext_fn is not None:
+            with contextlib.suppress(Exception):
+                data = ext_fn()
+                if isinstance(data, Mapping):
+                    return dict(data)
+        if base_fn is not None:
+            with contextlib.suppress(Exception):
+                buckets, rem, _ = base_fn()
+                derived: list[dict[str, Any]] = []
+                now_ts = time.time()
+                for item in buckets:
+                    grp = str(item.get("group", "Gemini Models"))
+                    q_grp = str(item.get("quota_group") or normalize_quota_group(grp))
+                    win = str(item.get("window", "5h"))
+                    pct = float(item.get("percent", 0.0))
+                    frac = float(item.get("remaining_fraction", max(0.0, min(1.0, pct / 100.0))))
+                    reset_ts = item.get("reset_timestamp_seconds")
+                    if reset_ts is None and item.get("reset_time"):
+                        reset_ts = parse_reset_epoch_seconds(str(item.get("reset_time")))
+                    if reset_ts is None:
+                        reset_ts = now_ts + (604_800.0 if win == "7d" else 18_000.0)
+                    derived.append(
+                        {
+                            "quota_group": q_grp,
+                            "group": grp,
+                            "window": win,
+                            "remaining_fraction": frac,
+                            "used_fraction": round(max(0.0, min(1.0, 1.0 - frac)), 6),
+                            "remaining_credits": float(
+                                item.get("remaining_credits", rem if rem is not None else 0.0)
+                            ),
+                            "reset_timestamp_seconds": float(reset_ts),
+                        }
+                    )
+                return {
+                    "buckets": derived,
+                    "g1_overage_credits": 0.0,
+                    "ratios": {
+                        "google_ai": DEFAULT_5H_PER_7D_RATIO,
+                        "anthropic_ai": DEFAULT_5H_PER_7D_RATIO,
+                    },
+                }
+        return None
+
+    def _observe_quota_remaining_fraction(self, options: CallbackOptions) -> Iterable[Observation]:
+        del options
+        payload = self._resolve_extended_quota_payload()
+        if payload is None:
+            return ()
+        return [
+            Observation(
+                float(b["remaining_fraction"]),
+                {
+                    "quota_group": str(b["quota_group"]),
+                    "group": str(b["group"]),
+                    "window": str(b["window"]),
+                },
+            )
+            for b in payload.get("buckets", ())
+            if "remaining_fraction" in b
+        ]
+
+    def _observe_quota_used_fraction(self, options: CallbackOptions) -> Iterable[Observation]:
+        del options
+        payload = self._resolve_extended_quota_payload()
+        if payload is None:
+            return ()
+        return [
+            Observation(
+                float(b["used_fraction"]),
+                {
+                    "quota_group": str(b["quota_group"]),
+                    "group": str(b["group"]),
+                    "window": str(b["window"]),
+                },
+            )
+            for b in payload.get("buckets", ())
+            if "used_fraction" in b
+        ]
+
+    def _observe_quota_bucket_remaining_credits(
+        self, options: CallbackOptions
+    ) -> Iterable[Observation]:
+        del options
+        payload = self._resolve_extended_quota_payload()
+        if payload is None:
+            return ()
+        return [
+            Observation(
+                float(b["remaining_credits"]),
+                {
+                    "quota_group": str(b["quota_group"]),
+                    "group": str(b["group"]),
+                    "window": str(b["window"]),
+                },
+            )
+            for b in payload.get("buckets", ())
+            if "remaining_credits" in b
+        ]
+
+    def _observe_quota_reset_timestamp(self, options: CallbackOptions) -> Iterable[Observation]:
+        del options
+        payload = self._resolve_extended_quota_payload()
+        if payload is None:
+            return ()
+        return [
+            Observation(
+                float(b["reset_timestamp_seconds"]),
+                {
+                    "quota_group": str(b["quota_group"]),
+                    "group": str(b["group"]),
+                    "window": str(b["window"]),
+                },
+            )
+            for b in payload.get("buckets", ())
+            if b.get("reset_timestamp_seconds") is not None
+        ]
+
+    def _observe_quota_5h_per_7d_ratio(self, options: CallbackOptions) -> Iterable[Observation]:
+        del options
+        payload = self._resolve_extended_quota_payload()
+        if payload is None:
+            return ()
+        ratios = payload.get("ratios")
+        if not isinstance(ratios, Mapping):
+            return ()
+        return [
+            Observation(float(val), {"quota_group": str(q_grp)})
+            for q_grp, val in ratios.items()
+            if val is not None
+        ]
+
+    def _observe_g1_overage_credits(self, options: CallbackOptions) -> Iterable[Observation]:
+        del options
+        payload = self._resolve_extended_quota_payload()
+        if payload is None or payload.get("g1_overage_credits") is None:
+            return ()
+        return (Observation(float(payload["g1_overage_credits"])),)
 
     def _observe_ledger_tokens(self, options: CallbackOptions) -> Iterable[Observation]:
         del options
@@ -1232,11 +1471,28 @@ class TelemetryManager:
         duration_s: float,
         ttft_s: float | None = None,
     ) -> None:
-        attrs = {"stop_reason": stop_reason, "model": model, "engine": engine}
+        quota_group = classify_model_quota_group(model)
+        status = "ok" if stop_reason in {"end_turn", "max_tokens", "stop_sequence"} else stop_reason
+        attrs = {
+            "stop_reason": stop_reason,
+            "status": status,
+            "model": model,
+            "model_id": model,
+            "quota_group": quota_group,
+            "engine": engine,
+        }
         self._turns.add(1, attrs)
         self._turn_duration.record(max(0.0, duration_s), attrs)
         if ttft_s is not None:
-            self._turn_ttft.record(max(0.0, ttft_s), {"model": model, "engine": engine})
+            self._turn_ttft.record(
+                max(0.0, ttft_s),
+                {
+                    "model": model,
+                    "model_id": model,
+                    "quota_group": quota_group,
+                    "engine": engine,
+                },
+            )
 
     def record_steer(self, *, outcome: str) -> None:
         self._steers.add(1, {"outcome": outcome})
@@ -1259,6 +1515,7 @@ class TelemetryManager:
         cached_tokens: int = 0,
         thought_tokens: int = 0,
     ) -> None:
+        quota_group = classify_model_quota_group(model)
         for token_type, count in (
             ("input", input_tokens),
             ("output", output_tokens),
@@ -1266,11 +1523,68 @@ class TelemetryManager:
             ("thought", thought_tokens),
         ):
             if count > 0:
-                self._tokens.add(count, {"model": model, "token_type": token_type})
+                self._tokens.add(
+                    count,
+                    {
+                        "model": model,
+                        "model_id": model,
+                        "quota_group": quota_group,
+                        "token_type": token_type,
+                    },
+                )
 
     def record_credits_consumed(self, model: str, credits: float) -> None:
         if credits > 0.0:
-            self._credits_consumed.add(credits, {"model": model})
+            self._credits_consumed.add(
+                credits,
+                {
+                    "model": model,
+                    "model_id": model,
+                    "quota_group": classify_model_quota_group(model),
+                },
+            )
+
+    def record_quota_fraction_burnt(
+        self,
+        quota_group: str,
+        *,
+        window: str,
+        model_id: str,
+        fraction: float,
+        context: Context | None = None,
+    ) -> None:
+        if fraction <= 0.0:
+            return
+        with _bind_optional_context(context):
+            self._quota_fraction_burnt.add(
+                fraction,
+                {
+                    "quota_group": quota_group,
+                    "window": window,
+                    "model_id": model_id,
+                },
+            )
+
+    def record_credits_burnt(
+        self,
+        quota_group: str,
+        *,
+        window: str,
+        model_id: str,
+        credits: float,
+        context: Context | None = None,
+    ) -> None:
+        if credits <= 0.0:
+            return
+        with _bind_optional_context(context):
+            self._credits_burnt.add(
+                credits,
+                {
+                    "quota_group": quota_group,
+                    "window": window,
+                    "model_id": model_id,
+                },
+            )
 
     def record_context_usage(
         self,
@@ -1279,9 +1593,15 @@ class TelemetryManager:
         used_tokens: int,
         usage_percent: float,
     ) -> None:
-        attrs = {"model": model}
+        attrs = {
+            "model": model,
+            "model_id": model,
+            "quota_group": classify_model_quota_group(model),
+        }
+        clamped_pct = max(0.0, usage_percent)
         self._context_tokens.record(max(0, used_tokens), attrs)
-        self._context_usage_percent.record(max(0.0, usage_percent), attrs)
+        self._context_usage_percent.record(clamped_pct, attrs)
+        self._context_window_utilization.record(min(1.0, clamped_pct / 100.0), attrs)
 
     def record_tool_call(
         self,

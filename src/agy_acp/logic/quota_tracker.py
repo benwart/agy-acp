@@ -11,7 +11,14 @@ from datetime import UTC, datetime, tzinfo
 from typing import Any
 
 import anyio
+from opentelemetry.context import Context
 
+from agy_acp.logic.quota_burn import (
+    DEFAULT_5H_PER_7D_RATIO,
+    QuotaBurnLedger,
+    normalize_quota_group,
+    parse_reset_epoch_seconds,
+)
 from agy_acp.providers.quota_provider import QuotaProvider
 from agy_acp.providers.state_store import SqliteStateStoreProvider
 from agy_acp.providers.telemetry import TelemetryCallbacks, get_telemetry
@@ -219,36 +226,128 @@ class QuotaTracker:
         self._pending_baseline_models: dict[str, str | None] = {}
         self._refresh_in_flight: bool = False
         self._refresh_pending: bool = False
+        self._pending_refresh_model: str | None = None
+        self._pending_refresh_otel_context: Context | None = None
         self._refresh_done_events: list[anyio.Event] = []
         self._last_refresh_monotonic: float | None = None
         self._last_otel_buckets: list[dict[str, Any]] = []
         self._last_otel_remaining_credits: float | None = None
         self._last_otel_capacity_credits: float | None = None
+        self._last_otel_extended: dict[str, Any] | None = None
+        persisted_burn = self._store.load_quota_burn_state() if self._store is not None else None
+        self._burn_ledger = QuotaBurnLedger(persisted_burn)
         db_ref = self._store.db_path if self._store is not None else None
         get_telemetry(db_ref).register_callbacks(
-            TelemetryCallbacks(quota_metrics=self._get_otel_quota_snapshot)
+            TelemetryCallbacks(
+                quota_metrics=self._get_otel_quota_snapshot,
+                quota_extended_metrics=self._get_otel_extended_quota_snapshot,
+            )
         )
+
+    def _default_tier_ratio(self, tier: Mapping[str, Any] | str | None = None) -> float:
+        spec = resolve_plan_credit_spec(tier if tier is not None else self._resolve_cached_tier())
+        if spec.five_hour_capacity <= 0.0:
+            return DEFAULT_5H_PER_7D_RATIO
+        return round(spec.weekly_capacity / spec.five_hour_capacity, 4)
+
+    def get_empirical_5h_per_7d_ratios(self) -> dict[str, float]:
+        """Return empirical non-resetting `5h`-per-`7d` capacity ratio `R` per quota pool."""
+        return self._burn_ledger.get_ratios(default_ratio=self._default_tier_ratio())
 
     def _update_otel_quota_snapshot(
         self,
         five_hour_buckets: list[dict[str, Any]],
         seven_day_buckets: list[dict[str, Any]],
         kiro_credits: Mapping[str, Any],
+        *,
+        active_model_id: str | None = None,
+        otel_context: Context | None = None,
     ) -> None:
+        obs = self._burn_ledger.observe_snapshot(
+            five_hour_buckets,
+            seven_day_buckets,
+            active_model_id=active_model_id,
+            default_ratio=self._default_tier_ratio(),
+        )
+        if obs.state_changed and self._store is not None:
+            self._store.save_quota_burn_state(self._burn_ledger.to_dict())
+
+        db_ref = self._store.db_path if self._store is not None else None
+        otel = get_telemetry(db_ref)
+        for delta in obs.burnt_deltas:
+            otel.record_quota_fraction_burnt(
+                delta.quota_group,
+                window=delta.window,
+                model_id=delta.model_id,
+                fraction=delta.fraction_burnt,
+                context=otel_context,
+            )
+            otel.record_credits_burnt(
+                delta.quota_group,
+                window=delta.window,
+                model_id=delta.model_id,
+                credits=delta.credits_burnt,
+                context=otel_context,
+            )
+
         buckets: list[dict[str, Any]] = []
-        for win_label, items in (("5h", five_hour_buckets), ("7d", seven_day_buckets)):
-            for b in items:
-                frac = float(b.get("remaining_fraction", 0.0))
-                buckets.append(
-                    {
-                        "group": str(b.get("group") or b.get("name") or "default"),
-                        "window": win_label,
-                        "percent": round(max(0.0, min(100.0, frac * 100.0)), 2),
-                    }
-                )
+        ext_buckets: list[dict[str, Any]] = []
+        for g in obs.bucket_gauges:
+            buckets.append(
+                {
+                    "group": g.group,
+                    "window": g.window,
+                    "percent": g.remaining_percent,
+                }
+            )
+            ext_buckets.append(
+                {
+                    "quota_group": g.quota_group,
+                    "group": g.group,
+                    "window": g.window,
+                    "remaining_fraction": g.remaining_fraction,
+                    "used_fraction": g.used_fraction,
+                    "remaining_credits": g.remaining_credits,
+                    "reset_timestamp_seconds": g.reset_timestamp_seconds,
+                }
+            )
         self._last_otel_buckets = buckets
         self._last_otel_remaining_credits = float(kiro_credits.get("effective_credits", 0.0))
         self._last_otel_capacity_credits = float(kiro_credits.get("credit_capacity", 0.0))
+        self._last_otel_extended = {
+            "buckets": ext_buckets,
+            "g1_overage_credits": float(kiro_credits.get("g1_overage_credits", 0.0)),
+            "ratios": obs.ratios_by_group,
+        }
+
+    def _get_otel_extended_quota_snapshot(self) -> dict[str, Any]:
+        if self._last_otel_extended is not None:
+            return dict(self._last_otel_extended)
+        active_tier = self._resolve_cached_tier()
+        five_hour, seven_day, credits_info = self._read_cached_quotas_and_credits(tier=active_tier)
+        ext_buckets: list[dict[str, Any]] = []
+        for win_label, items in (("5h", five_hour["buckets"]), ("7d", seven_day["buckets"])):
+            for b in items:
+                raw_grp = str(b.get("group") or b.get("name") or "Gemini Models")
+                frac = max(0.0, min(1.0, float(b.get("remaining_fraction", 0.0))))
+                ext_buckets.append(
+                    {
+                        "quota_group": normalize_quota_group(raw_grp),
+                        "group": raw_grp,
+                        "window": win_label,
+                        "remaining_fraction": frac,
+                        "used_fraction": round(1.0 - frac, 6),
+                        "remaining_credits": float(b.get("remaining_credits", 0.0)),
+                        "reset_timestamp_seconds": parse_reset_epoch_seconds(
+                            str(b.get("reset_time") or "")
+                        ),
+                    }
+                )
+        return {
+            "buckets": ext_buckets,
+            "g1_overage_credits": float(credits_info.get("remaining_credits", 0)),
+            "ratios": self.get_empirical_5h_per_7d_ratios(),
+        }
 
     def _get_otel_quota_snapshot(
         self,
@@ -379,14 +478,20 @@ class QuotaTracker:
         *,
         seed_session_ids: Sequence[str] = (),
         model_id: str | None = None,
+        otel_context: Context | None = None,
     ) -> bool:
         """Refresh quota/credit cache in single-flight mode without clobbering billed baselines."""
+        self._burn_ledger.note_active_model(model_id)
         for sid in seed_session_ids:
             if sid and sid not in self._last_session_effective_credits:
                 self._pending_baseline_models[sid] = model_id
 
         if self._refresh_in_flight:
             self._refresh_pending = True
+            if model_id is not None:
+                self._pending_refresh_model = model_id
+            if otel_context is not None:
+                self._pending_refresh_otel_context = otel_context
             waiter = anyio.Event()
             self._refresh_done_events.append(waiter)
             await waiter.wait()
@@ -394,6 +499,8 @@ class QuotaTracker:
 
         self._refresh_in_flight = True
         refreshed_any = False
+        active_model = model_id
+        active_ctx = otel_context
         try:
             while True:
                 self._refresh_pending = False
@@ -411,7 +518,7 @@ class QuotaTracker:
                 default_kiro = self.calculate_effective_kiro_credits(
                     five_hour["buckets"],
                     seven_day["buckets"],
-                    model_id=model_id,
+                    model_id=active_model,
                     g1_overage_credits=g1_overage,
                     tier=active_tier,
                 )
@@ -419,6 +526,8 @@ class QuotaTracker:
                     five_hour["buckets"],
                     seven_day["buckets"],
                     default_kiro,
+                    active_model_id=active_model,
+                    otel_context=active_ctx,
                 )
                 if five_hour["buckets"] or seven_day["buckets"]:
                     for sid, pending_model in list(self._pending_baseline_models.items()):
@@ -426,7 +535,7 @@ class QuotaTracker:
                             seeded = self.calculate_effective_kiro_credits(
                                 five_hour["buckets"],
                                 seven_day["buckets"],
-                                model_id=pending_model or model_id,
+                                model_id=pending_model or active_model,
                                 g1_overage_credits=g1_overage,
                                 tier=active_tier,
                             )
@@ -436,9 +545,17 @@ class QuotaTracker:
                         self._pending_baseline_models.pop(sid, None)
                 if not self._refresh_pending:
                     break
+                if self._pending_refresh_model is not None:
+                    active_model = self._pending_refresh_model
+                    self._pending_refresh_model = None
+                if self._pending_refresh_otel_context is not None:
+                    active_ctx = self._pending_refresh_otel_context
+                    self._pending_refresh_otel_context = None
         finally:
             self._refresh_in_flight = False
             self._refresh_pending = False
+            self._pending_refresh_model = None
+            self._pending_refresh_otel_context = None
             waiters = list(self._refresh_done_events)
             self._refresh_done_events.clear()
             for waiter in waiters:
@@ -1107,6 +1224,7 @@ class QuotaTracker:
         )
         context_usage_pct = round((active_context_tokens / self.CONTEXT_WINDOW_SIZE) * 100.0, 4)
         effective_credits = float(kiro_credits["effective_credits"])
+        self._burn_ledger.note_active_model(model_id)
         all_buckets = [*five_hour["buckets"], *seven_day["buckets"]]
         has_snapshot = bool(all_buckets)
         prev_credits = self._last_session_effective_credits.get(session_id)
@@ -1122,6 +1240,7 @@ class QuotaTracker:
                 five_hour["buckets"],
                 seven_day["buckets"],
                 kiro_credits,
+                active_model_id=model_id,
             )
         else:
             delta_credits = 0.0

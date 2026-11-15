@@ -616,10 +616,12 @@ class AcpDispatcher:
     ) -> None:
         """Trigger a non-blocking single-flight `QuotaTracker.refresh_snapshot` in background."""
         seed_ids = (seed_session_id,) if seed_session_id else ()
+        captured_ctx = get_telemetry().current_context()
         self._spawn_background(
             lambda: self._quota_tracker.refresh_snapshot(
                 seed_session_ids=seed_ids,
                 model_id=model_id,
+                otel_context=captured_ctx,
             )
         )
 

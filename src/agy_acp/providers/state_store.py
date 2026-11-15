@@ -18,6 +18,7 @@ QUOTA_SNAPSHOT_TTL_SECONDS: float = 7 * 86_400.0
 _ACCOUNT_TIER_KV_KEY: str = "account_tier"
 _QUOTA_GROUPS_KV_KEY: str = "quota_groups"
 _QUOTA_CREDITS_KV_KEY: str = "quota_credits"
+_QUOTA_BURN_STATE_KV_KEY: str = "quota_burn_state"
 
 
 def _is_cache_timestamp_expired(raw_updated_at: Any, *, max_age_seconds: float) -> bool:
@@ -877,3 +878,29 @@ class SqliteStateStoreProvider:
             "remaining_credits": int(raw.get("remaining_credits", 0)),
             "upgrade_uri": raw.get("upgrade_uri"),
         }
+
+    def save_quota_burn_state(self, burn_state: Mapping[str, Any] | None) -> dict[str, Any] | None:
+        """Persist non-resetting quota burn baselines and 5h/7d ratio accumulators in `kv_state`."""
+        if not isinstance(burn_state, Mapping):
+            return None
+        payload = {
+            "baselines": dict(burn_state.get("baselines", {}))
+            if isinstance(burn_state.get("baselines"), Mapping)
+            else {},
+            "ratios": dict(burn_state.get("ratios", {}))
+            if isinstance(burn_state.get("ratios"), Mapping)
+            else {},
+            "last_models": dict(burn_state.get("last_models", {}))
+            if isinstance(burn_state.get("last_models"), Mapping)
+            else {},
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+        self.set_kv(_QUOTA_BURN_STATE_KV_KEY, payload)
+        return payload
+
+    def load_quota_burn_state(self) -> dict[str, Any] | None:
+        """Load persisted quota burn baselines and empirical 5h/7d capacity ratios."""
+        raw = self.get_kv(_QUOTA_BURN_STATE_KV_KEY)
+        if not isinstance(raw, Mapping):
+            return None
+        return dict(raw)

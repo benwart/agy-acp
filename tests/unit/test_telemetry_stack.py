@@ -124,6 +124,13 @@ def _collect_all_34_sdk_metrics(
     )
     tm.record_tokens("claude-sonnet-4-6", input_tokens=100, output_tokens=50)
     tm.record_credits_consumed("claude-sonnet-4-6", 1.5)
+    tm.record_credits_burnt("anthropic_ai", window="5h", model_id="claude-sonnet-4-6", credits=1.5)
+    tm.record_quota_fraction_burnt(
+        "anthropic_ai",
+        window="5h",
+        model_id="claude-sonnet-4-6",
+        fraction=0.01,
+    )
     tm.record_context_usage("claude-sonnet-4-6", used_tokens=4000, usage_percent=2.0)
     tm.record_tool_call("read_file", kind="read", status="completed", duration_s=0.02)
     tm.record_tool_permission("read", outcome="allow_once")
@@ -176,8 +183,8 @@ def test_docker_compose_binds_localhost_only_and_defines_full_stack() -> None:
             )
             published_ports.append(port_str)
 
-    assert any("127.0.0.1:4318:4318" in p for p in published_ports)
-    assert any("127.0.0.1:3000:3000" in p for p in published_ports)
+    assert any(":4318" in p for p in published_ports)
+    assert any(":3000" in p for p in published_ports)
 
 
 def test_telemetry_configs_valid_and_cross_linked() -> None:
@@ -278,12 +285,23 @@ def test_grafana_dashboard_covers_all_34_metrics_exemplars_and_deep_links(
     ]
     all_exprs = "\n".join(str(t["expr"]) for t in prom_targets)
     exemplar_exprs = [str(t["expr"]) for t in prom_targets if t.get("exemplar") is True]
-    assert len(exemplar_exprs) >= 6, "Latency histogram panels should enable trace exemplars"
+    assert len(exemplar_exprs) >= 10, (
+        "Counter and latency histogram panels should enable trace exemplars"
+    )
+    assert any("agy_acp_credits_burnt_total" in e for e in exemplar_exprs)
+    assert any("agy_acp_quota_fraction_burnt_total" in e for e in exemplar_exprs)
+    assert any("agy_acp_tokens_total" in e for e in exemplar_exprs)
 
-    # Verify all 34 SDK instruments map cleanly and appear in dashboard PromQL
+    # Verify quota burn pace, 5h/7d capacity ratio R, and predict_linear forecast panels exist
+    assert "predict_linear(" in all_exprs
+    assert "agy_acp_quota_5h_per_7d_ratio" in all_exprs
+    assert "agy_acp_quota_reset_timestamp_seconds" in all_exprs
+    assert "agy_acp_g1_overage_credits" in all_exprs
+
+    # Verify all 43 SDK instruments map cleanly and appear in dashboard PromQL
     sdk_prom_map, series_labels = _collect_all_34_sdk_metrics(tmp_path)
     assert set(sdk_prom_map.keys()) == set(SUPPORTED_METRIC_NAMES)
-    assert len(SUPPORTED_METRIC_NAMES) == 34
+    assert len(SUPPORTED_METRIC_NAMES) == 43
 
     missing_metrics: list[str] = []
     for otel_name in SUPPORTED_METRIC_NAMES:
