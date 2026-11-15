@@ -89,60 +89,72 @@ async def run_agy_acp_tier_json(
 ) -> dict[str, str] | None:
     """Probe `agy acp --stdio` via `initialize` + `authenticate` for `_meta.antigravity.tier`."""
     bin_path = resolve_agy_binary(agy_bin)
-    with anyio.fail_after(timeout):
-        proc = await anyio.open_process(
-            [bin_path, "acp", "--stdio"],
-            env=build_scrubbed_subprocess_env(),
-            stderr=subprocess.DEVNULL,
-        )
-        async with proc:
-            try:
-                if proc.stdin is None or proc.stdout is None:
-                    return None
-                reader = BufferedByteReceiveStream(proc.stdout)
+    try:
+        with anyio.fail_after(timeout):
+            proc = await anyio.open_process(
+                [bin_path, "acp", "--stdio"],
+                env=build_scrubbed_subprocess_env(),
+                stderr=subprocess.DEVNULL,
+            )
+            async with proc:
+                try:
+                    if proc.stdin is None or proc.stdout is None:
+                        return None
+                    reader = BufferedByteReceiveStream(proc.stdout)
 
-                async def _rpc(req_id: int, method: str, params: dict[str, Any]) -> dict[str, Any]:
-                    assert proc.stdin is not None
-                    payload = {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}
-                    frame = (json.dumps(payload) + "\n").encode("utf-8")
-                    await proc.stdin.send(frame)
-                    while True:
-                        raw_line = await reader.receive_until(b"\n", 1024 * 1024)
-                        line = raw_line.decode("utf-8", errors="replace").strip()
-                        if not line:
-                            continue
-                        with contextlib.suppress(json.JSONDecodeError):
-                            msg = json.loads(line)
-                            if isinstance(msg, dict) and msg.get("id") == req_id:
-                                res = msg.get("result")
-                                return dict(res) if isinstance(res, Mapping) else {}
+                    async def _rpc(
+                        req_id: int,
+                        method: str,
+                        params: dict[str, Any],
+                    ) -> dict[str, Any]:
+                        assert proc.stdin is not None
+                        payload = {
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "method": method,
+                            "params": params,
+                        }
+                        frame = (json.dumps(payload) + "\n").encode("utf-8")
+                        await proc.stdin.send(frame)
+                        while True:
+                            raw_line = await reader.receive_until(b"\n", 1024 * 1024)
+                            line = raw_line.decode("utf-8", errors="replace").strip()
+                            if not line:
+                                continue
+                            with contextlib.suppress(json.JSONDecodeError):
+                                msg = json.loads(line)
+                                if isinstance(msg, dict) and msg.get("id") == req_id:
+                                    res = msg.get("result")
+                                    return dict(res) if isinstance(res, Mapping) else {}
 
-                init_res = await _rpc(
-                    1, "initialize", {"protocolVersion": 1, "clientCapabilities": {}}
-                )
-                if not _supports_tier_capability(init_res):
-                    return None
-                auth_res = await _rpc(2, "authenticate", {"methodId": "oauth-personal"})
-                meta = auth_res.get("_meta")
-                agy_meta = meta.get("antigravity") if isinstance(meta, Mapping) else None
-                tier = agy_meta.get("tier") if isinstance(agy_meta, Mapping) else None
-                if not isinstance(tier, Mapping):
-                    return None
-                tier_id = str(tier.get("id") or "").strip()
-                if not tier_id:
-                    return None
-                return {
-                    "id": tier_id,
-                    "name": str(tier.get("name") or "").strip(),
-                    "upgradeUri": str(tier.get("upgradeUri") or "").strip(),
-                }
-            finally:
-                if proc.stdin is not None:
-                    with contextlib.suppress(Exception):
-                        await proc.stdin.aclose()
-                if proc.returncode is None:
-                    with contextlib.suppress(ProcessLookupError):
-                        proc.terminate()
+                    init_res = await _rpc(
+                        1, "initialize", {"protocolVersion": 1, "clientCapabilities": {}}
+                    )
+                    if not _supports_tier_capability(init_res):
+                        return None
+                    auth_res = await _rpc(2, "authenticate", {"methodId": "oauth-personal"})
+                    meta = auth_res.get("_meta")
+                    agy_meta = meta.get("antigravity") if isinstance(meta, Mapping) else None
+                    tier = agy_meta.get("tier") if isinstance(agy_meta, Mapping) else None
+                    if not isinstance(tier, Mapping):
+                        return None
+                    tier_id = str(tier.get("id") or "").strip()
+                    if not tier_id:
+                        return None
+                    return {
+                        "id": tier_id,
+                        "name": str(tier.get("name") or "").strip(),
+                        "upgradeUri": str(tier.get("upgradeUri") or "").strip(),
+                    }
+                finally:
+                    if proc.stdin is not None:
+                        with contextlib.suppress(Exception):
+                            await proc.stdin.aclose()
+                    if proc.returncode is None:
+                        with contextlib.suppress(ProcessLookupError):
+                            proc.terminate()
+    except OSError, TimeoutError, anyio.EndOfStream, anyio.BrokenResourceError:
+        return None
 
 
 class QuotaProvider:
@@ -176,6 +188,9 @@ class QuotaProvider:
         try:
             with telemetry.start_span("quota.fetch.usage"):
                 payload = await self._run_slash("/usage")
+        except OSError:
+            status = "error"
+            return []
         except Exception:
             status = "error"
             raise
@@ -222,6 +237,9 @@ class QuotaProvider:
         try:
             with telemetry.start_span("quota.fetch.credits"):
                 payload = await self._run_slash("/credits")
+        except OSError:
+            status = "error"
+            return {}
         except Exception:
             status = "error"
             raise

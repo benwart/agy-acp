@@ -4468,8 +4468,6 @@ async def test_session_prompt_never_blocks_on_slow_quota_provider_and_conserves_
     engine_name: str,
 ) -> None:
     """Verify `session/prompt` completes without awaiting slow `/usage` & `/credits` CLI spawns."""
-    import time
-
     import anyio
 
     from agy_acp.logic.wire import create_wire_adapter
@@ -4479,6 +4477,8 @@ async def test_session_prompt_never_blocks_on_slow_quota_provider_and_conserves_
         def __init__(self, store: SqliteStateStoreProvider) -> None:
             super().__init__(state_store=store)
             self._fractions = [0.95, 0.94, 0.93]
+            self.slash_gate = anyio.Event()
+            self.slash_completed_calls = 0
 
         async def run_slash_command(
             self,
@@ -4489,7 +4489,8 @@ async def test_session_prompt_never_blocks_on_slow_quota_provider_and_conserves_
             timeout: float = 30.0,
         ) -> dict[str, Any]:
             _ = (cwd, session_id, timeout)
-            await anyio.sleep(0.35)
+            await self.slash_gate.wait()
+            self.slash_completed_calls += 1
             if command.lstrip("/") == "usage":
                 frac = self._fractions.pop(0) if self._fractions else 0.93
                 return {
@@ -4544,60 +4545,72 @@ async def test_session_prompt_never_blocks_on_slow_quota_provider_and_conserves_
         wire_adapter=adapter,
     )
 
-    t0 = time.perf_counter()
-    new_resp = await dispatcher.handle_message(
-        json.dumps(
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "session/new",
-                "params": {"cwd": str(tmp_path), "mcpServers": []},
-            }
+    with anyio.fail_after(5.0):
+        new_resp = await dispatcher.handle_message(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "session/new",
+                    "params": {"cwd": str(tmp_path), "mcpServers": []},
+                }
+            )
         )
-    )
-    assert time.perf_counter() - t0 < 0.15
     assert new_resp is not None
+    assert not cli.slash_gate.is_set() and cli.slash_completed_calls == 0
     sid = new_resp["result"]["sessionId"]
     dispatcher.pop_post_response_notifications()
-    await dispatcher.wait_background_tasks()
+    cli.slash_gate.set()
+    with anyio.fail_after(5.0):
+        await dispatcher.wait_background_tasks()
+    assert cli.slash_completed_calls == 2
     emitted.clear()
 
-    # Turn 1 must NOT block on the 0.35s QuotaProvider!
-    t1_start = time.perf_counter()
-    p1 = await dispatcher.handle_message(
-        json.dumps(
-            {
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "session/prompt",
-                "params": {"sessionId": sid, "prompt": [{"type": "text", "text": "fast turn 1"}]},
-            }
+    # Turn 1 must NOT block while `slash_gate` holds `run_slash_command` open
+    cli.slash_gate = anyio.Event()
+    with anyio.fail_after(5.0):
+        p1 = await dispatcher.handle_message(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "session/prompt",
+                    "params": {
+                        "sessionId": sid,
+                        "prompt": [{"type": "text", "text": "fast turn 1"}],
+                    },
+                }
+            )
         )
-    )
-    t1_elapsed = time.perf_counter() - t1_start
     assert p1 is not None and p1["result"]["stopReason"] == "end_turn"
-    assert t1_elapsed < 0.15, f"session/prompt Turn 1 blocked for {t1_elapsed:.3f}s!"
+    assert not cli.slash_gate.is_set() and cli.slash_completed_calls == 2
 
-    # Let post-turn background refresh finish between Turn 1 and Turn 2 (0.95 -> 0.94 => -8.0)
-    await dispatcher.wait_background_tasks()
+    # Release gate and let post-turn background refresh finish (0.95 -> 0.94 => -8.0)
+    cli.slash_gate.set()
+    with anyio.fail_after(5.0):
+        await dispatcher.wait_background_tasks()
+    assert cli.slash_completed_calls == 4
     emitted.clear()
     dispatcher.pop_post_response_notifications()
 
-    # Turn 2 also completes in < 0.15s AND delivers conserved 8.0 credits to KiroCrew!
-    t2_start = time.perf_counter()
-    p2 = await dispatcher.handle_message(
-        json.dumps(
-            {
-                "jsonrpc": "2.0",
-                "id": 3,
-                "method": "session/prompt",
-                "params": {"sessionId": sid, "prompt": [{"type": "text", "text": "fast turn 2"}]},
-            }
+    # Turn 2 also returns without awaiting `slash_gate` AND delivers conserved 8.0 credits!
+    cli.slash_gate = anyio.Event()
+    with anyio.fail_after(5.0):
+        p2 = await dispatcher.handle_message(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "session/prompt",
+                    "params": {
+                        "sessionId": sid,
+                        "prompt": [{"type": "text", "text": "fast turn 2"}],
+                    },
+                }
+            )
         )
-    )
-    t2_elapsed = time.perf_counter() - t2_start
     assert p2 is not None and p2["result"]["stopReason"] == "end_turn"
-    assert t2_elapsed < 0.15, f"session/prompt Turn 2 blocked for {t2_elapsed:.3f}s!"
+    assert not cli.slash_gate.is_set() and cli.slash_completed_calls == 4
 
     post = dispatcher.pop_post_response_notifications()
     if engine_name == "v2":
@@ -4620,10 +4633,10 @@ async def test_session_prompt_never_blocks_on_slow_quota_provider_and_conserves_
         assert len(turn_completions) == 1
         assert turn_completions[0]["promptTurnSummaries"] == [{"unit": "credit", "usage": 8.0}]
 
-    # Shutdown cancels any in-flight 0.35s background refresh immediately
-    close_start = time.perf_counter()
-    await dispatcher.aclose()
-    assert time.perf_counter() - close_start < 0.15
+    # Shutdown cancels any in-flight gated background refresh immediately without awaiting gate
+    with anyio.fail_after(5.0):
+        await dispatcher.aclose()
+    assert not cli.slash_gate.is_set() and cli.slash_completed_calls == 4
 
 
 async def test_dispatcher_strips_retry_warnings_in_live_stream_persistence_replay_and_fork(
