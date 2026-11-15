@@ -4624,3 +4624,179 @@ async def test_session_prompt_never_blocks_on_slow_quota_provider_and_conserves_
     close_start = time.perf_counter()
     await dispatcher.aclose()
     assert time.perf_counter() - close_start < 0.15
+
+
+async def test_dispatcher_strips_retry_warnings_in_live_stream_persistence_replay_and_fork(
+    tmp_path: Path,
+) -> None:
+    """Retry banners never leak into streamed chunks, persisted turns, replay, or fork summaries."""
+    from agy_acp.logic.wire.v3_kas import V3KasWireAdapter
+    from agy_acp.providers.state_store import SqliteStateStoreProvider
+
+    class _RetryStubCli(_StubAgyAcpClientProvider):
+        async def stream_prompt(
+            self,
+            *,
+            cwd: str,
+            prompt: str = "",
+            on_text: Callable[[str], Awaitable[None]] | None = None,
+            on_tool_call: Callable[[ToolCallEvent], Awaitable[bool]] | None = None,
+            **_extra: Any,
+        ) -> PromptOutcome:
+            _ = (cwd, prompt, _extra)
+            raw_banner_1 = (
+                "\n\u26a0 API error (attempt 1): request failed: Post "
+                '"https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent": '
+                "read: connection reset by peer\n"
+            )
+            raw_banner_2 = (
+                "\n\u26a0 API error (attempt 2): request failed: Post "
+                '"https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent": '
+                "read: operation timed out\n"
+            )
+            if on_text is not None:
+                await on_text(raw_banner_1[:14])
+                await on_text(raw_banner_1[14:])
+                await on_text("\n\u26a0 API ")
+            if on_tool_call is not None:
+                await on_tool_call(
+                    ToolCallEvent(
+                        tool_call_id="tc_retry_boundary",
+                        title="Read file",
+                        kind="read",
+                        status="in_progress",
+                        raw_input={"path": str(tmp_path / "a.txt")},
+                    )
+                )
+            if on_text is not None:
+                await on_text(raw_banner_2 + "<!-- nothing_to_do -->")
+            return PromptOutcome(
+                conversation_id="conv-retry-1",
+                stop_reason="end_turn",
+                response=raw_banner_1 + "\n\u26a0 API " + raw_banner_2 + "<!-- nothing_to_do -->",
+                usage={"input_tokens": 10, "output_tokens": 4, "total_tokens": 14},
+            )
+
+    emitted: list[dict[str, Any]] = []
+
+    async def _sink(frame: dict[str, Any]) -> None:
+        emitted.append(frame)
+
+    store = SqliteStateStoreProvider(tmp_path / "state")
+    cli = _RetryStubCli(state_store=store)
+    v3 = V3KasWireAdapter()
+    mgr = SessionManager(cli_provider=cli, state_store=store, wire_adapter=v3)
+    dispatcher = AcpDispatcher(
+        notification_sink=_sink,
+        session_manager=mgr,
+        quota_tracker=QuotaTracker(provider=QuotaProvider(cli_provider=cli), state_store=store),
+        wire_adapter=v3,
+    )
+
+    new_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "session/new",
+                "params": {"cwd": str(tmp_path), "mcpServers": []},
+            }
+        )
+    )
+    assert new_resp is not None
+    sid = new_resp["result"]["sessionId"]
+    dispatcher.pop_post_response_notifications()
+    await dispatcher.wait_background_tasks()
+    emitted.clear()
+
+    prompt_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": sid,
+                    "prompt": [{"type": "text", "text": "[Heartbeat]"}],
+                    "_meta": {"kiro": {"ttft": True}},
+                },
+            }
+        )
+    )
+    assert prompt_resp is not None and "result" in prompt_resp
+
+    msg_updates = [
+        n["params"]["update"]
+        for n in emitted
+        if n.get("method") == "session/update"
+        and n["params"]["update"].get("sessionUpdate") == "agent_message_chunk"
+    ]
+    combined_streamed = "".join(u["content"]["text"] for u in msg_updates)
+    assert "API error (attempt" not in combined_streamed
+    assert combined_streamed == "\n\u26a0 API <!-- nothing_to_do -->"
+    # First displayed chunk (`\n⚠ API `) gets TTFT metadata, not a suppressed retry chunk
+    assert "ttft" in msg_updates[0].get("_meta", {}).get("kiro", {})
+
+    stored_turns = store.get_session_turns(sid)
+    assert len(stored_turns) == 1
+    assert stored_turns[0]["assistant_text"] == "\n\u26a0 API <!-- nothing_to_do -->"
+
+    # Seed legacy polluted turns in SQLite and verify replay + fork sanitize them
+    store.append_session_turn(
+        session_id=sid,
+        user_message_id="msg_legacy_1",
+        prompt_blocks=[{"type": "text", "text": "legacy 1"}],
+        assistant_text=(
+            '\n\u26a0 API error (attempt 1): request failed (code 502): HTML response "Error 502"\n'
+            "Saved [check_upgrades.py]..."
+        ),
+    )
+    store.append_session_turn(
+        session_id=sid,
+        user_message_id="msg_legacy_empty",
+        prompt_blocks=[{"type": "text", "text": "legacy banner only"}],
+        assistant_text="\n\u26a0 API error (attempt 1): read: operation timed out\n",
+    )
+
+    emitted.clear()
+    load_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "session/load",
+                "params": {"sessionId": sid, "cwd": str(tmp_path), "mcpServers": []},
+            }
+        )
+    )
+    assert load_resp is not None and "result" in load_resp
+    replay_msgs = [
+        n["params"]["update"]["content"]["text"]
+        for n in emitted
+        if n.get("method") == "session/update"
+        and n["params"]["update"].get("sessionUpdate") == "agent_message_chunk"
+    ]
+    assert replay_msgs == [
+        "\n\u26a0 API <!-- nothing_to_do -->",
+        "Saved [check_upgrades.py]...",
+    ]
+
+    fork_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "session/fork",
+                "params": {"sessionId": sid, "cwd": str(tmp_path)},
+            }
+        )
+    )
+    assert fork_resp is not None and "result" in fork_resp
+    fork_sid = fork_resp["result"]["sessionId"]
+    fork_state = store.get_session(fork_sid)
+    assert fork_state is not None
+    assert "API error (attempt" not in str(fork_state.get("compactedSummary") or "")
+    for ft in store.get_session_turns(fork_sid):
+        assert "API error (attempt" not in ft["assistant_text"]
+
+    await dispatcher.aclose()

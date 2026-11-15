@@ -1174,7 +1174,12 @@ class TelemetryManager:
         if "error" in lower_ev or "exception" in lower_ev:
             sev_num = SeverityNumber.ERROR
             sev_txt = "ERROR"
-        elif "warn" in lower_ev or "fallback" in lower_ev or "ignored" in lower_ev:
+        elif (
+            "warn" in lower_ev
+            or "fallback" in lower_ev
+            or "ignored" in lower_ev
+            or "retry" in lower_ev
+        ):
             sev_num = SeverityNumber.WARN
             sev_txt = "WARN"
         else:

@@ -22,6 +22,7 @@ from agy_acp.logic.custom_agents import (
     read_contained_regular_bytes,
 )
 from agy_acp.logic.mcp_catalog_prober import McpCatalogProber
+from agy_acp.logic.retry_warning_filter import strip_agy_retry_warnings
 from agy_acp.logic.tool_classifier import (
     FALLBACK_MODELS,
     PER_SESSION_MCP_ENV_KEYS,
@@ -219,7 +220,7 @@ def _format_remaining_turns_summary(turns: Sequence[Mapping[str, Any]]) -> str |
             and str(block.get("text") or "").strip()
         ]
         user_text = "\n".join(user_parts).strip()
-        assistant_text = str(turn.get("assistant_text") or "").strip()
+        assistant_text = strip_agy_retry_warnings(str(turn.get("assistant_text") or "")).strip()
         lines = [
             *(f"User: {user_text}" for _ in (1,) if user_text),
             *(f"Assistant: {assistant_text}" for _ in (1,) if assistant_text),
@@ -1247,7 +1248,7 @@ class SessionManager:
                 session_id=new_sid,
                 user_message_id=str(turn.get("user_message_id") or ""),
                 prompt_blocks=copy.deepcopy(turn.get("prompt_blocks") or []),
-                assistant_text=str(turn.get("assistant_text") or ""),
+                assistant_text=strip_agy_retry_warnings(str(turn.get("assistant_text") or "")),
                 turn_idx=idx,
             )
         _write_dsh_gate_marker_if_configured()
