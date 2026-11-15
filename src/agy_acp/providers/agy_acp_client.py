@@ -23,8 +23,10 @@ import anyio
 import anyio.abc
 from anyio.streams.text import TextReceiveStream
 from opentelemetry import context as otel_context
+from opentelemetry import trace
 from opentelemetry.context import Context
 
+from agy_acp.logic.retry_warning_filter import RetryFilterStep, RetryWarningStreamFilter
 from agy_acp.logic.tool_classifier import (
     FALLBACK_MODELS,
     PATH_ARGUMENT_KEYS,
@@ -43,7 +45,7 @@ from agy_acp.logic.tool_classifier import (
     translate_mcp_server,
 )
 from agy_acp.logic.wire.base import synthesize_task_command
-from agy_acp.providers.acp_logger import log_acp_event
+from agy_acp.providers.acp_logger import log_acp_event, redact_sensitive_data
 from agy_acp.providers.state_store import SqliteStateStoreProvider
 from agy_acp.providers.telemetry import get_telemetry
 
@@ -887,6 +889,7 @@ class _ActiveTurnState:
     in_flight_handlers: int = 0
     drained_event: anyio.Event = field(default_factory=anyio.Event)
     otel_ctx: Context = field(default_factory=otel_context.get_current)
+    retry_filter: RetryWarningStreamFilter = field(default_factory=RetryWarningStreamFilter)
 
     def __post_init__(self) -> None:
         self.drained_event.set()
@@ -1314,6 +1317,10 @@ class AgyAcpClientProvider:
         self._session_to_agy_sid: dict[str, str] = {}
         self._turn_states: dict[str, _ActiveTurnState] = {}
         self._steer_queues: dict[str, list[_QueuedAcpSteer]] = {}
+
+    @property
+    def _save_dir_or_db(self) -> Path:
+        return self._store.db_path
 
     @property
     def _conn(self) -> _AcpSubprocessConnection | None:
@@ -1951,6 +1958,68 @@ class AgyAcpClientProvider:
         await self._interrupt_active_turn(session_id)
         return True
 
+    def _record_retry_warnings(
+        self,
+        turn: _ActiveTurnState,
+        warnings: Sequence[str],
+    ) -> None:
+        if not warnings:
+            return
+        span = trace.get_current_span()
+        recording = span.is_recording()
+        for warning in warnings:
+            log_acp_event(
+                "agy_acp.backend_api_retry",
+                save_dir_or_db=self._save_dir_or_db,
+                session_id=turn.session_id,
+                warning=warning,
+            )
+            if recording:
+                span.add_event(
+                    "agy_acp.backend_api_retry",
+                    attributes={
+                        "session_id": turn.session_id,
+                        "warning": str(redact_sensitive_data(warning)),
+                    },
+                )
+
+    async def _apply_retry_step(
+        self,
+        turn: _ActiveTurnState,
+        step: RetryFilterStep,
+        *,
+        allow_text: bool = True,
+        catch_callback_error: bool = False,
+    ) -> None:
+        self._record_retry_warnings(turn, step.warnings)
+        if not allow_text or not step.text:
+            return
+        turn.collected_texts.append(step.text)
+        if turn.on_text is None:
+            return
+        if not catch_callback_error:
+            await turn.on_text(step.text)
+            return
+        try:
+            await turn.on_text(step.text)
+        except Exception as exc:
+            log_acp_event(
+                "agy_acp.notification_error",
+                save_dir_or_db=self._save_dir_or_db,
+                error=str(exc),
+            )
+
+    async def _flush_turn_retry_boundary(self, turn: _ActiveTurnState) -> None:
+        async with turn.stream_lock:
+            step = turn.retry_filter.flush_before_boundary()
+            allow = not (turn.interrupt_event.is_set() or turn.policy_denied_tools)
+            await self._apply_retry_step(
+                turn,
+                step,
+                allow_text=allow,
+                catch_callback_error=True,
+            )
+
     async def _evaluate_tool_call_once(
         self,
         turn: _ActiveTurnState,
@@ -1973,6 +2042,13 @@ class AgyAcpClientProvider:
         turn.decision_events[tc_id] = dec_event
         turn.evaluated_inputs[tc_id] = raw_input_snapshot
         turn.announced_tools.add(tc_id)
+
+        try:
+            await self._flush_turn_retry_boundary(turn)
+        except BaseException:
+            turn.decisions.setdefault(tc_id, False)
+            dec_event.set()
+            raise
 
         tool_cb = turn.on_tool_call
         if tool_cb is None:
@@ -2149,9 +2225,8 @@ class AgyAcpClientProvider:
                         if turn.on_thought is not None:
                             await turn.on_thought(delta)
                     else:
-                        turn.collected_texts.append(delta)
-                        if turn.on_text is not None:
-                            await turn.on_text(delta)
+                        step = turn.retry_filter.feed(delta)
+                        await self._apply_retry_step(turn, step)
             return
 
         if kind == "usage_update":
@@ -2463,6 +2538,22 @@ class AgyAcpClientProvider:
                     with anyio.move_on_after(1.0):
                         await conn.wait_idle()
                         await turn_state.drained_event.wait()
+                    flush_tok = otel_context.attach(turn_state.otel_ctx)
+                    try:
+                        async with turn_state.stream_lock:
+                            tail_step = turn_state.retry_filter.flush()
+                            allow_tail = not (
+                                turn_state.interrupt_event.is_set()
+                                or turn_state.policy_denied_tools
+                            )
+                            await self._apply_retry_step(
+                                turn_state,
+                                tail_step,
+                                allow_text=allow_tail,
+                                catch_callback_error=True,
+                            )
+                    finally:
+                        otel_context.detach(flush_tok)
                     for dangling_id in list(
                         turn_state.announced_tools - turn_state.completed_tools
                     ):

@@ -114,6 +114,102 @@ def handle_prompt(req_id, params: dict) -> None:
         },
     })
 
+    if "RETRY_THEN_CRASH" in text:
+        send_frame({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {
+                        "type": "text",
+                        "text": "\\n\\u26a0 API error (attempt 1): connection reset by peer\\n",
+                    },
+                },
+            },
+        })
+        time.sleep(0.05)
+        os._exit(1)
+
+    if "RETRY_SPLIT_AND_TOOL" in text:
+        for piece in (
+            "\\n\\u26a0 API error ",
+            '(attempt 1): request failed (code 502): HTML response "Error 502"\\n',
+            "\\n\\u26a0 API ",
+        ):
+            send_frame({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": sid,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": piece},
+                    },
+                },
+            })
+        time.sleep(0.03)
+        send_frame({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call_retry_read",
+                    "name": "read_file",
+                    "args": {"Path": "/workspace/check.py"},
+                    "status": "in_progress",
+                    "kind": "read",
+                    "title": "read_file",
+                    "rawInput": {"Path": "/workspace/check.py"},
+                },
+            },
+        })
+        send_frame({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call_retry_read",
+                    "name": "read_file",
+                    "args": {"Path": "/workspace/check.py"},
+                    "status": "completed",
+                    "kind": "read",
+                    "rawOutput": {"output": "ok"},
+                },
+            },
+        })
+        send_frame({
+            "jsonrpc": "2.0",
+            "params": {
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {
+                        "type": "text",
+                        "text": (
+                            "\\n\\u26a0\\ufe0f API error (attempt 2): read: operation timed out\\n"
+                            "<!-- nothing_to_do -->"
+                        ),
+                    },
+                },
+            },
+            "method": "session/update",
+        })
+        send_frame({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "stopReason": "end_turn",
+                "usage": {"inputTokens": 15, "outputTokens": 5, "totalTokens": 20},
+            },
+        })
+        return
+
     if "WAIT_FOR_STEER" in text:
         send_frame({
             "jsonrpc": "2.0",
@@ -2123,3 +2219,90 @@ async def test_should_isolate_concurrent_lazy_mcp_sessions_preserve_symlinks_and
     assert (fake_gemini / "jetski-standalone-oauth-token").read_text(
         encoding="utf-8"
     ) == "oauth-secret"
+
+
+async def test_should_strip_retry_banners_log_diagnostics_and_preserve_liveness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retry banners never leak into streamed text/response, emit diagnostics, and keep liveness."""
+    from agy_acp.providers import telemetry as telemetry_mod
+
+    log_path = tmp_path / "acp.log"
+    monkeypatch.setenv("AGY_ACP_LOG_FILE", str(log_path))
+    monkeypatch.setenv("AGY_ACP_TELEMETRY_ENABLED", "1")
+    monkeypatch.setenv("AGY_ACP_OTLP_ENDPOINT", "http://127.0.0.1:1")
+    telemetry_mod.reset_telemetry_for_tests()
+    cfg = telemetry_mod.resolve_telemetry_config(tmp_path / "state")
+    mgr = telemetry_mod.TelemetryManager(cfg, use_simple_processors=True)
+    monkeypatch.setattr(telemetry_mod, "_GLOBAL_MANAGER", mgr)
+
+    script, state_file = _make_mock_agy(tmp_path)
+    store = SqliteStateStoreProvider(tmp_path / "state")
+    events_order: list[str] = []
+    streamed_chunks: list[str] = []
+
+    async def on_text(chunk: str) -> None:
+        streamed_chunks.append(chunk)
+        events_order.append(f"text:{chunk}")
+
+    async def on_tool_call(ev: ToolCallEvent) -> bool:
+        events_order.append(f"tool:{ev.tool_call_id}")
+        return True
+
+    async with AgyAcpClientProvider(
+        bin_path=script,
+        state_store=store,
+        env={"MOCK_AGY_STATE_FILE": str(state_file)},
+    ) as client:
+        with mgr.start_span("test.prompt.turn"):
+            outcome = await client.stream_prompt(
+                cwd=str(tmp_path),
+                session_id="sess-retry-1",
+                prompt="RETRY_SPLIT_AND_TOOL",
+                on_text=on_text,
+                on_tool_call=on_tool_call,
+            )
+
+        assert "API error (attempt" not in "".join(streamed_chunks)
+        assert "API error (attempt" not in outcome.response
+        assert outcome.response == "\n\u26a0 API <!-- nothing_to_do -->"
+        assert events_order == [
+            "text:\n\u26a0 API ",
+            "tool:call_retry_read",
+            "text:<!-- nothing_to_do -->",
+        ]
+
+        # Liveness check: a turn that emitted a retry banner sets `emitted_any_signal = True`,
+        # so an abrupt subprocess exit does NOT trigger silent `turn_recovery` auto-replay.
+        crash_outcome = await client.stream_prompt(
+            cwd=str(tmp_path),
+            session_id="sess-retry-crash",
+            prompt="RETRY_THEN_CRASH",
+        )
+        assert crash_outcome.error != ""
+        assert crash_outcome.response == ""
+        spawns = [r for r in _read_mock_records(state_file) if r["type"] == "spawn"]
+        assert len(spawns) == 1
+
+    log_entries = [
+        json.loads(line)
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    retry_logs = [e for e in log_entries if e.get("event") == "agy_acp.backend_api_retry"]
+    assert [e["warning"] for e in retry_logs] == [
+        '\u26a0 API error (attempt 1): request failed (code 502): HTML response "Error 502"',
+        "\u26a0\ufe0f API error (attempt 2): read: operation timed out",
+        "\u26a0 API error (attempt 1): connection reset by peer",
+    ]
+    assert retry_logs[0]["session_id"] == "sess-retry-1"
+    assert retry_logs[2]["session_id"] == "sess-retry-crash"
+
+    spans = [s for s in mgr.peek_buffered_spans() if s.name == "test.prompt.turn"]
+    assert len(spans) == 1
+    span_retry_events = [ev for ev in spans[0].events if ev.name == "agy_acp.backend_api_retry"]
+    assert [(ev.attributes or {})["warning"] for ev in span_retry_events] == [
+        '\u26a0 API error (attempt 1): request failed (code 502): HTML response "Error 502"',
+        "\u26a0\ufe0f API error (attempt 2): read: operation timed out",
+    ]

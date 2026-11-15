@@ -29,6 +29,10 @@ from agy_acp.logic.custom_agents import (
     evaluate_tool_call_permission,
 )
 from agy_acp.logic.quota_tracker import QuotaTracker, TurnTelemetry
+from agy_acp.logic.retry_warning_filter import (
+    RetryWarningStreamFilter,
+    strip_agy_retry_warnings,
+)
 from agy_acp.logic.session_manager import DEFAULT_MODEL_ID, SessionManager
 from agy_acp.logic.tool_classifier import (
     PATH_ARGUMENT_KEYS,
@@ -1221,6 +1225,7 @@ class AcpDispatcher:
                 )
             return frame
 
+        retry_filter = RetryWarningStreamFilter()
         carousel_normalizer = CarouselStreamNormalizer()
 
         async def _emit_message_piece(piece: str) -> None:
@@ -1229,12 +1234,26 @@ class AcpDispatcher:
                 frame = self._wire_adapter.build_agent_message_chunk(session_id, piece)
                 await self._emit_notification(_maybe_attach_ttft(frame, piece))
 
+        async def _flush_stream_before_boundary() -> None:
+            flushed_retry = retry_filter.flush_before_boundary().text
+            if flushed_retry:
+                await _emit_message_piece(carousel_normalizer.feed(flushed_retry))
+            await _emit_message_piece(carousel_normalizer.flush_prose_before_boundary())
+
+        async def _flush_stream_at_turn_end() -> None:
+            flushed_retry = retry_filter.flush().text
+            if flushed_retry:
+                await _emit_message_piece(carousel_normalizer.feed(flushed_retry))
+            await _emit_message_piece(carousel_normalizer.flush())
+
         async def _on_thought(chunk: str) -> None:
             frame = self._wire_adapter.build_agent_thought_chunk(session_id, chunk)
             await self._emit_notification(_maybe_attach_ttft(frame, chunk))
 
         async def _on_text(chunk: str) -> None:
-            await _emit_message_piece(carousel_normalizer.feed(chunk))
+            cleaned = retry_filter.feed(chunk).text
+            if cleaned:
+                await _emit_message_piece(carousel_normalizer.feed(cleaned))
 
         announced_tool_ids: set[str] = set()
         persisted_prompt_blocks: list[dict[str, Any]] = list(prompt_blocks)
@@ -1253,7 +1272,7 @@ class AcpDispatcher:
                     },
                     parent_context=turn_otel_ctx,
                 )
-                await _emit_message_piece(carousel_normalizer.flush_prose_before_boundary())
+                await _flush_stream_before_boundary()
             if self._wire_adapter.engine_id == "v3":
                 return await self._handle_v3_tool_call(
                     session_id,
@@ -1326,7 +1345,7 @@ class AcpDispatcher:
         async def _on_steer_consumed(raw_content: str) -> None:
             if raw_content.strip():
                 persisted_prompt_blocks.append({"type": "text", "text": raw_content})
-            await _emit_message_piece(carousel_normalizer.flush_prose_before_boundary())
+            await _flush_stream_before_boundary()
             await self._emit_notification(
                 self._wire_adapter.build_steering_notification(
                     session_id,
@@ -1363,7 +1382,7 @@ class AcpDispatcher:
         active_model = self._resolve_session_model(session_id)
         stop_reason = str(turn_result.get("stopReason", "end_turn"))
         if stop_reason == "cancelled" or self._session_manager.consume_cancellation(session_id):
-            await _emit_message_piece(carousel_normalizer.flush())
+            await _flush_stream_at_turn_end()
             telemetry.record_turn(
                 stop_reason="cancelled",
                 model=active_model,
@@ -1379,7 +1398,7 @@ class AcpDispatcher:
                 turn_id=user_message_id,
             )
 
-        await _emit_message_piece(carousel_normalizer.flush())
+        await _flush_stream_at_turn_end()
 
         fallback_from = str(turn_result.get("fallbackFromModel") or "")
         resolved_to = str(turn_result.get("resolvedModel") or "")
@@ -1395,8 +1414,10 @@ class AcpDispatcher:
                 await self._emit_notification(fb_frame)
 
         turn_error = str(turn_result.get("error") or "").strip()
-        raw_assistant_text = str(turn_result.get("response") or "".join(collected_chunks))
-        assistant_text = normalize_carousel_markdown(raw_assistant_text)
+        raw_assistant_text = "".join(collected_chunks) or strip_agy_retry_warnings(
+            str(turn_result.get("response") or "")
+        )
+        assistant_text = normalize_carousel_markdown(strip_agy_retry_warnings(raw_assistant_text))
         if (not turn_error or assistant_text) and self._session_manager.state_store.get_session(
             session_id
         ) is not None:
@@ -1584,7 +1605,9 @@ class AcpDispatcher:
                     )
                     await self._emit_notification(_stamp_replay_meta(frame))
             assistant_text = normalize_carousel_markdown(
-                str(turn.get("assistant_text") or turn.get("assistantText") or "")
+                strip_agy_retry_warnings(
+                    str(turn.get("assistant_text") or turn.get("assistantText") or "")
+                )
             )
             if assistant_text:
                 reply_frame = self._wire_adapter.build_agent_message_chunk(
