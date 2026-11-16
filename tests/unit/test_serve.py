@@ -343,7 +343,7 @@ async def test_serve_default_write_bytes_offloads_to_thread_under_write_lock(
                 if is_first:
                     first_write_entered.set()
                     # If running on event loop thread, waiting here blocks loop tasks -> timeout!
-                    assert unblock_first_write.wait(timeout=0.5), (
+                    assert unblock_first_write.wait(timeout=2.0), (
                         "Event loop was blocked by synchronous stdout write"
                     )
                 written_chunks.append(bytes(data))
@@ -473,7 +473,8 @@ async def test_run_stdio_server_cancels_slow_background_quota_refresh_on_eof(
     tmp_path: Path,
 ) -> None:
     """Verify `run_stdio_server` cancels slow background quota refreshes promptly on EOF."""
-    import time
+
+    refresh_cancelled = False
 
     class _SlowUsageCli(_ServeStubCliProvider):
         async def run_slash_command(
@@ -484,8 +485,13 @@ async def test_run_stdio_server_cancels_slow_background_quota_refresh_on_eof(
             session_id: str | None = None,
             timeout: float = 30.0,
         ) -> dict[str, Any]:
+            nonlocal refresh_cancelled
             _ = (command, cwd, session_id, timeout)
-            await anyio.sleep(5.0)
+            try:
+                await anyio.sleep_forever()
+            except anyio.get_cancelled_exc_class():
+                refresh_cancelled = True
+                raise
             return {"status": "SUCCESS", "command": {"name": "usage", "data": {"groups": []}}}
 
     adapter = create_wire_adapter("v3")
@@ -516,15 +522,15 @@ async def test_run_stdio_server_cancels_slow_background_quota_refresh_on_eof(
     )
     await send_in.aclose()
 
-    t0 = time.perf_counter()
-    rc = await run_stdio_server(
-        session_manager=mgr,
-        wire_adapter=create_wire_adapter("v3"),
-        quota_tracker=qt,
-        save_dir=tmp_path,
-        stdin_readline=_readline,
-        stdout_write=_noop_write,
-    )
+    with anyio.fail_after(3.0):
+        rc = await run_stdio_server(
+            session_manager=mgr,
+            wire_adapter=create_wire_adapter("v3"),
+            quota_tracker=qt,
+            save_dir=tmp_path,
+            stdin_readline=_readline,
+            stdout_write=_noop_write,
+        )
     await recv_in.aclose()
     assert rc == 0
-    assert time.perf_counter() - t0 < 0.5
+    assert refresh_cancelled is True

@@ -919,7 +919,7 @@ async def test_run_agy_slash_json_and_quota_provider_decoupled_from_acp_client(
 
 def test_state_store_save_and_load_tier_with_ttl(tmp_path: Any) -> None:
     """Verify `SqliteStateStoreProvider` persists account tier with TTL and stale fallback."""
-    from datetime import UTC, datetime, timedelta
+    from datetime import timedelta
 
     from agy_acp.providers.state_store import TIER_CACHE_TTL_SECONDS, SqliteStateStoreProvider
 
@@ -938,19 +938,14 @@ def test_state_store_save_and_load_tier_with_ttl(tmp_path: Any) -> None:
     store.save_tier({})
     assert store.load_tier() == loaded
 
-    # Expire cached timestamp beyond TIER_CACHE_TTL_SECONDS
-    stale_ts = (datetime.now(UTC) - timedelta(seconds=TIER_CACHE_TTL_SECONDS + 60)).isoformat()
-    store.set_kv(
-        "account_tier",
-        {
-            "id": "g1-ultra-tier",
-            "name": "Google AI Ultra",
-            "upgradeUri": "",
-            "updated_at": stale_ts,
-        },
-    )
-    assert store.load_tier() is None
-    assert store.load_tier(max_age_seconds=None) == loaded
+    # Expire cached timestamp beyond TIER_CACHE_TTL_SECONDS using deterministic clock
+    from freezegun import freeze_time
+
+    with freeze_time("2026-11-15T12:00:00Z") as frozen_clock:
+        store.save_tier(loaded)
+        frozen_clock.tick(timedelta(seconds=TIER_CACHE_TTL_SECONDS + 60))
+        assert store.load_tier() is None
+        assert store.load_tier(max_age_seconds=None) == loaded
 
 
 def test_resolve_plan_credit_spec_all_tiers_and_fallback() -> None:

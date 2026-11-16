@@ -129,7 +129,9 @@ def test_sqlite_models_cache_and_kv_state(tmp_path: Path) -> None:
 
 def test_sqlite_models_cache_expires_after_one_day(tmp_path: Path) -> None:
     """Verify load_models returns empty list when cached rows are older than 24 hours."""
-    from datetime import UTC, datetime, timedelta
+    from datetime import timedelta
+
+    from freezegun import freeze_time
 
     store = SqliteStateStoreProvider(tmp_path)
     models = [
@@ -139,15 +141,13 @@ def test_sqlite_models_cache_expires_after_one_day(tmp_path: Path) -> None:
             "description": "Argon",
         },
     ]
-    store.save_models(models)
-    assert store.load_models() == models
+    with freeze_time("2026-11-15T12:00:00Z") as frozen_clock:
+        store.save_models(models)
+        assert store.load_models() == models
 
-    stale_ts = (datetime.now(UTC) - timedelta(days=1, seconds=1)).isoformat()
-    with store._connect() as conn:
-        conn.execute("UPDATE models_cache SET updated_at = ?", (stale_ts,))
-
-    assert store.load_models() == []
-    assert store.load_models(max_age_seconds=None) == models
+        frozen_clock.tick(timedelta(days=1, seconds=1))
+        assert store.load_models() == []
+        assert store.load_models(max_age_seconds=None) == models
 
 
 def test_sqlite_token_ledger_persistence_across_instances(tmp_path: Path) -> None:
@@ -336,7 +336,7 @@ def test_sqlite_context_paths_knowledge_entries_and_revert_turns_from_message_id
 
 def test_save_and_load_quota_groups_and_credits_with_ttl(tmp_path: Path) -> None:
     """Verify `SqliteStateStoreProvider` persists quota groups and G1 credits with TTL bounds."""
-    from datetime import UTC, datetime, timedelta
+    from datetime import timedelta
 
     from agy_acp.providers.state_store import (
         QUOTA_SNAPSHOT_TTL_SECONDS,
@@ -381,13 +381,14 @@ def test_save_and_load_quota_groups_and_credits_with_ttl(tmp_path: Path) -> None
     assert reloaded_store.load_quota_groups() == sample_groups
     assert reloaded_store.load_credits() == sample_credits
 
-    # Expire timestamps beyond QUOTA_SNAPSHOT_TTL_SECONDS
-    expired_ts = (
-        datetime.now(UTC) - timedelta(seconds=QUOTA_SNAPSHOT_TTL_SECONDS + 60)
-    ).isoformat()
-    reloaded_store.set_kv("quota_groups", {"groups": sample_groups, "updated_at": expired_ts})
-    reloaded_store.set_kv("quota_credits", {**sample_credits, "updated_at": expired_ts})
-    assert reloaded_store.load_quota_groups() is None
-    assert reloaded_store.load_credits() is None
-    assert reloaded_store.load_quota_groups(max_age_seconds=None) == sample_groups
-    assert reloaded_store.load_credits(max_age_seconds=None) == sample_credits
+    # Expire timestamps beyond QUOTA_SNAPSHOT_TTL_SECONDS using deterministic clock
+    from freezegun import freeze_time
+
+    with freeze_time("2026-11-15T12:00:00Z") as frozen_clock:
+        reloaded_store.save_quota_groups(sample_groups)
+        reloaded_store.save_credits(sample_credits)
+        frozen_clock.tick(timedelta(seconds=QUOTA_SNAPSHOT_TTL_SECONDS + 60))
+        assert reloaded_store.load_quota_groups() is None
+        assert reloaded_store.load_credits() is None
+        assert reloaded_store.load_quota_groups(max_age_seconds=None) == sample_groups
+        assert reloaded_store.load_credits(max_age_seconds=None) == sample_credits
