@@ -6,9 +6,9 @@ services:
     volumes:
       - ./telemetry/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
     ports:
-      - "127.0.0.1:4317:4317"
-      - "127.0.0.1:4318:4318"
-      - "127.0.0.1:8889:8889"
+      - "127.0.0.1:${AGY_ACP_OTEL_GRPC_PORT:-4317}:4317"
+      - "127.0.0.1:${AGY_ACP_OTEL_HTTP_PORT:-4318}:4318"
+      - "127.0.0.1:${AGY_ACP_OTEL_PROM_PORT:-8889}:8889"
     depends_on:
       - tempo
       - loki
@@ -27,7 +27,7 @@ services:
       - ./telemetry/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
     ports:
-      - "127.0.0.1:9090:9090"
+      - "127.0.0.1:${AGY_ACP_PROMETHEUS_PORT:-9090}:9090"
     depends_on:
       - otel-collector
     restart: unless-stopped
@@ -41,7 +41,7 @@ services:
       - ./telemetry/tempo.yaml:/etc/tempo.yaml:ro
       - tempo_data:/var/tempo
     ports:
-      - "127.0.0.1:3200:3200"
+      - "127.0.0.1:${AGY_ACP_TEMPO_PORT:-3200}:3200"
     restart: unless-stopped
 
   loki:
@@ -53,7 +53,7 @@ services:
       - ./telemetry/loki-config.yaml:/etc/loki/local-config.yaml:ro
       - loki_data:/loki
     ports:
-      - "127.0.0.1:3100:3100"
+      - "127.0.0.1:${AGY_ACP_LOKI_PORT:-3100}:3100"
     restart: unless-stopped
 
   grafana:
@@ -70,7 +70,7 @@ services:
       - ./telemetry/grafana/dashboards:/var/lib/grafana/dashboards:ro
       - grafana_data:/var/lib/grafana
     ports:
-      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:${AGY_ACP_GRAFANA_PORT:-3000}:3000"
     depends_on:
       - prometheus
       - tempo
