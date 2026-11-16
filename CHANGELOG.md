@@ -1,3 +1,15 @@
+## [1.3.0](https://github.com/benwart/agy-acp/compare/v1.2.0...v1.3.0) (2026-11-16)
+
+### Features
+
+* **telemetry:** add quota burn pace, 5h/7d ratio R, forecasts, and compose CLI ([145829e](https://github.com/benwart/agy-acp/commit/145829e0f6ed4c0d1b0270daee1c26dcf20c80f6))
+* **telemetry:** add quota burn pace, 5h/7d ratio R, forecasts, and compose CLI ([#6](https://github.com/benwart/agy-acp/issues/6)) ([c42641f](https://github.com/benwart/agy-acp/commit/c42641f7af0acab0e7848f9af459fe802bc2ca4e))
+
+### Bug Fixes
+
+* **ci:** replace wall-clock test timers with deterministic clock and cancellation ([c50374c](https://github.com/benwart/agy-acp/commit/c50374c0700afe21a2b34f996c5efc3ac44dcb41))
+* **ci:** replace wall-clock test timers with deterministic clock and cancellation ([#7](https://github.com/benwart/agy-acp/issues/7)) ([4ff711d](https://github.com/benwart/agy-acp/commit/4ff711d1593c3f6b6e0696ea6c9ca8e5b48f1282))
+
 ## [1.2.0](https://github.com/benwart/agy-acp/compare/v1.1.0...v1.2.0) (2026-11-15)
 
 ### Features
