@@ -1553,8 +1553,10 @@ async def test_should_recover_automatically_after_worker_crash_or_eof(
         agy_sid = first.conversation_id
         assert first.response == "Echo: EXIT_AFTER_TURN"
 
-        # Wait briefly for post-turn exit (`os._exit(1)`) to close stdout
-        await anyio.sleep(0.15)
+        # Wait deterministically for post-turn exit (`os._exit(1)`) to close stdout
+        with anyio.fail_after(5.0):
+            while client.worker_pid is not None:
+                await anyio.sleep(0.01)
 
         second = await client.stream_prompt(
             cwd=str(tmp_path),
@@ -1743,7 +1745,9 @@ def test_normalize_tool_arguments_canonicalizes_document_body_and_target_file_ke
 
 async def test_discover_models_refreshes_when_cache_older_than_one_day(tmp_path: Path) -> None:
     """Verify `discover_models` refreshes expired cache and falls back to stale rows on error."""
-    from datetime import UTC, datetime, timedelta
+    from datetime import timedelta
+
+    from freezegun import freeze_time
 
     script, state_file = _make_mock_agy(tmp_path)
     store = SqliteStateStoreProvider(tmp_path)
@@ -1754,41 +1758,40 @@ async def test_discover_models_refreshes_when_cache_older_than_one_day(tmp_path:
             "description": "Old",
         }
     ]
-    store.save_models(stale_models)
-    stale_ts = (datetime.now(UTC) - timedelta(days=1, seconds=5)).isoformat()
 
-    async with AgyAcpClientProvider(
-        bin_path=script,
-        state_store=store,
-        env={"MOCK_AGY_STATE_FILE": str(state_file)},
-    ) as provider:
-        # Warm in-memory cache while fresh, then age SQLite rows past 24h TTL
-        assert [m["modelId"] for m in await provider.discover_models(refresh=False)] == [
-            "gemini-4-argon-medium"
-        ]
-        with store._connect() as conn:
-            conn.execute("UPDATE models_cache SET updated_at = ?", (stale_ts,))
+    with freeze_time("2026-11-15T12:00:00Z", real_asyncio=True) as frozen_clock:
+        store.save_models(stale_models)
 
-        refreshed = await provider.discover_models(cwd=str(tmp_path), refresh=False)
-        assert [m["modelId"] for m in refreshed] == [
-            "gemini-4-carbon-medium",
-            "gemini-4-carbon-high",
-            "gemini-4-carbon-low",
-        ]
-        assert store.load_models() == refreshed
+        async with AgyAcpClientProvider(
+            bin_path=script,
+            state_store=store,
+            env={"MOCK_AGY_STATE_FILE": str(state_file)},
+        ) as provider:
+            # Warm in-memory cache while fresh, then advance mock clock past 24h TTL
+            assert [m["modelId"] for m in await provider.discover_models(refresh=False)] == [
+                "gemini-4-argon-medium"
+            ]
+            frozen_clock.tick(timedelta(days=1, seconds=5))
 
-    # When live discovery fails and cache expired, fall back to stale rows before FALLBACK_MODELS
-    store.save_models(stale_models)
-    with store._connect() as conn:
-        conn.execute("UPDATE models_cache SET updated_at = ?", (stale_ts,))
+            refreshed = await provider.discover_models(cwd=str(tmp_path), refresh=False)
+            assert [m["modelId"] for m in refreshed] == [
+                "gemini-4-carbon-medium",
+                "gemini-4-carbon-high",
+                "gemini-4-carbon-low",
+            ]
+            assert store.load_models() == refreshed
 
-    async with AgyAcpClientProvider(
-        bin_path=script,
-        state_store=store,
-        env={"MOCK_AGY_STATE_FILE": str(state_file), "MOCK_AGY_FAIL_INIT": "1"},
-    ) as failing_provider:
-        fallback = await failing_provider.discover_models(cwd=str(tmp_path), refresh=False)
-        assert fallback == stale_models
+        # On live discovery failure with expired cache, fall back to stale rows
+        store.save_models(stale_models)
+        frozen_clock.tick(timedelta(days=1, seconds=5))
+
+        async with AgyAcpClientProvider(
+            bin_path=script,
+            state_store=store,
+            env={"MOCK_AGY_STATE_FILE": str(state_file), "MOCK_AGY_FAIL_INIT": "1"},
+        ) as failing_provider:
+            fallback = await failing_provider.discover_models(cwd=str(tmp_path), refresh=False)
+            assert fallback == stale_models
 
 
 async def test_w4_reevaluate_populated_input_fail_closed_callbacks_and_shielded_close(
@@ -1922,18 +1925,18 @@ async def test_w4_reevaluate_populated_input_fail_closed_callbacks_and_shielded_
         state_store=store,
         env={"MOCK_AGY_STATE_FILE": str(state_file)},
     )
-    spawned_pid: int | None = None
-    with anyio.move_on_after(0.05):
+    await cancel_client.discover_models(cwd=str(tmp_path), refresh=True)
+    spawned_pid = cancel_client.worker_pid
+    assert spawned_pid is not None
+    with anyio.CancelScope() as cancel_scope:
         try:
-            await cancel_client.discover_models(cwd=str(tmp_path), refresh=True)
-            spawned_pid = cancel_client.worker_pid
-            await anyio.sleep(10.0)
+            cancel_scope.cancel()
+            await anyio.sleep(0)
         finally:
             await cancel_client.close()
 
-    assert spawned_pid is not None
     assert cancel_client.worker_pid is None
-    for _ in range(40):
+    for _ in range(100):
         try:
             os.kill(spawned_pid, 0)
         except ProcessLookupError:

@@ -1202,7 +1202,7 @@ async def test_session_manager_fork_steer_clear_context_knowledge_code_intel_and
 
 async def test_create_session_refreshes_expired_models_cache(tmp_path: Path) -> None:
     """Verify create_session re-discovers models when `models_cache` is older than 24h."""
-    from datetime import UTC, datetime, timedelta
+    from datetime import timedelta
 
     from agy_acp.providers.agy_acp_client import AgyAcpClientProvider
 
@@ -1224,24 +1224,25 @@ async def test_create_session_refreshes_expired_models_cache(tmp_path: Path) -> 
             self.state_store.save_models(fresh)
             return fresh
 
-    cli = _DiscoveryCli(save_dir=tmp_path)
-    cli.state_store.save_models(
-        [
-            {
-                "modelId": "gemini-4-argon-medium",
-                "name": "Gemini 4 Argon (Medium)",
-                "description": "Old",
-            }
-        ]
-    )
-    stale_ts = (datetime.now(UTC) - timedelta(days=1, seconds=10)).isoformat()
-    with cli.state_store._connect() as conn:
-        conn.execute("UPDATE models_cache SET updated_at = ?", (stale_ts,))
+    from freezegun import freeze_time
 
-    mgr = SessionManager(save_dir=tmp_path, cli_provider=cli)
-    desc = await mgr.create_session(cwd=str(tmp_path))
-    available = desc["models"]["availableModels"]
-    assert [m["modelId"] for m in available] == ["gemini-4-carbon-medium"]
+    cli = _DiscoveryCli(save_dir=tmp_path)
+    with freeze_time("2026-11-15T12:00:00Z", real_asyncio=True) as frozen_clock:
+        cli.state_store.save_models(
+            [
+                {
+                    "modelId": "gemini-4-argon-medium",
+                    "name": "Gemini 4 Argon (Medium)",
+                    "description": "Old",
+                }
+            ]
+        )
+        frozen_clock.tick(timedelta(days=1, seconds=10))
+
+        mgr = SessionManager(save_dir=tmp_path, cli_provider=cli)
+        desc = await mgr.create_session(cwd=str(tmp_path))
+        available = desc["models"]["availableModels"]
+        assert [m["modelId"] for m in available] == ["gemini-4-carbon-medium"]
 
 
 async def test_w4_image_cap_compacted_mandate_reinjection_and_load_evict_close(

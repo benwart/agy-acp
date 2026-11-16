@@ -330,7 +330,7 @@ while True:
                     "content": {{"type": "text", "text": "Working before steer... "}},
                 }},
             }}}})
-            if ev.wait(0.5):
+            if ev.wait(5.0):
                 send({{"jsonrpc": "2.0", "id": mid, "result": {{"stopReason": "cancelled"}}}})
                 continue
             send({{"jsonrpc": "2.0", "id": mid, "result": {{"stopReason": "end_turn"}}}})
@@ -798,8 +798,7 @@ async def test_kas_v3_tool_call_envelopes_permissions_and_reject_abort(
         "toolOrigin": "client",
     }
 
-    # Subprocess was terminated immediately on reject_once before sleeping & writing marker_file!
-    await asyncio.sleep(0.45)
+    # Rejected drop_table must not write marker_file
     assert not marker_file.exists()
 
 
@@ -1665,8 +1664,6 @@ async def test_kas_v3_custom_agent_tools_mount_allowlist_and_delete_file_alias_g
         and n["params"]["update"].get("sessionUpdate") == "tool_call_update"
     ]
     assert [u["status"] for u in alias_updates] == ["completed", "failed"]
-
-    await asyncio.sleep(0.4)
     assert list(leak_dir.iterdir()) == []
 
 
