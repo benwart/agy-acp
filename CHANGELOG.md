@@ -1,3 +1,10 @@
+## [1.3.1](https://github.com/benwart/agy-acp/compare/v1.3.0...v1.3.1) (2026-11-17)
+
+### Bug Fixes
+
+* **acp:** use session/resume to skip history replay on backend reconnect ([aef2357](https://github.com/benwart/agy-acp/commit/aef2357646092e032e932cbc41f9abba1208ecd2))
+* **acp:** use session/resume to skip history replay on backend reconnect ([#8](https://github.com/benwart/agy-acp/issues/8)) ([dcbc456](https://github.com/benwart/agy-acp/commit/dcbc456081358cfaccde33c6aeccbdaf92a55b6b))
+
 ## [1.3.0](https://github.com/benwart/agy-acp/compare/v1.2.0...v1.3.0) (2026-11-16)
 
 ### Features
