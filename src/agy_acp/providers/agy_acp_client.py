@@ -521,6 +521,22 @@ def _build_session_meta(system_prompt_append: str | None) -> dict[str, Any] | No
     return None
 
 
+def _extract_supports_session_resume(init_res: Mapping[str, Any]) -> bool:
+    """Return whether `initialize` capabilities advertise ACP `session/resume` support."""
+    for caps_key in ("agentCapabilities", "agent_capabilities"):
+        caps = init_res.get(caps_key)
+        if not isinstance(caps, Mapping):
+            continue
+        for sess_key in ("sessionCapabilities", "session_capabilities"):
+            sess_caps = caps.get(sess_key)
+            if not isinstance(sess_caps, Mapping) or "resume" not in sess_caps:
+                continue
+            resume_cap = sess_caps["resume"]
+            if isinstance(resume_cap, Mapping) or resume_cap is True:
+                return True
+    return False
+
+
 def _normalize_discovered_models(raw_models: Any) -> list[dict[str, str]]:
     """Normalize `models.availableModels` entries into `{modelId, name, description}` dicts."""
     if not isinstance(raw_models, Sequence) or isinstance(raw_models, (str, bytes)):
@@ -963,6 +979,7 @@ class _AcpSubprocessConnection:
         self.session_prefs: dict[str, tuple[str, str, str]] = {}
         self.initialized = False
         self.supports_tier = False
+        self.supports_session_resume = False
         self._tg_stack: contextlib.AsyncExitStack | None = None
         self._actor_task: asyncio.Task[None] | None = None
 
@@ -1528,6 +1545,7 @@ class AgyAcpClientProvider:
                 (isinstance(caps_agy, Mapping) and caps_agy.get("tier"))
                 or (isinstance(top_agy, Mapping) and top_agy.get("tier"))
             )
+            conn.supports_session_resume = _extract_supports_session_resume(init_res)
             self._conns[profile_key] = conn
             return conn
 
@@ -1714,7 +1732,7 @@ class AgyAcpClientProvider:
         effort: str | None = "medium",
         session_env: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
-        """Execute `session/new` or `session/load` with lazy `mcp_config.json` routing."""
+        """Execute `session/new`, `session/resume`, or `session/load` with lazy MCP routing."""
         profile_key, lazy_mcp_config = self._compute_mcp_profile(mcp_servers, session_env)
         params: dict[str, Any] = {
             **({"sessionId": agy_session_id} if agy_session_id else {}),
@@ -1725,18 +1743,42 @@ class AgyAcpClientProvider:
         if meta is not None:
             params["_meta"] = meta
 
-        conn, res = await self._rpc_with_reconnect(
-            rpc_method,
-            params,
-            timeout=self._rpc_timeout,
-            profile_key=profile_key,
-            lazy_mcp_config=lazy_mcp_config,
-        )
+        effective_method = rpc_method
+        if rpc_method == "session/resume":
+            init_conn = await self._ensure_connection(
+                profile_key=profile_key,
+                lazy_mcp_config=lazy_mcp_config,
+            )
+            if not init_conn.supports_session_resume:
+                effective_method = "session/load"
+
+        try:
+            conn, res = await self._rpc_with_reconnect(
+                effective_method,
+                params,
+                timeout=self._rpc_timeout,
+                profile_key=profile_key,
+                lazy_mcp_config=lazy_mcp_config,
+            )
+        except AgyAcpRpcError as exc:
+            if effective_method != "session/resume" or exc.code != -32601:
+                raise
+            active_conn = self._conns.get(profile_key)
+            if active_conn is not None:
+                active_conn.supports_session_resume = False
+            effective_method = "session/load"
+            conn, res = await self._rpc_with_reconnect(
+                effective_method,
+                params,
+                timeout=self._rpc_timeout,
+                profile_key=profile_key,
+                lazy_mcp_config=lazy_mcp_config,
+            )
         await conn.wait_idle()
         sid = str(res.get("sessionId") or (agy_session_id or "")).strip()
         if not sid:
-            err_code = -32002 if rpc_method == "session/load" else -32603
-            raise AgyAcpRpcError(err_code, f"{rpc_method} returned empty sessionId")
+            err_code = -32002 if effective_method in {"session/load", "session/resume"} else -32603
+            raise AgyAcpRpcError(err_code, f"{effective_method} returned empty sessionId")
 
         self._session_profiles[sid] = (profile_key, lazy_mcp_config)
         conn.loaded_sessions.add(sid)
@@ -1806,10 +1848,10 @@ class AgyAcpClientProvider:
         effort: str | None = "medium",
         session_env: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
-        """Load an existing `agy acp` session (`session/load`), falling back to `session/new`."""
+        """Resume an existing `agy acp` session (`session/resume` or `session/load`), or create."""
         try:
             return await self._open_backend_session(
-                "session/load",
+                "session/resume",
                 agy_session_id=agy_session_id,
                 cwd=cwd,
                 mcp_servers=mcp_servers,
