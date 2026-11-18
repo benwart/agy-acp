@@ -190,6 +190,7 @@ async def test_serve_non_dict_frames_unhashable_rpc_responses_and_exception_cont
         "checkpoints": True,
         "mcpServerOAuth": True,
         "mcpRegistryPointers": True,
+        "strictSessionLoad": True,
     }
     new_frame = next(f for f in written_frames if f.get("id") == 2)
     sid = new_frame["result"]["sessionId"]

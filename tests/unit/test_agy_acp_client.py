@@ -2309,3 +2309,174 @@ async def test_should_strip_retry_banners_log_diagnostics_and_preserve_liveness(
         '\u26a0 API error (attempt 1): request failed (code 502): HTML response "Error 502"',
         "\u26a0\ufe0f API error (attempt 2): read: operation timed out",
     ]
+
+
+async def test_agy_1_5_10_dynamic_thought_level_and_additional_directories(
+    tmp_path: Path,
+) -> None:
+    """`agy 1.5.10` preserves `xhigh` after `set_model` and forwards `additionalDirectories`."""
+    trace_file = tmp_path / "agy_1510_trace.jsonl"
+    fake_agy = tmp_path / "fake_agy_1510.py"
+    fake_agy.write_text(
+        """#!/usr/bin/env python3
+import json, os, pathlib, sys
+
+trace_path = pathlib.Path(os.environ["AGY_TRACE"])
+sessions = {}
+
+MODELS = [
+    {"modelId": "gemini-4-carbon-medium", "name": "Gemini 4 Carbon (Medium)"},
+    {"modelId": "gemini-4-carbon-high", "name": "Gemini 4 Carbon (High)"},
+    {"modelId": "gemini-4-hydrogen-low", "name": "Gemini 4 Hydrogen (Low)"},
+    {"modelId": "gemini-4-hydrogen-medium", "name": "Gemini 4 Hydrogen (Medium)"},
+    {"modelId": "gemini-4-hydrogen-high", "name": "Gemini 4 Hydrogen (High)"},
+    {"modelId": "gemini-4-hydrogen-xhigh", "name": "Gemini 4 Hydrogen (XHigh)"},
+]
+
+def config_options_for(s: dict) -> list[dict]:
+    model_id = s["model"]
+    is_hydrogen = model_id.startswith("gemini-4-hydrogen-")
+    family = "gemini-4-hydrogen" if is_hydrogen else "gemini-4-carbon"
+    efforts = ["low", "medium", "high", "xhigh"] if is_hydrogen else ["low", "medium", "high"]
+    cur_eff = model_id.rsplit("-", 1)[-1]
+    return [
+        {"id": "model", "category": "model", "currentValue": family, "options": [
+            {"value": "gemini-4-carbon"}, {"value": "gemini-4-hydrogen"}
+        ]},
+        {"id": "thought_level", "category": "thought_level", "currentValue": cur_eff, "options": [
+            {"value": v} for v in efforts
+        ]},
+        {"id": "mode", "category": "mode", "currentValue": s["mode"], "options": [
+            {"value": "default"}, {"value": "auto"}, {"value": "plan"}
+        ]},
+    ]
+
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method")
+    params = msg.get("params") or {}
+    with trace_path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"method": method, "params": params}) + "\\n")
+
+    if method == "initialize":
+        resp = {
+            "protocolVersion": 1,
+            "agentCapabilities": {
+                "loadSession": True,
+                "sessionCapabilities": {
+                    "resume": {}, "close": {}, "load": {}, "list": {}, "additionalDirectories": {}
+                },
+            },
+            "agentInfo": {"name": "Antigravity ACP Server", "version": "1.5.10"},
+        }
+    elif method == "session/new":
+        sid = "sid-1510-1"
+        sessions[sid] = {
+            "model": "gemini-4-carbon-medium",
+            "mode": "default",
+            "additionalDirectories": params.get("additionalDirectories", []),
+        }
+        resp = {
+            "sessionId": sid,
+            "models": {"currentModelId": "gemini-4-carbon-medium", "availableModels": MODELS},
+            "configOptions": config_options_for(sessions[sid]),
+        }
+    elif method in ("session/resume", "session/load"):
+        sid = params["sessionId"]
+        s = sessions.setdefault(sid, {"model": "gemini-4-carbon-medium", "mode": "default"})
+        s["additionalDirectories"] = params.get("additionalDirectories", [])
+        resp = {
+            "sessionId": sid,
+            "models": {"currentModelId": s["model"], "availableModels": MODELS},
+            "configOptions": config_options_for(s),
+        }
+    elif method == "session/set_model":
+        s = sessions[params["sessionId"]]
+        s["model"] = params["modelId"]
+        resp = {}
+    elif method == "session/set_config_option":
+        s = sessions[params["sessionId"]]
+        cid = params["configId"]
+        val = params["value"]
+        if cid == "mode":
+            s["mode"] = val
+        elif cid == "thought_level":
+            base = s["model"].rsplit("-", 1)[0]
+            s["model"] = f"{base}-{val}"
+        resp = {"configOptions": config_options_for(s)}
+    elif method == "session/prompt":
+        sid = params["sessionId"]
+        s = sessions[sid]
+        txt = f"model={s['model']} dirs={s.get('additionalDirectories')}"
+        sys.stdout.write(json.dumps({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": txt},
+                },
+            },
+        }) + "\\n")
+        resp = {"stopReason": "end_turn", "usage": {"inputTokens": 4, "outputTokens": 4}}
+    else:
+        resp = {}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": resp}) + "\\n")
+    sys.stdout.flush()
+""",
+        encoding="utf-8",
+    )
+    fake_agy.chmod(fake_agy.stat().st_mode | stat.S_IEXEC)
+
+    store = SqliteStateStoreProvider(tmp_path / "state")
+    extra_dir = str(tmp_path / "shared-pkg")
+    extra_dir_2 = str(tmp_path / "shared-pkg-2")
+    async with AgyAcpClientProvider(
+        bin_path=fake_agy,
+        state_store=store,
+        env={"AGY_TRACE": str(trace_file)},
+    ) as client:
+        outcome = await client.stream_prompt(
+            cwd=str(tmp_path),
+            session_id="sess-1510",
+            prompt="check model",
+            model="gemini-4-hydrogen-medium",
+            effort="xhigh",
+            additional_directories=[extra_dir],
+        )
+        assert outcome.resolved_model == "gemini-4-hydrogen-xhigh"
+        assert outcome.response == f"model=gemini-4-hydrogen-xhigh dirs={[extra_dir]!r}"
+
+        resumed = await client.stream_prompt(
+            cwd=str(tmp_path),
+            session_id="sess-1510",
+            agy_session_id=outcome.conversation_id,
+            prompt="check updated dirs",
+            model="gemini-4-hydrogen-low",
+            effort="xhigh",
+            additional_directories=[extra_dir, extra_dir_2],
+        )
+        assert resumed.response == (
+            f"model=gemini-4-hydrogen-xhigh dirs={[extra_dir, extra_dir_2]!r}"
+        )
+
+    traces = [
+        json.loads(line)
+        for line in trace_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    new_calls = [t for t in traces if t["method"] == "session/new"]
+    assert new_calls[0]["params"]["additionalDirectories"] == [extra_dir]
+    resume_calls = [t for t in traces if t["method"] == "session/resume"]
+    assert resume_calls[0]["params"]["additionalDirectories"] == [extra_dir, extra_dir_2]
+    thought_calls = [
+        t["params"]["value"]
+        for t in traces
+        if t["method"] == "session/set_config_option" and t["params"]["configId"] == "thought_level"
+    ]
+    assert thought_calls == ["xhigh", "xhigh"]

@@ -498,6 +498,48 @@ def _session_update_frame(session_id: str, update: dict[str, Any]) -> dict[str, 
     }
 
 
+def _parse_additional_directories(
+    msg_id: Any,
+    params: dict[str, Any],
+) -> tuple[list[str] | None, dict[str, Any] | None]:
+    """Validate optional `additionalDirectories` as a list of non-empty strings."""
+    raw_dirs = params.get("additionalDirectories")
+    if raw_dirs is None:
+        return None, None
+    if not isinstance(raw_dirs, list) or any(
+        not isinstance(entry, str) or not entry.strip() for entry in raw_dirs
+    ):
+        return (
+            None,
+            _jsonrpc_error(
+                msg_id,
+                -32602,
+                "Invalid params: 'additionalDirectories' must be a list of strings",
+            ),
+        )
+    return [entry.strip() for entry in raw_dirs], None
+
+
+def _validate_strict_load_meta(
+    msg_id: Any,
+    meta: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Validate optional `_meta.kiro.requireExisting` boolean on `session/load`."""
+    if not isinstance(meta, dict):
+        return None
+    kiro_meta = meta.get("kiro")
+    if not isinstance(kiro_meta, dict) or "requireExisting" not in kiro_meta:
+        return None
+    req_existing = kiro_meta.get("requireExisting")
+    if req_existing is not None and not isinstance(req_existing, bool):
+        return _jsonrpc_error(
+            msg_id,
+            -32602,
+            "Invalid params: '_meta.kiro.requireExisting' must be a boolean",
+        )
+    return None
+
+
 def _parse_session_wire_options(
     msg_id: Any,
     params: dict[str, Any],
@@ -1631,10 +1673,14 @@ class AcpDispatcher:
         mcp_servers, meta, err = _parse_session_wire_options(message_id, params)
         if err is not None:
             return err
+        additional_dirs, dir_err = _parse_additional_directories(message_id, params)
+        if dir_err is not None:
+            return dir_err
         desc = await self._session_manager.create_session(
             cwd=cwd,
             mcp_servers=mcp_servers,
             meta=meta,
+            additional_directories=additional_dirs,
         )
         await self._emit_post_session_open(desc["sessionId"], include_persisted_usage=True)
         return _jsonrpc_result(message_id, desc)
@@ -1664,12 +1710,19 @@ class AcpDispatcher:
         mcp_servers, meta, err = _parse_session_wire_options(message_id, params)
         if err is not None:
             return err
+        additional_dirs, dir_err = _parse_additional_directories(message_id, params)
+        if dir_err is not None:
+            return dir_err
+        strict_err = _validate_strict_load_meta(message_id, meta)
+        if strict_err is not None:
+            return strict_err
         try:
             desc = await self._session_manager.load_session(
                 session_id=session_id,
                 cwd=cwd,
                 mcp_servers=mcp_servers,
                 meta=meta,
+                additional_directories=additional_dirs,
             )
         except KeyError as exc:
             return _jsonrpc_error(message_id, -32002, str(exc))
@@ -1697,6 +1750,9 @@ class AcpDispatcher:
         mcp_servers, meta, err = _parse_session_wire_options(message_id, params)
         if err is not None:
             return err
+        additional_dirs, dir_err = _parse_additional_directories(message_id, params)
+        if dir_err is not None:
+            return dir_err
 
         raw_top_msg_id = params.get("messageId")
         if raw_top_msg_id is not None and not isinstance(raw_top_msg_id, str):
@@ -1713,6 +1769,7 @@ class AcpDispatcher:
                 mcp_servers=mcp_servers,
                 meta=meta,
                 message_id=fork_msg_id,
+                additional_directories=additional_dirs,
             )
         except KeyError as exc:
             return _jsonrpc_error(message_id, -32002, str(exc))
@@ -2355,7 +2412,13 @@ class AcpDispatcher:
         )
         caps = {
             **dict(init_res["agentCapabilities"]),
-            "sessionCapabilities": {"close": {}, "fork": {}, "list": {}, "resume": {}},
+            "sessionCapabilities": {
+                "additionalDirectories": {},
+                "close": {},
+                "fork": {},
+                "list": {},
+                "resume": {},
+            },
         }
         info = {**dict(init_res["agentInfo"]), "_meta": {"agyAcpVersion": __version__}}
         return _jsonrpc_result(
@@ -2407,6 +2470,11 @@ class AcpDispatcher:
                             "cwd": s["cwd"],
                             "title": s.get("title"),
                             "updatedAt": s.get("updatedAt"),
+                            **(
+                                {"additionalDirectories": list(s["additionalDirectories"])}
+                                if s.get("additionalDirectories")
+                                else {}
+                            ),
                         }
                         for s in sessions
                     ]

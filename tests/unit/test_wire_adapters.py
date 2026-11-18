@@ -62,6 +62,7 @@ def test_initialize_result_protocol_version_and_kas_capabilities() -> None:
         "checkpoints": True,
         "mcpServerOAuth": True,
         "mcpRegistryPointers": True,
+        "strictSessionLoad": True,
     }
 
 
