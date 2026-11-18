@@ -4813,3 +4813,141 @@ async def test_dispatcher_strips_retry_warnings_in_live_stream_persistence_repla
         assert "API error (attempt" not in ft["assistant_text"]
 
     await dispatcher.aclose()
+
+
+async def test_kiro_3_4_0_strict_session_load_and_additional_directories_lifecycle(
+    tmp_path: Path,
+) -> None:
+    """Verify kiro-cli 3.4.0 `strictSessionLoad` (`requireExisting`) and `additionalDirectories`."""
+    from agy_acp.logic.wire import create_wire_adapter
+    from agy_acp.providers.state_store import SqliteStateStoreProvider
+
+    captured_kwargs: list[dict[str, Any]] = []
+
+    class _RecordingCliProvider(_StubAgyAcpClientProvider):
+        async def stream_prompt(self, **kwargs: Any) -> PromptOutcome:
+            captured_kwargs.append(dict(kwargs))
+            return PromptOutcome(
+                conversation_id="conv_340",
+                stop_reason="end_turn",
+                response="ok",
+                usage={"input_tokens": 5, "output_tokens": 3},
+            )
+
+    store = SqliteStateStoreProvider(tmp_path / "state.db")
+    adapter = create_wire_adapter("v3")
+    mgr = SessionManager(
+        state_store=store,
+        cli_provider=_RecordingCliProvider(state_store=store),
+        wire_adapter=adapter,
+    )
+    dispatcher = AcpDispatcher(session_manager=mgr, wire_adapter=adapter)
+
+    async def _rpc(req_id: int, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        resp = await dispatcher.handle_message(
+            json.dumps({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
+        )
+        assert resp is not None
+        return resp
+
+    init_resp = await _rpc(1, "initialize", {"protocolVersion": 1, "clientCapabilities": {}})
+    agent_caps = init_resp["result"]["agentCapabilities"]
+    assert agent_caps["sessionCapabilities"]["additionalDirectories"] == {}
+    assert agent_caps["_meta"]["kiro"]["strictSessionLoad"] is True
+
+    bad_dirs_resp = await _rpc(
+        2,
+        "session/new",
+        {"cwd": str(tmp_path), "additionalDirectories": "not-a-list", "mcpServers": []},
+    )
+    assert bad_dirs_resp["error"]["code"] == -32602
+
+    bad_elem_resp = await _rpc(
+        3,
+        "session/new",
+        {"cwd": str(tmp_path), "additionalDirectories": [123], "mcpServers": []},
+    )
+    assert bad_elem_resp["error"]["code"] == -32602
+
+    extra_a = str(tmp_path / "extra-a")
+    extra_b = str(tmp_path / "extra-b")
+    new_resp = await _rpc(
+        4,
+        "session/new",
+        {
+            "cwd": str(tmp_path),
+            "additionalDirectories": [extra_a, extra_b],
+            "mcpServers": [],
+        },
+    )
+    sid = new_resp["result"]["sessionId"]
+
+    list_resp = await _rpc(5, "session/list", {})
+    assert list_resp["result"]["sessions"][0]["additionalDirectories"] == [extra_a, extra_b]
+
+    # Invalid `_meta.kiro.requireExisting` type returns -32602
+    bad_strict = await _rpc(
+        6,
+        "session/load",
+        {
+            "sessionId": sid,
+            "cwd": str(tmp_path),
+            "mcpServers": [],
+            "_meta": {"kiro": {"requireExisting": "yes"}},
+        },
+    )
+    assert bad_strict["error"]["code"] == -32602
+
+    # Strict missing session load returns -32002
+    missing_strict = await _rpc(
+        7,
+        "session/load",
+        {
+            "sessionId": "00000000-0000-0000-0000-000000000000",
+            "cwd": str(tmp_path),
+            "mcpServers": [],
+            "_meta": {"kiro": {"requireExisting": True}},
+        },
+    )
+    assert missing_strict["error"]["code"] == -32002
+
+    # Valid `requireExisting: True` load inherits `additionalDirectories` when omitted
+    load_resp = await _rpc(
+        8,
+        "session/load",
+        {
+            "sessionId": sid,
+            "cwd": str(tmp_path),
+            "mcpServers": [],
+            "_meta": {"kiro": {"requireExisting": True}},
+        },
+    )
+    assert load_resp["result"]["sessionId"] == sid
+
+    await _rpc(
+        9,
+        "session/prompt",
+        {"sessionId": sid, "prompt": [{"type": "text", "text": "hello"}]},
+    )
+    assert captured_kwargs[-1]["additional_directories"] == [extra_a, extra_b]
+
+    # Fork inherits parent's `additionalDirectories` by default and allows explicit override
+    fork_inherited = await _rpc(10, "session/fork", {"sessionId": sid})
+    fork_sid = fork_inherited["result"]["sessionId"]
+    fork_s1 = store.get_session(fork_sid)
+    assert fork_s1 is not None
+    assert fork_s1["additionalDirectories"] == [extra_a, extra_b]
+
+    extra_c = str(tmp_path / "extra-c")
+    fork_overridden = await _rpc(
+        11,
+        "session/fork",
+        {"sessionId": sid, "additionalDirectories": [extra_c]},
+    )
+    fork_sid_2 = fork_overridden["result"]["sessionId"]
+    fork_s2 = store.get_session(fork_sid_2)
+    assert fork_s2 is not None
+    assert fork_s2["additionalDirectories"] == [extra_c]
+
+    await dispatcher.aclose()
+    await mgr.close()

@@ -50,6 +50,7 @@ class V3KasWireAdapter(EngineWireAdapter):
             "checkpoints": True,
             "mcpServerOAuth": True,
             "mcpRegistryPointers": True,
+            "strictSessionLoad": True,
         }
         capabilities["_meta"] = {"kiro": kiro_meta}
 

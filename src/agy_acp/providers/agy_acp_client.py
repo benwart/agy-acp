@@ -38,6 +38,7 @@ from agy_acp.logic.tool_classifier import (
     _extract_first_str,
     _pairs_to_dict,
     _resolve_builtin_triple,
+    _split_model_effort_suffix,
     build_scrubbed_subprocess_env,
     classify_tool_call_step,
     resolve_agy_binary,
@@ -561,11 +562,18 @@ def _normalize_discovered_models(raw_models: Any) -> list[dict[str, str]]:
     return out
 
 
-def _resolve_supported_thought_level(effort: str | None, config_options: Any) -> str | None:
+def _resolve_supported_thought_level(
+    effort: str | None,
+    config_options: Any,
+    *,
+    model_effort_hint: str | None = None,
+) -> str | None:
     """Map `effort` onto `thought_level` options supported by `agy acp`."""
     if not effort or not effort.strip():
         return None
     cleaned = effort.strip().lower()
+    if model_effort_hint and cleaned == model_effort_hint.strip().lower():
+        return cleaned
     mapped = "high" if cleaned in {"xhigh", "max"} else cleaned
     if isinstance(config_options, Sequence) and not isinstance(config_options, (str, bytes)):
         for opt in config_options:
@@ -977,6 +985,7 @@ class _AcpSubprocessConnection:
         self.loaded_sessions: set[str] = set()
         self.session_results: dict[str, dict[str, Any]] = {}
         self.session_prefs: dict[str, tuple[str, str, str]] = {}
+        self.session_dirs: dict[str, tuple[str, ...]] = {}
         self.initialized = False
         self.supports_tier = False
         self.supports_session_resume = False
@@ -1668,15 +1677,7 @@ class AgyAcpClientProvider:
         effort: str | None,
         available_models: Sequence[Mapping[str, Any]],
     ) -> tuple[str, str]:
-        """Configure backend `mode` (`default`/`plan`), `model`, and `thought_level`."""
-        target_agy_mode = "plan" if mode in {"read-only", "plan"} else "default"
-        with contextlib.suppress(AgyAcpRpcError):
-            await conn.request(
-                "session/set_config_option",
-                {"sessionId": agy_sid, "configId": "mode", "value": target_agy_mode},
-                timeout=self._rpc_timeout,
-            )
-
+        """Configure backend `model`, `mode` (`default`/`plan`), and `thought_level`."""
         models_block = session_result.get("models")
         resolved_model = (
             str(models_block.get("currentModelId") or "").strip()
@@ -1700,8 +1701,25 @@ class AgyAcpClientProvider:
             except AgyAcpRpcError:
                 fallback_from_model = clean_model
 
+        effective_config_options: Any = session_result.get("configOptions")
+        target_agy_mode = "plan" if mode in {"read-only", "plan"} else "default"
+        with contextlib.suppress(AgyAcpRpcError):
+            mode_res = await conn.request(
+                "session/set_config_option",
+                {"sessionId": agy_sid, "configId": "mode", "value": target_agy_mode},
+                timeout=self._rpc_timeout,
+            )
+            refreshed_opts = mode_res.get("configOptions")
+            if isinstance(refreshed_opts, list) and refreshed_opts:
+                effective_config_options = refreshed_opts
+                if agy_sid in conn.session_results:
+                    conn.session_results[agy_sid]["configOptions"] = list(refreshed_opts)
+
+        parsed_model_effort = _split_model_effort_suffix(resolved_model)
         target_thought = _resolve_supported_thought_level(
-            effort, session_result.get("configOptions")
+            effort,
+            effective_config_options,
+            model_effort_hint=parsed_model_effort[1] if parsed_model_effort is not None else None,
         )
         if target_thought is not None:
             with contextlib.suppress(AgyAcpRpcError):
@@ -1725,6 +1743,7 @@ class AgyAcpClientProvider:
         *,
         cwd: str,
         agy_session_id: str | None = None,
+        additional_directories: Sequence[str] | None = None,
         mcp_servers: Sequence[Mapping[str, Any]] | None = None,
         system_prompt_append: str | None = None,
         model: str | None = None,
@@ -1734,9 +1753,11 @@ class AgyAcpClientProvider:
     ) -> dict[str, Any]:
         """Execute `session/new`, `session/resume`, or `session/load` with lazy MCP routing."""
         profile_key, lazy_mcp_config = self._compute_mcp_profile(mcp_servers, session_env)
+        clean_dirs = [str(d).strip() for d in (additional_directories or ()) if str(d).strip()]
         params: dict[str, Any] = {
             **({"sessionId": agy_session_id} if agy_session_id else {}),
             "cwd": str(cwd),
+            **({"additionalDirectories": clean_dirs} if clean_dirs else {}),
             "mcpServers": [],
         }
         meta = _build_session_meta(system_prompt_append)
@@ -1799,6 +1820,7 @@ class AgyAcpClientProvider:
         )
         await conn.wait_idle()
         conn.session_prefs[sid] = (model or "", mode, effort or "")
+        conn.session_dirs[sid] = tuple(clean_dirs)
         extracted_tier = self._extract_tier(res)
         self._cache_tier(extracted_tier)
         return {
@@ -1809,7 +1831,9 @@ class AgyAcpClientProvider:
             "tier": extracted_tier,
             "modes": dict(res["modes"]) if isinstance(res.get("modes"), Mapping) else {},
             "configOptions": (
-                list(res["configOptions"]) if isinstance(res.get("configOptions"), list) else []
+                list(conn.session_results[sid]["configOptions"])
+                if isinstance(conn.session_results[sid].get("configOptions"), list)
+                else []
             ),
         }
 
@@ -1817,6 +1841,7 @@ class AgyAcpClientProvider:
         self,
         *,
         cwd: str,
+        additional_directories: Sequence[str] | None = None,
         mcp_servers: Sequence[Mapping[str, Any]] | None = None,
         system_prompt_append: str | None = None,
         model: str | None = None,
@@ -1828,6 +1853,7 @@ class AgyAcpClientProvider:
         return await self._open_backend_session(
             "session/new",
             cwd=cwd,
+            additional_directories=additional_directories,
             mcp_servers=mcp_servers,
             system_prompt_append=system_prompt_append,
             model=model,
@@ -1841,6 +1867,7 @@ class AgyAcpClientProvider:
         *,
         agy_session_id: str,
         cwd: str,
+        additional_directories: Sequence[str] | None = None,
         mcp_servers: Sequence[Mapping[str, Any]] | None = None,
         system_prompt_append: str | None = None,
         model: str | None = None,
@@ -1854,6 +1881,7 @@ class AgyAcpClientProvider:
                 "session/resume",
                 agy_session_id=agy_session_id,
                 cwd=cwd,
+                additional_directories=additional_directories,
                 mcp_servers=mcp_servers,
                 system_prompt_append=system_prompt_append,
                 model=model,
@@ -1864,6 +1892,7 @@ class AgyAcpClientProvider:
         except AgyAcpRpcError:
             return await self.create_backend_session(
                 cwd=cwd,
+                additional_directories=additional_directories,
                 mcp_servers=mcp_servers,
                 system_prompt_append=system_prompt_append,
                 model=model,
@@ -1910,6 +1939,7 @@ class AgyAcpClientProvider:
             conn.loaded_sessions.discard(agy_session_id)
             conn.session_results.pop(agy_session_id, None)
             conn.session_prefs.pop(agy_session_id, None)
+            conn.session_dirs.pop(agy_session_id, None)
 
     async def close_backend_session(self, agy_session_id: str) -> dict[str, Any]:
         """Close `agy_session_id` via `session/close` and evict from loaded session set."""
@@ -2389,6 +2419,7 @@ class AgyAcpClientProvider:
         *,
         agy_sid: str,
         cwd: str,
+        additional_directories: Sequence[str] | None,
         mcp_servers: Sequence[Mapping[str, Any]] | None,
         system_prompt_append: str | None,
         model: str | None,
@@ -2397,11 +2428,18 @@ class AgyAcpClientProvider:
         env: Mapping[str, str] | None,
     ) -> tuple[_AcpSubprocessConnection, str, str, str]:
         profile_key, lazy_cfg = self._compute_mcp_profile(mcp_servers, env)
+        desired_dirs = tuple(
+            str(d).strip() for d in (additional_directories or ()) if str(d).strip()
+        )
         conn = await self._ensure_connection(
             profile_key=profile_key,
             lazy_mcp_config=lazy_cfg,
         )
-        if agy_sid and agy_sid in conn.loaded_sessions:
+        if (
+            agy_sid
+            and agy_sid in conn.loaded_sessions
+            and conn.session_dirs.get(agy_sid, ()) == desired_dirs
+        ):
             desired_prefs = (model or "", mode, effort or "")
             if conn.session_prefs.get(agy_sid) == desired_prefs:
                 return conn, agy_sid, "", ""
@@ -2422,6 +2460,7 @@ class AgyAcpClientProvider:
             info = await self.load_backend_session(
                 agy_session_id=agy_sid,
                 cwd=cwd,
+                additional_directories=desired_dirs,
                 mcp_servers=mcp_servers,
                 system_prompt_append=system_prompt_append,
                 model=model,
@@ -2432,6 +2471,7 @@ class AgyAcpClientProvider:
         else:
             info = await self.create_backend_session(
                 cwd=cwd,
+                additional_directories=desired_dirs,
                 mcp_servers=mcp_servers,
                 system_prompt_append=system_prompt_append,
                 model=model,
@@ -2460,6 +2500,7 @@ class AgyAcpClientProvider:
         conversation_id: str | None = None,
         content_blocks: Sequence[Mapping[str, Any]] | None = None,
         prompt: str = "",
+        additional_directories: Sequence[str] | None = None,
         mcp_servers: Sequence[Mapping[str, Any]] | None = None,
         system_prompt_append: str | None = None,
         model: str | None = None,
@@ -2527,6 +2568,7 @@ class AgyAcpClientProvider:
                     conn, resolved_agy_sid, new_model, new_fb = await self._prepare_turn_backend(
                         agy_sid=resolved_agy_sid,
                         cwd=cwd,
+                        additional_directories=additional_directories,
                         mcp_servers=effective_mcp,
                         system_prompt_append=system_prompt_append,
                         model=model,

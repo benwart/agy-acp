@@ -1036,6 +1036,7 @@ class SessionManager:
         cwd: str | None,
         mcp_servers: list[dict[str, Any]] | None,
         meta: dict[str, Any] | None,
+        additional_directories: list[str] | None = None,
     ) -> tuple[dict[str, Any], list[dict[str, str]]]:
         """Build merged draft state and available models for `load_session` or `fork_session`."""
         effective_cwd = (
@@ -1056,6 +1057,11 @@ class SessionManager:
         effective_meta = (
             copy.deepcopy(meta) if meta is not None else copy.deepcopy(source.get("meta", {}))
         )
+        effective_dirs = (
+            list(additional_directories)
+            if additional_directories is not None
+            else [str(d) for d in (source.get("additionalDirectories") or []) if str(d).strip()]
+        )
 
         agent = source.get("agent") or self._default_agent
         self._cli.discard_cancelled(target_sid)
@@ -1074,6 +1080,7 @@ class SessionManager:
             **copy.deepcopy(source),
             "sessionId": target_sid,
             "cwd": effective_cwd,
+            "additionalDirectories": effective_dirs,
             "mcp_servers": combined_mcp,
             "wire_mcp_servers": effective_wire_mcp,
             "custom_agents": effective_custom_agents,
@@ -1101,6 +1108,7 @@ class SessionManager:
         cwd: str,
         mcp_servers: list[dict[str, Any]] | None = None,
         meta: dict[str, Any] | None = None,
+        additional_directories: list[str] | None = None,
     ) -> dict[str, Any]:
         """Create a new ACP session (`session/new`) in SQLite and return its descriptor."""
         initial_mode = "approve" if os.environ.get("GOOSE_MODE") else "auto"
@@ -1116,6 +1124,7 @@ class SessionManager:
 
         isolated_mcp = copy.deepcopy(mcp_servers) if mcp_servers is not None else []
         isolated_meta = copy.deepcopy(meta) if meta is not None else {}
+        isolated_dirs = list(additional_directories) if additional_directories is not None else []
         wire_custom_agents = _extract_wire_custom_agents(isolated_meta) or []
 
         sid = str(uuid.uuid4())
@@ -1132,6 +1141,7 @@ class SessionManager:
             "sessionId": sid,
             "agyConversationId": None,
             "cwd": cwd,
+            "additionalDirectories": isolated_dirs,
             "mcp_servers": combined_mcp,
             "wire_mcp_servers": isolated_mcp,
             "custom_agents": wire_custom_agents,
@@ -1165,6 +1175,7 @@ class SessionManager:
         cwd: str,
         mcp_servers: list[dict[str, Any]] | None = None,
         meta: dict[str, Any] | None = None,
+        additional_directories: list[str] | None = None,
     ) -> dict[str, Any]:
         """Resume an existing ACP session (`session/load`) from SQLite storage."""
         await anyio.sleep(0)
@@ -1175,11 +1186,14 @@ class SessionManager:
             cwd=cwd,
             mcp_servers=mcp_servers,
             meta=meta,
+            additional_directories=additional_directories,
         )
         old_agy_id = str(state.get("agyConversationId") or "").strip()
         if old_agy_id and (
             draft_state["mcp_servers"] != state.get("mcp_servers")
             or draft_state.get("agentPrompt") != state.get("agentPrompt")
+            or draft_state.get("additionalDirectories", [])
+            != state.get("additionalDirectories", [])
         ):
             await self._cli.close_backend_session(old_agy_id)
             self._cli.evict_backend_session(old_agy_id)
@@ -1197,6 +1211,7 @@ class SessionManager:
         mcp_servers: list[dict[str, Any]] | None = None,
         meta: dict[str, Any] | None = None,
         message_id: str | None = None,
+        additional_directories: list[str] | None = None,
     ) -> dict[str, Any]:
         """Fork an existing ACP session (`session/fork`) into a new session ID."""
         await anyio.sleep(0)
@@ -1208,6 +1223,7 @@ class SessionManager:
             cwd=cwd,
             mcp_servers=mcp_servers,
             meta=meta,
+            additional_directories=additional_directories,
         )
 
         source_turns = self._store.get_session_turns(source_session_id)
@@ -1327,6 +1343,12 @@ class SessionManager:
         effective_session = (
             session if self._mcp_enabled else {**session, "mcp_servers": [], "wire_mcp_servers": []}
         )
+        raw_dirs = session.get("additionalDirectories")
+        clean_dirs = (
+            [str(d).strip() for d in raw_dirs if isinstance(d, str) and d.strip()]
+            if isinstance(raw_dirs, list)
+            else []
+        )
         return {
             "session_id": session_id,
             "mcp_servers": effective_session.get("mcp_servers"),
@@ -1341,6 +1363,7 @@ class SessionManager:
                 session_id=session_id,
                 state_db_path=self._store.db_path,
             ),
+            **({"additional_directories": clean_dirs} if clean_dirs else {}),
         }
 
     async def compact_session(

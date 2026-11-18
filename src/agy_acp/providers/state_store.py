@@ -195,6 +195,12 @@ class SqliteStateStoreProvider:
             if "custom_agents_json" in row_keys
             else []
         )
+        raw_additional_dirs = auth_cfg.get("_additional_directories", [])
+        additional_directories = (
+            [str(d) for d in raw_additional_dirs if str(d).strip()]
+            if isinstance(raw_additional_dirs, list)
+            else []
+        )
         raw_context_paths = auth_cfg.get("_context_paths", [])
         context_paths = (
             [str(p) for p in raw_context_paths] if isinstance(raw_context_paths, list) else []
@@ -209,6 +215,7 @@ class SqliteStateStoreProvider:
             "sessionId": str(row["session_id"]),
             "agyConversationId": row["agy_conversation_id"],
             "cwd": str(row["cwd"]),
+            "additionalDirectories": additional_directories,
             "mode": str(row["mode"]),
             "agent": auth_cfg.get("_agent"),
             "agentPrompt": auth_cfg.get("_agent_prompt"),
@@ -319,6 +326,13 @@ class SqliteStateStoreProvider:
                 auth_config["_reinject_agent_prompt"] = True
             else:
                 auth_config.pop("_reinject_agent_prompt", None)
+        if "additionalDirectories" in state:
+            if isinstance(state["additionalDirectories"], list) and state["additionalDirectories"]:
+                auth_config["_additional_directories"] = [
+                    str(d) for d in state["additionalDirectories"] if str(d).strip()
+                ]
+            else:
+                auth_config.pop("_additional_directories", None)
         if "contextPaths" in state:
             if isinstance(state["contextPaths"], list) and state["contextPaths"]:
                 auth_config["_context_paths"] = [str(p) for p in state["contextPaths"]]
