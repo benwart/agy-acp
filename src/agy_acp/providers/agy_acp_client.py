@@ -574,7 +574,10 @@ def _resolve_supported_thought_level(
     cleaned = effort.strip().lower()
     if model_effort_hint and cleaned == model_effort_hint.strip().lower():
         return cleaned
-    mapped = "high" if cleaned in {"xhigh", "max"} else cleaned
+    candidates = {
+        "max": ("max", "xhigh", "high"),
+        "xhigh": ("xhigh", "high"),
+    }.get(cleaned, (cleaned,))
     if isinstance(config_options, Sequence) and not isinstance(config_options, (str, bytes)):
         for opt in config_options:
             if not isinstance(opt, Mapping) or opt.get("id") != "thought_level":
@@ -586,8 +589,9 @@ def _resolve_supported_thought_level(
                     for c in raw_choices
                     if isinstance(c, Mapping) and c.get("value")
                 }
-                return cleaned if cleaned in valid else (mapped if mapped in valid else None)
-    return mapped if mapped in {"low", "medium", "high"} else None
+                return next((candidate for candidate in candidates if candidate in valid), None)
+    fallback = "high" if cleaned in {"xhigh", "max"} else cleaned
+    return fallback if fallback in {"low", "medium", "high"} else None
 
 
 def _select_permission_option_id(options: Any, *, allow: bool) -> str:
