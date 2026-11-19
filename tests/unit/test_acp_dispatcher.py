@@ -12,7 +12,7 @@ import pytest
 from agy_acp.logic.acp_dispatcher import AcpDispatcher
 from agy_acp.logic.quota_tracker import QuotaTracker
 from agy_acp.logic.session_manager import SessionManager
-from agy_acp.logic.tool_classifier import PromptOutcome, ToolCallEvent
+from agy_acp.logic.tool_classifier import PromptOutcome, ToolCallEvent, ToolPermissionDecision
 from agy_acp.providers.agy_acp_client import AgyAcpClientProvider
 from agy_acp.providers.quota_provider import QuotaProvider
 
@@ -85,7 +85,8 @@ class _StubAgyAcpClientProvider(AgyAcpClientProvider):
         known_mcp_servers: Sequence[str] = (),
         on_thought: Callable[[str], Awaitable[None]] | None = None,
         on_text: Callable[[str], Awaitable[None]] | None = None,
-        on_tool_call: Callable[[ToolCallEvent], Awaitable[bool]] | None = None,
+        on_tool_call: Callable[[ToolCallEvent], Awaitable[bool | ToolPermissionDecision]]
+        | None = None,
         on_tool_update: Callable[[ToolCallEvent], Awaitable[None]] | None = None,
         on_usage: Callable[[int], Awaitable[None]] | None = None,
         on_steer_consumed: Callable[[str], Awaitable[None]] | None = None,
@@ -4653,7 +4654,8 @@ async def test_dispatcher_strips_retry_warnings_in_live_stream_persistence_repla
             cwd: str,
             prompt: str = "",
             on_text: Callable[[str], Awaitable[None]] | None = None,
-            on_tool_call: Callable[[ToolCallEvent], Awaitable[bool]] | None = None,
+            on_tool_call: Callable[[ToolCallEvent], Awaitable[bool | ToolPermissionDecision]]
+            | None = None,
             **_extra: Any,
         ) -> PromptOutcome:
             _ = (cwd, prompt, _extra)

@@ -652,8 +652,8 @@ async def test_installed_kirocrew_wire_methods_tool_mappings_and_kas_discriminan
     ]
     families = installed_contract.kas_tool_family_by_kiro_name
     kiro_name_by_kas_id = {
-        **{kas_id: kiro_name for kiro_name, fam in families.items() for kas_id in fam},
         **dict.fromkeys(installed_contract.policy_alias_deny_only_ids, "fs_write"),
+        **{kas_id: kiro_name for kiro_name, fam in families.items() for kas_id in fam},
         "run_command": "execute_bash",
     }
     allowed_builtins = set(installed_contract.allowed_tools_builtins)
@@ -932,3 +932,105 @@ def test_installed_kirocrew_document_body_keys_and_edit_target_candidates(
     assert not edit_targets.truncated
     assert not edit_targets.unanchored
     assert list(edit_targets) == [target_mod]
+
+
+async def test_installed_kirocrew_0_13_0_shared_runtime_and_rejection_reason_contract(
+    installed_contract: InstalledKiroCrewContract,
+    tmp_path: Path,
+) -> None:
+    """Verify `0.13.0` shared-runtime `session/close` and KAS rejection-reason contract."""
+    store = SqliteStateStoreProvider(tmp_path / "shared_contract.db")
+    v3_adapter = V3KasWireAdapter()
+    mgr = SessionManager(state_store=store, wire_adapter=v3_adapter)
+    dispatcher = AcpDispatcher(session_manager=mgr, wire_adapter=v3_adapter)
+
+    init_resp = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": installed_contract.kas_v3_protocol_version,
+                    "clientCapabilities": {},
+                },
+            }
+        )
+    )
+    assert init_resp is not None and "result" in init_resp
+    # KiroCrew 0.13.0 KasHarness.release() requires `sessionCapabilities.close` to keep records
+    assert isinstance(
+        init_resp["result"]["agentCapabilities"]["sessionCapabilities"].get("close"), dict
+    )
+
+    # Create two concurrent sessions on one shared dispatcher, close B, and verify B resumes
+    # cleanly via `session/load` while A remains active.
+    s_a = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/new",
+                "params": {"cwd": str(tmp_path / "a"), "mcpServers": []},
+            }
+        )
+    )
+    s_b = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "session/new",
+                "params": {"cwd": str(tmp_path / "b"), "mcpServers": []},
+            }
+        )
+    )
+    assert s_a is not None and s_b is not None
+    sid_a = s_a["result"]["sessionId"]
+    sid_b = s_b["result"]["sessionId"]
+
+    close_b = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "session/close",
+                "params": {"sessionId": sid_b},
+            }
+        )
+    )
+    assert close_b is not None and "result" in close_b
+    assert mgr.get_session(sid_a)["cwd"] == str(tmp_path / "a")
+
+    load_b = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "session/load",
+                "params": {"sessionId": sid_b, "cwd": str(tmp_path / "b"), "mcpServers": []},
+            }
+        )
+    )
+    assert load_b is not None and "result" in load_b
+    assert load_b["result"]["sessionId"] == sid_b
+
+    # Verify KAS v3 permission params satisfy KiroCrew 0.13.0 `takes_rejection_reason` contract
+    _, _, tc_event = _build_tool_event_from_record(
+        "tc-rej-contract",
+        {
+            "toolCallId": "tc-rej-contract",
+            "name": "run_command",
+            "kind": "execute",
+            "raw_args": {"CommandLine": "pytest"},
+        },
+        known_mcp_servers=(),
+    )
+    perm_params = v3_adapter.build_permission_request_params(
+        sid_a,
+        _to_normalized_tool_event(tc_event),
+    )
+    assert isinstance(perm_params.get("_meta", {}).get("kiro"), dict)
+    option_kinds = {opt.get("kind"): opt.get("optionId") for opt in perm_params["options"]}
+    assert option_kinds.get("reject_once") == "reject_once"
+    await mgr.close()

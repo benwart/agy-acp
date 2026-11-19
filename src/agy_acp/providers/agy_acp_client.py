@@ -21,6 +21,7 @@ from typing import Any, Self
 
 import anyio
 import anyio.abc
+from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from anyio.streams.text import TextReceiveStream
 from opentelemetry import context as otel_context
 from opentelemetry import trace
@@ -35,6 +36,7 @@ from agy_acp.logic.tool_classifier import (
     QueuedSteer,
     ToolCallClassification,
     ToolCallEvent,
+    ToolPermissionDecision,
     _extract_first_str,
     _pairs_to_dict,
     _resolve_builtin_triple,
@@ -896,7 +898,7 @@ class _ActiveTurnState:
     known_mcp_servers: tuple[str, ...]
     on_thought: Callable[[str], Awaitable[None]] | None
     on_text: Callable[[str], Awaitable[None]] | None
-    on_tool_call: Callable[[ToolCallEvent], Awaitable[bool]] | None
+    on_tool_call: Callable[[ToolCallEvent], Awaitable[bool | ToolPermissionDecision]] | None
     on_tool_update: Callable[[ToolCallEvent], Awaitable[None]] | None
     on_usage: Callable[[int], Awaitable[None]] | None
     collected_texts: list[str]
@@ -910,6 +912,7 @@ class _ActiveTurnState:
     perm_arrived_events: dict[str, anyio.Event] = field(default_factory=dict)
     decision_events: dict[str, anyio.Event] = field(default_factory=dict)
     decisions: dict[str, bool] = field(default_factory=dict)
+    rejection_reasons: dict[str, str] = field(default_factory=dict)
     evaluated_inputs: dict[str, dict[str, Any]] = field(default_factory=dict)
     policy_denied_tools: list[str] = field(default_factory=list)
     last_context_tokens: int = 0
@@ -980,12 +983,12 @@ class _AcpSubprocessConnection:
         self._spawn_error: BaseException | None = None
         self._closed = False
         self._stderr_tail: list[str] = []
-        self._notif_send, self._notif_recv = anyio.create_memory_object_stream[dict[str, Any]](
-            math.inf
-        )
+        self._session_notif_sends: dict[str, MemoryObjectSendStream[dict[str, Any]]] = {}
         self._inflight_frames = 0
         self._idle_event = anyio.Event()
         self._idle_event.set()
+        self._session_inflight: dict[str, int] = {}
+        self._session_idle_events: dict[str, anyio.Event] = {}
         self.loaded_sessions: set[str] = set()
         self.session_results: dict[str, dict[str, Any]] = {}
         self.session_prefs: dict[str, tuple[str, str, str]] = {}
@@ -1167,7 +1170,6 @@ class _AcpSubprocessConnection:
         try:
             async with proc:
                 async with anyio.create_task_group() as tg:
-                    tg.start_soon(self._notification_worker)
                     tg.start_soon(self._stdout_reader, proc, tg)
                     tg.start_soon(self._stderr_reader, proc)
                     tg.start_soon(self._shutdown_watcher, proc, tg)
@@ -1239,30 +1241,78 @@ class _AcpSubprocessConnection:
         except anyio.BrokenResourceError, anyio.ClosedResourceError, OSError:
             pass
         finally:
-            with contextlib.suppress(Exception):
-                self._notif_send.close()
+            self._close_all_session_queues()
             _, eof_err = self._format_stderr_error("agy acp stdout closed unexpectedly")
             self._fail_pending(eof_err)
             self._shutdown_event.set()
 
-    def _begin_frame(self) -> None:
+    @staticmethod
+    def _extract_frame_session_id(msg: Mapping[str, Any]) -> str:
+        params = msg.get("params")
+        if isinstance(params, Mapping):
+            sid = params.get("sessionId")
+            if isinstance(sid, str):
+                return sid.strip()
+        return ""
+
+    def _begin_frame(self, session_id: str = "") -> None:
         if self._inflight_frames == 0:
             self._idle_event = anyio.Event()
         self._inflight_frames += 1
+        if session_id:
+            prev = self._session_inflight.get(session_id, 0)
+            if prev == 0:
+                self._session_idle_events[session_id] = anyio.Event()
+            self._session_inflight[session_id] = prev + 1
 
-    def _finish_frame(self) -> None:
+    def _finish_frame(self, session_id: str = "") -> None:
         self._inflight_frames = max(0, self._inflight_frames - 1)
         if self._inflight_frames == 0:
             self._idle_event.set()
+        if session_id:
+            remaining = max(0, self._session_inflight.get(session_id, 0) - 1)
+            if remaining == 0:
+                self._session_inflight.pop(session_id, None)
+                ev = self._session_idle_events.pop(session_id, None)
+                if ev is not None:
+                    ev.set()
+            else:
+                self._session_inflight[session_id] = remaining
 
-    async def wait_idle(self) -> None:
-        """Wait until all inbound notifications and server requests received so far finish."""
+    def close_session_queue(self, session_id: str) -> None:
+        """Close and drop the per-session notification queue when a shared session closes."""
+        if not session_id:
+            return
+        send_stream = self._session_notif_sends.pop(session_id, None)
+        if send_stream is not None:
+            with contextlib.suppress(Exception):
+                send_stream.close()
+
+    def _close_all_session_queues(self) -> None:
+        for send_stream in list(self._session_notif_sends.values()):
+            with contextlib.suppress(Exception):
+                send_stream.close()
+        self._session_notif_sends.clear()
+
+    async def wait_idle(self, session_id: str | None = None) -> None:
+        """Wait until inbound notifications/requests for `session_id` (or all) finish."""
+        if session_id:
+            while self._session_inflight.get(session_id, 0) > 0:
+                ev = self._session_idle_events.get(session_id)
+                if ev is None:
+                    break
+                await ev.wait()
+            return
         while self._inflight_frames > 0:
             await self._idle_event.wait()
 
-    async def _notification_worker(self) -> None:
-        with self._notif_recv:
-            async for msg in self._notif_recv:
+    async def _session_notification_worker(
+        self,
+        session_id: str,
+        recv_stream: MemoryObjectReceiveStream[dict[str, Any]],
+    ) -> None:
+        with recv_stream:
+            async for msg in recv_stream:
                 try:
                     await self._on_notification(self, msg)
                 except Exception as exc:
@@ -1272,9 +1322,9 @@ class _AcpSubprocessConnection:
                         error=str(exc),
                     )
                 finally:
-                    self._finish_frame()
+                    self._finish_frame(session_id)
 
-    async def _run_server_request(self, msg: dict[str, Any]) -> None:
+    async def _run_server_request(self, msg: dict[str, Any], session_id: str) -> None:
         try:
             await self._on_server_request(self, msg)
         except Exception as exc:
@@ -1284,10 +1334,10 @@ class _AcpSubprocessConnection:
                 error=str(exc),
             )
         finally:
-            self._finish_frame()
+            self._finish_frame(session_id)
 
     def _route_frame(self, msg: dict[str, Any], tg: anyio.abc.TaskGroup) -> None:
-        """Dispatch JSON-RPC responses immediately, FIFO notifications, and async server RPCs."""
+        """Dispatch responses immediately, per-session FIFO notifications, and async RPCs."""
         has_method = isinstance(msg.get("method"), str) and bool(msg["method"])
         if not has_method and "id" in msg and ("result" in msg or "error" in msg):
             slot = self._pending.get(msg["id"])
@@ -1296,9 +1346,10 @@ class _AcpSubprocessConnection:
                 slot.event.set()
             return
 
+        frame_sid = self._extract_frame_session_id(msg)
         if has_method and "id" in msg:
-            self._begin_frame()
-            tg.start_soon(self._run_server_request, msg)
+            self._begin_frame(frame_sid)
+            tg.start_soon(self._run_server_request, msg, frame_sid)
             return
 
         if has_method:
@@ -1306,11 +1357,18 @@ class _AcpSubprocessConnection:
                 return
             if self._accept_notification is not None and not self._accept_notification(msg):
                 return
-            self._begin_frame()
+            send_stream = self._session_notif_sends.get(frame_sid)
+            if send_stream is None:
+                send_stream, recv_stream = anyio.create_memory_object_stream[dict[str, Any]](
+                    math.inf
+                )
+                self._session_notif_sends[frame_sid] = send_stream
+                tg.start_soon(self._session_notification_worker, frame_sid, recv_stream)
+            self._begin_frame(frame_sid)
             try:
-                self._notif_send.send_nowait(msg)
+                send_stream.send_nowait(msg)
             except anyio.BrokenResourceError, anyio.ClosedResourceError, anyio.WouldBlock:
-                self._finish_frame()
+                self._finish_frame(frame_sid)
 
 
 class AgyAcpClientProvider:
@@ -1799,11 +1857,11 @@ class AgyAcpClientProvider:
                 profile_key=profile_key,
                 lazy_mcp_config=lazy_mcp_config,
             )
-        await conn.wait_idle()
         sid = str(res.get("sessionId") or (agy_session_id or "")).strip()
         if not sid:
             err_code = -32002 if effective_method in {"session/load", "session/resume"} else -32603
             raise AgyAcpRpcError(err_code, f"{effective_method} returned empty sessionId")
+        await conn.wait_idle(sid)
 
         self._session_profiles[sid] = (profile_key, lazy_mcp_config)
         conn.loaded_sessions.add(sid)
@@ -1822,7 +1880,7 @@ class AgyAcpClientProvider:
             effort=effort,
             available_models=models,
         )
-        await conn.wait_idle()
+        await conn.wait_idle(sid)
         conn.session_prefs[sid] = (model or "", mode, effort or "")
         conn.session_dirs[sid] = tuple(clean_dirs)
         extracted_tier = self._extract_tier(res)
@@ -1954,13 +2012,16 @@ class AgyAcpClientProvider:
         self.evict_backend_session(agy_session_id)
         if conn is None or conn.is_closed:
             return {}
-        with contextlib.suppress(AgyAcpError, TimeoutError, OSError):
-            return await conn.request(
-                "session/close",
-                {"sessionId": agy_session_id},
-                timeout=10.0,
-            )
-        return {}
+        try:
+            with contextlib.suppress(AgyAcpError, TimeoutError, OSError):
+                return await conn.request(
+                    "session/close",
+                    {"sessionId": agy_session_id},
+                    timeout=10.0,
+                )
+            return {}
+        finally:
+            conn.close_session_queue(agy_session_id)
 
     def is_turn_active(self, session_id: str) -> bool:
         """Return whether `session_id` currently has an active `stream_prompt` turn."""
@@ -2132,11 +2193,20 @@ class AgyAcpClientProvider:
             dec_event.set()
             return turn.skip_permissions, turn.interrupt_event.is_set()
 
-        result_holder: dict[str, bool] = {"allowed": False, "interrupted": False}
+        result_holder: dict[str, Any] = {
+            "allowed": False,
+            "interrupted": False,
+            "rejection_reason": "",
+        }
 
         async def _run_callback(tg: anyio.abc.TaskGroup) -> None:
             try:
-                result_holder["allowed"] = bool(await tool_cb(event))
+                raw_decision = await tool_cb(event)
+                if isinstance(raw_decision, ToolPermissionDecision):
+                    result_holder["allowed"] = raw_decision.allowed
+                    result_holder["rejection_reason"] = raw_decision.rejection_reason
+                else:
+                    result_holder["allowed"] = bool(raw_decision)
             except Exception as exc:
                 log_acp_event(
                     "agy_acp.tool_callback_error",
@@ -2158,18 +2228,33 @@ class AgyAcpClientProvider:
                 race_tg.start_soon(_run_callback, race_tg)
                 race_tg.start_soon(_watch_interrupt, race_tg)
         finally:
-            turn.decisions[tc_id] = result_holder["allowed"]
+            turn.decisions[tc_id] = bool(result_holder["allowed"])
+            rejection_reason = str(result_holder["rejection_reason"] or "")
+            if not result_holder["allowed"] and rejection_reason:
+                turn.rejection_reasons[tc_id] = rejection_reason
+                log_acp_event(
+                    "agy_acp.tool_rejected",
+                    save_dir_or_db=self._store.db_path,
+                    session_id=turn.session_id,
+                    tool_call_id=tc_id,
+                    rejection_reason=rejection_reason,
+                )
             dec_event.set()
 
-        return result_holder["allowed"], result_holder["interrupted"]
+        return bool(result_holder["allowed"]), bool(result_holder["interrupted"])
 
     @staticmethod
     async def _send_permission_outcome(
         conn: _AcpSubprocessConnection,
         req_id: Any,
         outcome: dict[str, Any],
+        *,
+        rejection_reason: str = "",
     ) -> None:
-        await conn.send_payload({"jsonrpc": "2.0", "id": req_id, "result": {"outcome": outcome}})
+        result: dict[str, Any] = {"outcome": outcome}
+        if rejection_reason and outcome.get("outcome") == "selected":
+            result["_meta"] = {"kiro": {"rejectionReason": rejection_reason}}
+        await conn.send_payload({"jsonrpc": "2.0", "id": req_id, "result": result})
 
     async def _handle_server_request(
         self,
@@ -2240,7 +2325,8 @@ class AgyAcpClientProvider:
                     "optionId": _select_permission_option_id(options, allow=allowed),
                 }
             )
-            await self._send_permission_outcome(conn, req_id, outcome)
+            reason = "" if (allowed or interrupted) else turn.rejection_reasons.get(tc_id, "")
+            await self._send_permission_outcome(conn, req_id, outcome, rejection_reason=reason)
         except AgyAcpError:
             pass
         except Exception as exc:
@@ -2394,13 +2480,19 @@ class AgyAcpClientProvider:
         tc_id: str,
         event: ToolCallEvent,
     ) -> None:
+        reason = turn.rejection_reasons.get(tc_id, "")
+        output = (
+            f"The user rejected this tool call: {reason}"
+            if reason
+            else "Tool execution rejected by policy."
+        )
         await cls._emit_terminal_tool_update(
             turn,
             tc_id,
             replace(
                 event,
                 status="failed",
-                output="Tool execution rejected by policy.",
+                output=output,
                 diff_content=[],
             ),
         )
@@ -2517,7 +2609,8 @@ class AgyAcpClientProvider:
         env: Mapping[str, str] | None = None,
         on_thought: Callable[[str], Awaitable[None]] | None = None,
         on_text: Callable[[str], Awaitable[None]] | None = None,
-        on_tool_call: Callable[[ToolCallEvent], Awaitable[bool]] | None = None,
+        on_tool_call: Callable[[ToolCallEvent], Awaitable[bool | ToolPermissionDecision]]
+        | None = None,
         on_tool_update: Callable[[ToolCallEvent], Awaitable[None]] | None = None,
         on_usage: Callable[[int], Awaitable[None]] | None = None,
         on_steer_consumed: Callable[[str], Awaitable[None]] | None = None,
@@ -2586,7 +2679,7 @@ class AgyAcpClientProvider:
                     outcome_error = str(exc)
                     break
 
-                await conn.wait_idle()
+                await conn.wait_idle(resolved_agy_sid)
                 self._session_to_agy_sid[sid] = resolved_agy_sid
                 turn_state = _ActiveTurnState(
                     session_id=sid,
@@ -2624,7 +2717,7 @@ class AgyAcpClientProvider:
                     outcome_error = exc.rpc_message
                 finally:
                     with anyio.move_on_after(1.0):
-                        await conn.wait_idle()
+                        await conn.wait_idle(resolved_agy_sid)
                         await turn_state.drained_event.wait()
                     flush_tok = otel_context.attach(turn_state.otel_ctx)
                     try:

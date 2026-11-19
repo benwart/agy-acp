@@ -28,6 +28,7 @@ from agy_acp.logic.tool_classifier import (
     PER_SESSION_MCP_ENV_KEYS,
     VALID_EFFORTS,
     ToolCallEvent,
+    ToolPermissionDecision,
     _dedupe_mcp_servers,
     _pairs_to_dict,
     resolve_model_for_effort,
@@ -1506,7 +1507,8 @@ class SessionManager:
         prompt_blocks: list[dict[str, Any]],
         on_thought: Callable[[str], Awaitable[None]] | None = None,
         on_text: Callable[[str], Awaitable[None]] | None = None,
-        on_tool_call: Callable[[ToolCallEvent], Awaitable[bool]] | None = None,
+        on_tool_call: Callable[[ToolCallEvent], Awaitable[bool | ToolPermissionDecision]]
+        | None = None,
         on_tool_update: Callable[[ToolCallEvent], Awaitable[None]] | None = None,
         on_usage: Callable[[int], Awaitable[None]] | None = None,
         on_steer_consumed: Callable[[str], Awaitable[None]] | None = None,

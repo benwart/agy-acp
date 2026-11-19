@@ -215,6 +215,30 @@ class ToolCallEvent:
                 object.__setattr__(self, "kas_builtin_id", "run_command")
 
 
+REJECTION_REASON_MAX_CHARS: int = 1000
+
+
+def sanitize_rejection_reason(value: object) -> str:
+    """Clean a KAS `_meta.kiro.rejectionReason`, returning `""` if invalid or > 1000 chars."""
+    if not isinstance(value, str):
+        return ""
+    cleaned = "".join(
+        ch for ch in value if ch in "\n\t" or not (ord(ch) < 0x20 or 0x7F <= ord(ch) < 0xA0)
+    ).strip()
+    return cleaned if len(cleaned) <= REJECTION_REASON_MAX_CHARS else ""
+
+
+@dataclass(frozen=True)
+class ToolPermissionDecision:
+    """Outcome of a tool permission check, carrying optional KAS `rejectionReason`."""
+
+    allowed: bool
+    rejection_reason: str = ""
+
+    def __bool__(self) -> bool:
+        return self.allowed
+
+
 @dataclass(frozen=True)
 class PromptOutcome:
     """Result of executing a streaming prompt turn via the `agy` CLI."""
