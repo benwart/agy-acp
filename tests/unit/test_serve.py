@@ -13,7 +13,12 @@ import pytest
 from agy_acp.commands.serve import normalize_agent_engine, run_stdio_server
 from agy_acp.logic.quota_tracker import QuotaTracker
 from agy_acp.logic.session_manager import SessionManager
-from agy_acp.logic.tool_classifier import FALLBACK_MODELS, PromptOutcome, ToolCallEvent
+from agy_acp.logic.tool_classifier import (
+    FALLBACK_MODELS,
+    PromptOutcome,
+    ToolCallEvent,
+    ToolPermissionDecision,
+)
 from agy_acp.logic.wire import create_wire_adapter
 from agy_acp.providers.agy_acp_client import AgyAcpClientProvider
 from agy_acp.providers.quota_provider import QuotaProvider
@@ -71,7 +76,8 @@ class _ServeStubCliProvider(AgyAcpClientProvider):
         prompt: str = "",
         session_id: str | None = None,
         conversation_id: str | None = None,
-        on_tool_call: Callable[[ToolCallEvent], Awaitable[bool]] | None = None,
+        on_tool_call: Callable[[ToolCallEvent], Awaitable[bool | ToolPermissionDecision]]
+        | None = None,
         **kwargs: Any,
     ) -> PromptOutcome:
         _ = (cwd, session_id, kwargs)
@@ -92,7 +98,7 @@ class _ServeStubCliProvider(AgyAcpClientProvider):
                 )
             )
             if self._permission_outcomes is not None:
-                self._permission_outcomes.append(allowed)
+                self._permission_outcomes.append(bool(allowed))
         return PromptOutcome(
             conversation_id=conversation_id or "conv-serve-1",
             stop_reason="end_turn",

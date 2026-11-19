@@ -37,8 +37,10 @@ from agy_acp.logic.session_manager import DEFAULT_MODEL_ID, SessionManager
 from agy_acp.logic.tool_classifier import (
     PATH_ARGUMENT_KEYS,
     ToolCallEvent,
+    ToolPermissionDecision,
     _extract_first_str,
     match_mcp_server_prefix,
+    sanitize_rejection_reason,
 )
 from agy_acp.logic.wire import (
     EngineWireAdapter,
@@ -94,6 +96,9 @@ _FS_TOOL_IDS: frozenset[str] = frozenset(
         "edit",
     }
 )
+_POLICY_ALIAS_DENY_ONLY_IDS: frozenset[str] = frozenset(
+    {"delete_file", "control_bash_process", "control_pwsh_process"}
+)
 _TOOL_CAPABILITY_ALIASES: dict[str, tuple[str, ...]] = {
     "read_file": ("fs_read", "read"),
     "list_directory": ("fs_read", "read"),
@@ -103,6 +108,8 @@ _TOOL_CAPABILITY_ALIASES: dict[str, tuple[str, ...]] = {
     "str_replace": ("fs_write", "write", "edit"),
     "fs_append": ("fs_write", "write"),
     "run_command": ("execute_bash", "shell", "bash"),
+    "control_bash_process": ("execute_bash", "shell", "bash"),
+    "control_pwsh_process": ("execute_bash", "shell", "bash"),
     "remote_web_search": ("web_search",),
     "invoke_sub_agent": ("use_subagent", "subagent"),
 }
@@ -243,9 +250,12 @@ def _matches_agent_tool_list(
                 f"mcp_{norm.mcp_server}_{norm.mcp_tool}",
             }
         )
-    elif for_allowlist and (norm.kas_tool_id == "delete_file" or norm.kind == "delete"):
-        # POLICY_ALIAS_DENY_ONLY_IDS: `fs_write` / `write` MUST NEVER auto-approve `delete_file`.
-        candidates.update({"delete_file", "builtin"})
+    elif for_allowlist and (
+        norm.kas_tool_id in _POLICY_ALIAS_DENY_ONLY_IDS or norm.kind == "delete"
+    ):
+        # POLICY_ALIAS_DENY_ONLY_IDS: family aliases (`fs_write`, `execute_bash`) MUST NEVER
+        # auto-approve `delete_file`, `control_bash_process`, or `control_pwsh_process`.
+        candidates.update({norm.kas_tool_id, "builtin"})
     else:
         candidates.update({norm.kas_tool_id, norm.kiro_v2_tool_name, "builtin"})
         candidates.update(_TOOL_CAPABILITY_ALIASES.get(norm.kas_tool_id, ()))
@@ -918,22 +928,38 @@ class AcpDispatcher:
             return "allow"
         return "allow" if perm_decision == "allow" else "ask"
 
+    @staticmethod
+    def _extract_rejection_reason(perm_response: Any) -> str:
+        """Extract and sanitize `_meta.kiro.rejectionReason` from a permission response."""
+        if not isinstance(perm_response, Mapping):
+            return ""
+        meta = perm_response.get("_meta")
+        if not isinstance(meta, Mapping):
+            return ""
+        kiro_meta = meta.get("kiro")
+        if not isinstance(kiro_meta, Mapping):
+            return ""
+        return sanitize_rejection_reason(kiro_meta.get("rejectionReason"))
+
     async def _request_client_permission(
         self,
         session_id: str,
         perm_params: dict[str, Any],
-    ) -> bool:
+    ) -> ToolPermissionDecision:
         """Prompt the ACP client for tool approval, failing closed when headless or rejected."""
         if self._client_rpc_caller is None:
-            return False
+            return ToolPermissionDecision(allowed=False)
 
         perm_response = await self._client_rpc_caller("session/request_permission", perm_params)
         outcome = perm_response.get("outcome") if isinstance(perm_response, dict) else None
         if isinstance(outcome, dict) and outcome.get("outcome") == "cancelled":
             await self._session_manager.cancel(session_id=session_id)
-            return False
+            return ToolPermissionDecision(allowed=False)
         selected_option = outcome.get("optionId") if isinstance(outcome, dict) else None
-        return selected_option in {"allow_once", "allow_always"}
+        if selected_option in {"allow_once", "allow_always"}:
+            return ToolPermissionDecision(allowed=True)
+        reason = self._extract_rejection_reason(perm_response)
+        return ToolPermissionDecision(allowed=False, rejection_reason=reason)
 
     async def _authorize_tool_call(
         self,
@@ -941,7 +967,7 @@ class AcpDispatcher:
         session: Mapping[str, Any],
         norm: NormalizedToolEvent,
         perm_params_factory: Callable[[], dict[str, Any]],
-    ) -> bool:
+    ) -> ToolPermissionDecision:
         """Evaluate customAgent/session permissions and prompt client only on `ask`."""
         telemetry = get_telemetry(self._session_manager.state_store.db_path)
         decision = self._evaluate_tool_permission(
@@ -952,16 +978,16 @@ class AcpDispatcher:
         )
         if decision == "allow":
             telemetry.record_tool_permission(norm.kind, outcome="auto_allow")
-            return True
+            return ToolPermissionDecision(allowed=True)
         if decision == "deny":
             telemetry.record_tool_permission(norm.kind, outcome="policy_deny")
-            return False
-        client_allowed = await self._request_client_permission(session_id, perm_params_factory())
+            return ToolPermissionDecision(allowed=False)
+        client_decision = await self._request_client_permission(session_id, perm_params_factory())
         telemetry.record_tool_permission(
             norm.kind,
-            outcome="user_allow" if client_allowed else "user_deny",
+            outcome="user_allow" if client_decision.allowed else "user_deny",
         )
-        return client_allowed
+        return client_decision
 
     async def _emit_turn_telemetry_frames(
         self,
@@ -1025,7 +1051,7 @@ class AcpDispatcher:
         event: ToolCallEvent,
         *,
         emit_start: bool = True,
-    ) -> bool:
+    ) -> ToolPermissionDecision:
         session = self._session_manager.state_store.get_session(session_id) or {}
         known_mcp = self._session_manager.get_session_mcp_server_names(session_id)
         norm = _to_normalized_tool_event(event, known_mcp_servers=known_mcp)
@@ -1046,7 +1072,7 @@ class AcpDispatcher:
         event: ToolCallEvent,
         *,
         emit_start: bool = True,
-    ) -> bool:
+    ) -> ToolPermissionDecision:
         session = self._session_manager.state_store.get_session(session_id) or {}
         known_mcp = self._session_manager.get_session_mcp_server_names(session_id)
         norm = _to_normalized_tool_event(event, known_mcp_servers=known_mcp)
@@ -1302,7 +1328,7 @@ class AcpDispatcher:
         announced_tool_ids: set[str] = set()
         persisted_prompt_blocks: list[dict[str, Any]] = list(prompt_blocks)
 
-        async def _on_tool_call(event: ToolCallEvent) -> bool:
+        async def _on_tool_call(event: ToolCallEvent) -> bool | ToolPermissionDecision:
             first_announce = event.tool_call_id not in announced_tool_ids
             announced_tool_ids.add(event.tool_call_id)
             if first_announce:
@@ -1317,16 +1343,23 @@ class AcpDispatcher:
                     parent_context=turn_otel_ctx,
                 )
                 await _flush_stream_before_boundary()
-            if self._wire_adapter.engine_id == "v3":
-                return await self._handle_v3_tool_call(
+            decision = (
+                await self._handle_v3_tool_call(
                     session_id,
                     event,
                     emit_start=first_announce,
                 )
-            return await self._handle_v2_tool_call(
-                session_id,
-                event,
-                emit_start=first_announce,
+                if self._wire_adapter.engine_id == "v3"
+                else await self._handle_v2_tool_call(
+                    session_id,
+                    event,
+                    emit_start=first_announce,
+                )
+            )
+            return (
+                decision
+                if (not decision.allowed and decision.rejection_reason)
+                else decision.allowed
             )
 
         async def _on_tool_update(event: ToolCallEvent) -> None:
@@ -2022,6 +2055,19 @@ class AcpDispatcher:
             )
         if cmd_name == "effort":
             level = str(cmd_args.get("level") or cmd_args.get("value") or "medium").strip().lower()
+            supported = self._wire_adapter.supported_effort_levels
+            if level not in supported:
+                choices = ", ".join(supported)
+                err_msg = f"Unsupported effort level '{level}' (expected one of: {choices})"
+                return _jsonrpc_result(
+                    message_id,
+                    {
+                        "success": False,
+                        "message": err_msg,
+                        "text": err_msg,
+                        "stopReason": "end_turn",
+                    },
+                )
             if session_id:
                 try:
                     await self._session_manager.set_config_option(
@@ -2029,11 +2075,23 @@ class AcpDispatcher:
                         config_id=self._wire_adapter.effort_config_id,
                         value=level,
                     )
-                except KeyError, ValueError:
+                except ValueError as exc:
+                    err_msg = str(exc)
+                    return _jsonrpc_result(
+                        message_id,
+                        {
+                            "success": False,
+                            "message": err_msg,
+                            "text": err_msg,
+                            "stopReason": "end_turn",
+                        },
+                    )
+                except KeyError:
                     pass
             msg = f"Reasoning effort set to {level}"
             return _jsonrpc_result(
-                message_id, {"message": msg, "text": msg, "stopReason": "end_turn"}
+                message_id,
+                {"success": True, "message": msg, "text": msg, "stopReason": "end_turn"},
             )
         if cmd_name in {"mcp", "tools"}:
             server_names = (
