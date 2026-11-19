@@ -1,3 +1,10 @@
+## [1.5.0](https://github.com/benwart/agy-acp/compare/v1.4.0...v1.5.0) (2026-11-19)
+
+### Features
+
+* **acp:** sync kiro-cli 3.5.0 and agy 1.5.12 compatibility ([095f219](https://github.com/benwart/agy-acp/commit/095f21946d1cd65fd9373625b65ca9896eeccef8))
+* **acp:** sync kiro-cli 3.5.0 and agy 1.5.12 compatibility ([#10](https://github.com/benwart/agy-acp/issues/10)) ([5743ba6](https://github.com/benwart/agy-acp/commit/5743ba646b293b64a50a64d8dac985ad453f15f6))
+
 ## [1.4.0](https://github.com/benwart/agy-acp/compare/v1.3.1...v1.4.0) (2026-11-18)
 
 ### Features
