@@ -2480,3 +2480,51 @@ for raw in sys.stdin:
         if t["method"] == "session/set_config_option" and t["params"]["configId"] == "thought_level"
     ]
     assert thought_calls == ["xhigh", "xhigh"]
+
+
+def test_resolve_supported_thought_level_maps_max_to_xhigh_when_supported() -> None:
+    """Verify `max` maps to `xhigh` when `agy 1.5.12` advertises `xhigh`, else `high`."""
+    from agy_acp.providers.agy_acp_client import _resolve_supported_thought_level
+
+    opts_with_xhigh = [
+        {
+            "id": "thought_level",
+            "options": [
+                {"value": "low"},
+                {"value": "medium"},
+                {"value": "high"},
+                {"value": "xhigh"},
+            ],
+        }
+    ]
+    opts_without_xhigh = [
+        {
+            "id": "thought_level",
+            "options": [
+                {"value": "low"},
+                {"value": "medium"},
+                {"value": "high"},
+            ],
+        }
+    ]
+    opts_with_max = [
+        {
+            "id": "thought_level",
+            "options": [
+                {"value": "low"},
+                {"value": "medium"},
+                {"value": "high"},
+                {"value": "xhigh"},
+                {"value": "max"},
+            ],
+        }
+    ]
+
+    assert _resolve_supported_thought_level("max", opts_with_xhigh) == "xhigh"
+    assert _resolve_supported_thought_level("xhigh", opts_with_xhigh) == "xhigh"
+    assert _resolve_supported_thought_level("max", opts_without_xhigh) == "high"
+    assert _resolve_supported_thought_level("xhigh", opts_without_xhigh) == "high"
+    assert _resolve_supported_thought_level("max", opts_with_max) == "max"
+    assert _resolve_supported_thought_level("max", None) == "high"
+    assert _resolve_supported_thought_level("xhigh", None) == "high"
+    assert _resolve_supported_thought_level("medium", opts_with_xhigh) == "medium"
