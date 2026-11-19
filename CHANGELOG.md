@@ -1,3 +1,10 @@
+## [1.6.0](https://github.com/benwart/agy-acp/compare/v1.5.0...v1.6.0) (2026-11-19)
+
+### Features
+
+* **acp:** add KiroCrew 0.13.0 KAS deny reason, shared runtime, and effort refusal support ([6780b4b](https://github.com/benwart/agy-acp/commit/6780b4beb07d0c88bf8c47f346b5cfbf1120dcf3))
+* **acp:** add KiroCrew 0.13.0 KAS deny reason, shared runtime, and effort refusal support ([#11](https://github.com/benwart/agy-acp/issues/11)) ([402a40c](https://github.com/benwart/agy-acp/commit/402a40c6566ed038eddc4d099a50a9311ba9fcea))
+
 ## [1.5.0](https://github.com/benwart/agy-acp/compare/v1.4.0...v1.5.0) (2026-11-19)
 
 ### Features
