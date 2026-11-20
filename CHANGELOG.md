@@ -1,3 +1,10 @@
+## [1.6.1](https://github.com/benwart/agy-acp/compare/v1.6.0...v1.6.1) (2026-11-20)
+
+### Bug Fixes
+
+* **mcp:** scrub empty session env placeholders during stdio catalog probing ([7f56753](https://github.com/benwart/agy-acp/commit/7f567532c4c9dbf8e2c2fadfb5d3ecd1dfb86686))
+* **mcp:** scrub empty session env placeholders during stdio catalog probing ([#12](https://github.com/benwart/agy-acp/issues/12)) ([6222a8f](https://github.com/benwart/agy-acp/commit/6222a8fc877f8807804a53f1b3a7edb882ac3cbe))
+
 ## [1.6.0](https://github.com/benwart/agy-acp/compare/v1.5.0...v1.6.0) (2026-11-19)
 
 ### Features
