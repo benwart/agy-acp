@@ -43,6 +43,7 @@ PER_SESSION_MCP_ENV_KEYS: frozenset[str] = frozenset(
         "KIROCREW_HOST_PID",
         "KIROCREW_CHANNEL_ID",
         "KIROCREW_PORT",
+        "KIROCREW_BOUND_PORT",
         "KIROCREW_HOME",
     }
 )

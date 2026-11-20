@@ -423,3 +423,75 @@ async def test_stdio_oversized_content_length_process_group_cleanup_and_error_sc
     assert "TOK999" not in noisy_err
     assert "SECRET_JWT_ABC" not in noisy_err
     assert "MY_SEC_42" not in noisy_err
+
+
+async def test_stdio_probe_scrubs_ambient_and_empty_session_env_vars(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify stdio probing omits empty session_env placeholders and scrubs ambient KiroCrew env."""
+    from agy_acp.logic.session_manager import _extract_session_mcp_env
+    from agy_acp.logic.tool_classifier import PER_SESSION_MCP_ENV_KEYS
+
+    assert "KIROCREW_BOUND_PORT" in PER_SESSION_MCP_ENV_KEYS
+
+    monkeypatch.setenv("KIROCREW_PORT", "9999")
+    monkeypatch.setenv("KIROCREW_SESSION_KEY", "ambient:leaked-session")
+
+    strict_port_script = tmp_path / "strict_port_mcp.py"
+    strict_port_script.write_text(
+        "import json, os, sys\n"
+        "# Mirrors loader_credentials: int(os.environ.get('KIROCREW_PORT', 5476))\n"
+        "port = int(os.environ.get('KIROCREW_PORT', 5476))\n"
+        "bound = os.environ.get('KIROCREW_BOUND_PORT', 'unset')\n"
+        "sess_key = os.environ.get('KIROCREW_SESSION_KEY', 'unset')\n"
+        "for raw in sys.stdin:\n"
+        "    msg = json.loads(raw)\n"
+        "    m = msg.get('method')\n"
+        "    if m == 'initialize':\n"
+        "        pv = msg['params']['protocolVersion']\n"
+        "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': msg['id'], "
+        "'result': {'protocolVersion': pv, 'capabilities': {'tools': {}}}}) + '\\n')\n"
+        "        sys.stdout.flush()\n"
+        "    elif m == 'tools/list':\n"
+        "        desc = f'port={port} bound={bound} key={sess_key}'\n"
+        "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': msg['id'], "
+        "'result': {'tools': [{'name': 'chat_folder_tree', 'description': desc}]}}) + '\\n')\n"
+        "        sys.stdout.flush()\n"
+        "        break\n",
+        encoding="utf-8",
+    )
+
+    server_decl = {
+        "name": "kirocrew-dashboard",
+        "command": sys.executable,
+        "args": ["-u", str(strict_port_script)],
+        "env": [
+            {"name": "KIROCREW_BOUND_PORT", "value": "5476"},
+            {"name": "KIROCREW_SESSION_KEY", "value": "dashboard:slot-1"},
+        ],
+        "_meta": {"kiro": {"versionNegotiation": "legacy"}},
+    }
+    session_env = _extract_session_mcp_env(
+        {"mcp_servers": [server_decl]},
+        session_id="sess-1",
+        state_db_path=tmp_path / "state.db",
+    )
+
+    prober = McpCatalogProber(timeout_secs=5.0)
+    statuses = await prober.probe_servers([server_decl], session_env=session_env, cwd=str(tmp_path))
+    assert len(statuses) == 1
+    assert statuses[0].status == "connected", f"Unexpected probe error: {statuses[0].error}"
+    assert len(statuses[0].tools) == 1
+    assert statuses[0].tools[0].description == "port=5476 bound=5476 key=dashboard:slot-1"
+
+    # Also verify a server declaration with NO env at all does not inherit ambient KIROCREW_* vars
+    bare_decl = {
+        "name": "bare-mcp",
+        "command": sys.executable,
+        "args": ["-u", str(strict_port_script)],
+    }
+    bare_env = _extract_session_mcp_env({"mcp_servers": [bare_decl]}, session_id="sess-2")
+    bare_statuses = await prober.probe_servers([bare_decl], session_env=bare_env, cwd=str(tmp_path))
+    assert bare_statuses[0].status == "connected", f"Unexpected error: {bare_statuses[0].error}"
+    assert bare_statuses[0].tools[0].description == "port=5476 bound=unset key=unset"
