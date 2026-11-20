@@ -19,6 +19,7 @@ import anyio
 from anyio.streams.buffered import BufferedByteReceiveStream
 
 from agy_acp.logic.custom_agents import AgentOrigin
+from agy_acp.logic.tool_classifier import build_scrubbed_subprocess_env
 from agy_acp.logic.wire.base import McpServerStatus, McpToolDef
 from agy_acp.providers.telemetry import get_telemetry
 
@@ -119,6 +120,24 @@ def _normalize_kv_pairs(raw: Any) -> dict[str, str]:
                 out[name] = str(value)
         return out
     return {}
+
+
+def _build_stdio_probe_env(
+    session_env: Mapping[str, str] | None,
+    server_env: Any,
+) -> dict[str, str]:
+    """Build scrubbed child environment omitting empty `session_env` sentinel values."""
+    merged_env = build_scrubbed_subprocess_env()
+    if session_env:
+        for raw_key, raw_val in session_env.items():
+            key = str(raw_key)
+            val = "" if raw_val is None else str(raw_val)
+            if val:
+                merged_env[key] = val
+            else:
+                merged_env.pop(key, None)
+    merged_env.update(_normalize_kv_pairs(server_env))
+    return merged_env
 
 
 def _extract_disabled_tools(server_cfg: Mapping[str, Any]) -> frozenset[str]:
@@ -460,10 +479,7 @@ class McpCatalogProber:
             if isinstance(raw_args, Sequence) and not isinstance(raw_args, (str, bytes))
             else []
         )
-        merged_env = dict(os.environ)
-        if session_env:
-            merged_env.update({str(k): str(v) for k, v in session_env.items()})
-        merged_env.update(_normalize_kv_pairs(server_cfg.get("env")))
+        merged_env = _build_stdio_probe_env(session_env, server_cfg.get("env"))
 
         server_cwd = server_cfg.get("cwd")
         effective_cwd = str(server_cwd) if isinstance(server_cwd, str) and server_cwd else cwd

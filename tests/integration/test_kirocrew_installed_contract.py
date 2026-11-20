@@ -1034,3 +1034,45 @@ async def test_installed_kirocrew_0_13_0_shared_runtime_and_rejection_reason_con
     option_kinds = {opt.get("kind"): opt.get("optionId") for opt in perm_params["options"]}
     assert option_kinds.get("reject_once") == "reject_once"
     await mgr.close()
+
+
+async def test_installed_kirocrew_mcp_dashboard_stdio_probe_succeeds(
+    installed_contract: InstalledKiroCrewContract,
+    tmp_path: Path,
+) -> None:
+    """Verify `probe_session_mcp_servers` connects to real `kirocrew mcp-dashboard`."""
+    _ = installed_contract
+    pkg_dir = _resolve_kirocrew_pkg_dir()
+    kirocrew_bin = pkg_dir.parents[3] / "bin" / "kirocrew"
+    if not kirocrew_bin.is_file():
+        pytest.skip(f"Installed kirocrew binary not found at {kirocrew_bin}")
+
+    v3_adapter = V3KasWireAdapter()
+    store = SqliteStateStoreProvider(tmp_path / "dash_probe.db")
+    mgr = SessionManager(state_store=store, wire_adapter=v3_adapter)
+    try:
+        created = await mgr.create_session(
+            cwd=str(tmp_path),
+            mcp_servers=[
+                {
+                    "name": "kirocrew-dashboard",
+                    "type": "stdio",
+                    "command": str(kirocrew_bin),
+                    "args": ["mcp-dashboard"],
+                    "env": [
+                        {"name": "KIROCREW_BOUND_PORT", "value": "5476"},
+                        {"name": "KIROCREW_SESSION_KEY", "value": "dashboard:test-slot"},
+                    ],
+                    "_meta": {"kiro": {"versionNegotiation": "legacy"}},
+                }
+            ],
+        )
+        sid = str(created["sessionId"])
+        statuses = await mgr.probe_session_mcp_servers(sid)
+        assert len(statuses) == 1
+        assert statuses[0].name == "kirocrew-dashboard"
+        assert statuses[0].status == "connected", f"Probe failed: {statuses[0].error}"
+        tool_names = {t.name for t in statuses[0].tools}
+        assert "chat_folder_tree" in tool_names
+    finally:
+        await mgr.close()
