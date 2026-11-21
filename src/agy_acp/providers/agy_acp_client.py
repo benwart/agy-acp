@@ -2443,6 +2443,8 @@ class AgyAcpClientProvider:
             return
         if tc_id in turn.blocked_subagent_tools:
             return
+        if turn.interrupt_event.is_set() and tc_id not in turn.decision_events:
+            return
 
         perm_ev = turn.perm_arrived_events.setdefault(tc_id, anyio.Event())
 
@@ -2451,7 +2453,7 @@ class AgyAcpClientProvider:
             tc_id,
             replace(event, status="in_progress"),
         )
-        if interrupted and allowed:
+        if interrupted:
             return
 
         if not allowed:

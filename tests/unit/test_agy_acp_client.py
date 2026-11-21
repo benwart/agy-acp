@@ -630,6 +630,69 @@ def handle_prompt(req_id, params: dict) -> None:
         })
         return
 
+    if "PARALLEL_DENY_AND_SIBLINGS" in text:
+        send_frame({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call_search_1",
+                    "name": "search_web",
+                    "args": {"query": "floci aws emulator"},
+                    "status": "in_progress",
+                    "kind": "fetch",
+                    "rawInput": {"query": "floci aws emulator"},
+                },
+            },
+        })
+        send_frame({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call_read_sibling",
+                    "name": "read_file",
+                    "args": {"Path": "/tmp/docs.md"},
+                    "status": "in_progress",
+                    "kind": "read",
+                    "locations": [{"path": "/tmp/docs.md"}],
+                    "rawInput": {"Path": "/tmp/docs.md"},
+                },
+            },
+        })
+        send_frame({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call_mcp_sibling",
+                    "name": "call_mcp_tool",
+                    "args": {"ServerName": "kirocrew-work", "ToolName": "work_ledger_read"},
+                    "status": "in_progress",
+                    "kind": "other",
+                    "rawInput": {"ServerName": "kirocrew-work", "ToolName": "work_ledger_read"},
+                },
+            },
+        })
+        deadline = time.monotonic() + 2.0
+        while sid not in cancelled_sessions and time.monotonic() < deadline:
+            time.sleep(0.01)
+        send_frame({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "stopReason": "cancelled" if sid in cancelled_sessions else "end_turn",
+                "usage": {"inputTokens": 10, "outputTokens": 1, "totalTokens": 11},
+            },
+        })
+        return
+
     if "MULTI_STEP_NO_USAGE_UPDATE" in text:
         send_frame({
             "jsonrpc": "2.0",
@@ -2528,3 +2591,34 @@ def test_resolve_supported_thought_level_maps_max_to_xhigh_when_supported() -> N
     assert _resolve_supported_thought_level("max", None) == "high"
     assert _resolve_supported_thought_level("xhigh", None) == "high"
     assert _resolve_supported_thought_level("medium", opts_with_xhigh) == "medium"
+
+
+async def test_should_only_report_policy_denied_tool_when_sibling_tools_are_interrupted(
+    tmp_path: Path,
+) -> None:
+    """Verify interrupted sibling tools are not misreported in `policy_denied_tools`."""
+    script, state_file = _make_mock_agy(tmp_path)
+    store = SqliteStateStoreProvider(tmp_path / "state")
+
+    async def on_tool_call(ev: ToolCallEvent) -> bool:
+        if ev.kas_builtin_id == "remote_web_search":
+            return False
+        await anyio.sleep(0.2)
+        return True
+
+    async with AgyAcpClientProvider(
+        bin_path=script,
+        state_store=store,
+        env={"MOCK_AGY_STATE_FILE": str(state_file)},
+    ) as client:
+        res = await client.stream_prompt(
+            cwd=str(tmp_path),
+            session_id="sess-parallel-deny",
+            prompt="PARALLEL_DENY_AND_SIBLINGS",
+            on_tool_call=on_tool_call,
+        )
+
+    assert res.stop_reason == "end_turn"
+    assert res.response == "Tool `search_web` is not permitted in this session."
+    assert "read_file" not in res.response
+    assert "call_mcp_tool" not in res.response
