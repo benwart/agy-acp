@@ -739,9 +739,9 @@ async def test_adaptive_initialize_deadline_stretch_and_eviction(tmp_path: Path)
     assert first_slot not in evict_prober._deadline_reaps
 
     # 2. Live stdio behavioral verification:
-    #    - 1st init hangs -> times out at 0.15s, stretches to 0.30s
-    #    - non-timeout failure (JSON-RPC error) -> leaves reap count at 1 (0.30s)
-    #    - 2nd init succeeds (sleeps 0.20s, which only passes because stretched to 0.30s!) -> resets
+    #    - 1st init hangs -> times out at 0.50s, stretches to 1.00s
+    #    - non-timeout failure (JSON-RPC error) -> leaves reap count at 1 (1.00s)
+    #    - 2nd init succeeds (sleeps 0.60s, which only passes because stretched to 1.00s!) -> resets
     #    - tools/list timeout after init succeeds -> does NOT increment reap count
     state_file = tmp_path / "mode.txt"
     adaptive_script = tmp_path / "adaptive_mcp.py"
@@ -761,7 +761,7 @@ async def test_adaptive_initialize_deadline_stretch_and_eviction(tmp_path: Path)
         "            sys.stdout.flush()\n"
         "            break\n"
         "        elif mode == 'slow_init_ok':\n"
-        "            time.sleep(0.20)\n"
+        "            time.sleep(0.60)\n"
         "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': msg['id'], "
         "'result': {'protocolVersion': '2025-03-26', 'capabilities': {'tools': {}}}}) + '\\n')\n"
         "        sys.stdout.flush()\n"
@@ -781,29 +781,29 @@ async def test_adaptive_initialize_deadline_stretch_and_eviction(tmp_path: Path)
         "args": ["-u", str(adaptive_script)],
     }
     slot = _probe_reap_slot("adaptive-srv", sys.executable, ("-u", str(adaptive_script)), "")
-    prober = McpCatalogProber(timeout_secs=0.15)
+    prober = McpCatalogProber(timeout_secs=0.50)
 
     state_file.write_text("hang_init", encoding="utf-8")
     r1 = await prober.probe_server(cfg)
     assert r1.status == "failed"
-    assert "0.15s" in (r1.error or "")
-    assert prober.initialize_timeout_for(slot) == pytest.approx(0.30)
+    assert "0.50s" in (r1.error or "")
+    assert prober.initialize_timeout_for(slot) == pytest.approx(1.00)
 
     # Non-timeout failure must leave reap count unchanged
     state_file.write_text("error_init", encoding="utf-8")
     r_err = await prober.probe_server(cfg)
     assert r_err.status == "failed"
-    assert prober.initialize_timeout_for(slot) == pytest.approx(0.30)
+    assert prober.initialize_timeout_for(slot) == pytest.approx(1.00)
 
-    # Slow init (0.20s) now succeeds under 0.30s stretched deadline and resets reap count
+    # Slow init (0.60s) now succeeds under 1.00s stretched deadline and resets reap count
     state_file.write_text("slow_init_ok", encoding="utf-8")
     r2 = await prober.probe_server(cfg)
     assert r2.status == "connected", f"Expected connected under stretched deadline: {r2.error}"
-    assert prober.initialize_timeout_for(slot) == pytest.approx(0.15)
+    assert prober.initialize_timeout_for(slot) == pytest.approx(0.50)
 
     # tools/list timeout after initialize succeeded does NOT increment reap count
     state_file.write_text("hang_list", encoding="utf-8")
     r3 = await prober.probe_server(cfg)
     assert r3.status == "failed"
-    assert "0.15s" in (r3.error or "")
-    assert prober.initialize_timeout_for(slot) == pytest.approx(0.15)
+    assert "0.50s" in (r3.error or "")
+    assert prober.initialize_timeout_for(slot) == pytest.approx(0.50)
