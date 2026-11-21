@@ -1,3 +1,10 @@
+## [1.7.1](https://github.com/benwart/agy-acp/compare/v1.7.0...v1.7.1) (2026-11-21)
+
+### Bug Fixes
+
+* **acp:** inject disallowed native tools and skip interrupted sibling denials ([#14](https://github.com/benwart/agy-acp/issues/14)) ([0c021b4](https://github.com/benwart/agy-acp/commit/0c021b49a9b504643e8adc90500ed507a349fb9c))
+* **acp:** inject disallowed native tools into system prompt and skip interrupted sibling denials ([9d4884f](https://github.com/benwart/agy-acp/commit/9d4884f7dc90627aa3996eadfe73e28586863571))
+
 ## [1.7.0](https://github.com/benwart/agy-acp/compare/v1.6.1...v1.7.0) (2026-11-21)
 
 ### Features
