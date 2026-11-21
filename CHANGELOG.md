@@ -1,3 +1,10 @@
+## [1.7.0](https://github.com/benwart/agy-acp/compare/v1.6.1...v1.7.0) (2026-11-21)
+
+### Features
+
+* **mcp:** add KiroCrew 0.13.1-rc.1 RFC 9728 OAuth discovery, init deadline stretch, and policy bundle support ([3191591](https://github.com/benwart/agy-acp/commit/3191591da6184a3be7d140f926920996958dc670))
+* **mcp:** add KiroCrew 0.13.1-rc.1 RFC 9728 OAuth discovery, init deadline stretch, and policy bundle support ([#13](https://github.com/benwart/agy-acp/issues/13)) ([02a8384](https://github.com/benwart/agy-acp/commit/02a83840398521c4bd90bc7374831d159b296eae))
+
 ## [1.6.1](https://github.com/benwart/agy-acp/compare/v1.6.0...v1.6.1) (2026-11-20)
 
 ### Bug Fixes
