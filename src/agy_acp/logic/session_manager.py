@@ -165,6 +165,59 @@ def _extract_session_mcp_env(
     return env
 
 
+_NATIVE_TOOL_POLICY_PATTERNS: tuple[tuple[str, frozenset[str]], ...] = (
+    ("run_command", frozenset({"run_command", "execute_bash", "shell", "bash", "builtin"})),
+    ("manage_task", frozenset({"run_command", "execute_bash", "shell", "bash", "builtin"})),
+    ("read_file", frozenset({"read_file", "fs_read", "read", "builtin"})),
+    ("write_file", frozenset({"fs_write", "write", "builtin"})),
+    ("edit_file", frozenset({"str_replace", "fs_write", "write", "edit", "builtin"})),
+    ("search_web", frozenset({"remote_web_search", "web_search", "builtin"})),
+    (
+        "invoke_subagent",
+        frozenset({"invoke_sub_agent", "use_subagent", "subagent", "builtin"}),
+    ),
+    (
+        "define_subagent",
+        frozenset({"invoke_sub_agent", "use_subagent", "subagent", "builtin"}),
+    ),
+    (
+        "manage_subagents",
+        frozenset({"invoke_sub_agent", "use_subagent", "subagent", "builtin"}),
+    ),
+    (
+        "send_message",
+        frozenset({"invoke_sub_agent", "use_subagent", "subagent", "builtin"}),
+    ),
+)
+
+
+def _compute_disallowed_native_tools(session: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return native `agy` built-in tool names blocked by `agentTools` / `agentExcludedTools`."""
+    raw_excluded = session.get("agentExcludedTools")
+    excluded = (
+        {str(t).strip() for t in raw_excluded if isinstance(t, str) and t.strip()}
+        if isinstance(raw_excluded, list)
+        else set()
+    )
+    raw_tools = session.get("agentTools")
+    allowlist = (
+        {str(t).strip() for t in raw_tools if isinstance(t, str) and t.strip()}
+        if isinstance(raw_tools, list)
+        else None
+    )
+    restrict_by_allowlist = allowlist is not None and "*" not in allowlist
+
+    disallowed: list[str] = []
+    for native_name, patterns in _NATIVE_TOOL_POLICY_PATTERNS:
+        if (
+            "*" in excluded
+            or bool(excluded & patterns)
+            or (restrict_by_allowlist and allowlist is not None and not (allowlist & patterns))
+        ):
+            disallowed.append(native_name)
+    return tuple(disallowed)
+
+
 def _build_system_prompt_append(
     session: Mapping[str, Any],
     *,
@@ -190,6 +243,16 @@ def _build_system_prompt_append(
             )
     if _session_has_kirocrew_spawn_run(session) and "[KIROCREW SUBAGENT ROUTING]" not in user_text:
         sections.append(_KIROCREW_SPAWN_ROUTING_DIRECTIVE)
+    disallowed_native = _compute_disallowed_native_tools(session)
+    if disallowed_native and "[DISALLOWED NATIVE TOOLS]" not in user_text:
+        tool_list = ", ".join(f"`{name}`" for name in disallowed_native)
+        sections.append(
+            "[DISALLOWED NATIVE TOOLS]\n"
+            "The following built-in tools are NOT permitted by this agent's policy and will "
+            f"abort the turn if called: {tool_list}.\n"
+            "NEVER call any of these tools. Use only permitted tools and available MCP tools.\n"
+            "[END DISALLOWED NATIVE TOOLS]"
+        )
     return "\n\n".join(sections) if sections else None
 
 

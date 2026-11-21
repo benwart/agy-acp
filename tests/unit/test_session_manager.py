@@ -1358,3 +1358,51 @@ async def test_w4_image_cap_compacted_mandate_reinjection_and_load_evict_close(
         mcp_servers=[{"name": "other-mcp", "command": "echo", "args": []}],
     )
     assert closed_ids == ["agy-next"]
+
+
+def test_should_append_disallowed_native_tools_directive_for_restricted_agent_tools() -> None:
+    """Verify `_build_system_prompt_append` lists blocked built-ins for restricted agents."""
+    from agy_acp.logic.session_manager import _build_system_prompt_append
+
+    conductor_session = {
+        "agentTools": [
+            "execute_bash",
+            "fs_read",
+            "web_fetch",
+            "@kirocrew-core",
+            "@kirocrew-dashboard",
+            "@kirocrew-work",
+        ],
+        "agentExcludedTools": [],
+    }
+    appended = _build_system_prompt_append(conductor_session) or ""
+    assert "[DISALLOWED NATIVE TOOLS]" in appended
+    assert "`search_web`" in appended
+    assert "`write_file`" in appended
+    assert "`edit_file`" in appended
+    assert "`run_command`" not in appended
+    assert "`read_file`" not in appended
+
+
+def test_should_handle_excluded_and_unrestricted_agent_tools_in_system_prompt_append() -> None:
+    """Verify `agentExcludedTools` blocks specific tools while unrestricted agents emit nothing."""
+    from agy_acp.logic.session_manager import _build_system_prompt_append
+
+    excluded_session = {
+        "agentTools": None,
+        "agentExcludedTools": ["web_search"],
+    }
+    appended = _build_system_prompt_append(excluded_session) or ""
+    assert "[DISALLOWED NATIVE TOOLS]" in appended
+    assert "`search_web`" in appended
+    assert "`write_file`" not in appended
+
+    assert _build_system_prompt_append({"agentTools": None, "agentExcludedTools": []}) is None
+    assert _build_system_prompt_append({"agentTools": ["*"], "agentExcludedTools": []}) is None
+    assert (
+        _build_system_prompt_append(
+            excluded_session,
+            user_text="already has [DISALLOWED NATIVE TOOLS]",
+        )
+        is None
+    )
