@@ -40,10 +40,21 @@ CREW_ONLY_ENTRY_KEYS: frozenset[str] = frozenset(
     {
         "_crewAnsweredBuiltins",
         "_crewAnsweredCommands",
+        "_crewAnsweredHookHeld",
+        "_crewAnsweredWrites",
+        "_crewSpecDenies",
+        "_crewShellUnjudgedDenies",
+        "_crewFolderPreToolHooks",
         "_crewShellAllowlist",
         "_crewWriteAllowlist",
+        "_crewAnsweredPaths",
+        "_crewAnsweredReadPaths",
+        "_crewShellReadonly",
+        "_crewSettingsMcp",
     }
 )
+
+_PERMISSION_BLOCK_KEYS: frozenset[str] = frozenset({"rules", "policies"})
 
 #: Reserved KAS built-in agent IDs that KiroCrew projects with `-crewmate` or `crew-`.
 KAS_RESERVED_AGENT_IDS: frozenset[str] = frozenset(
@@ -663,7 +674,7 @@ def _extract_non_empty_strs(raw: Any) -> list[str]:
 
 
 def _normalize_permission_rules(raw_permissions: Any) -> list[dict[str, Any]]:
-    """Normalize `{"rules": [...]}` or `[...]` permission policies into canonical rules."""
+    """Normalize `{"rules": [...], "policies": [...]}` or `[...]` permissions into rules."""
     raw_list = (
         raw_permissions.get("rules") if isinstance(raw_permissions, Mapping) else raw_permissions
     )
@@ -780,13 +791,19 @@ def _validate_permissions_structure(raw_permissions: Any) -> None:
     if raw_permissions is None or raw_permissions == {}:
         return
     if isinstance(raw_permissions, dict):
-        if "rules" not in raw_permissions:
-            raise ValueError("'permissions' object must contain a 'rules' list")
-        unknown_keys = set(raw_permissions.keys()) - {"rules"}
+        unknown_keys = set(raw_permissions.keys()) - _PERMISSION_BLOCK_KEYS
         if unknown_keys:
             raise ValueError(f"unsupported keys in 'permissions': {sorted(unknown_keys)!r}")
-        rules = raw_permissions["rules"]
-        if not isinstance(rules, list):
+        if "rules" not in raw_permissions and "policies" not in raw_permissions:
+            raise ValueError("'permissions' object must contain 'rules' or 'policies'")
+        if "policies" in raw_permissions and raw_permissions["policies"] is not None:
+            _validate_str_list_field(raw_permissions["policies"], "permissions.policies")
+        raw_rules = raw_permissions.get("rules")
+        if raw_rules is None:
+            rules: list[Any] = []
+        elif isinstance(raw_rules, list):
+            rules = raw_rules
+        else:
             raise ValueError("'permissions.rules' must be a list")
     elif isinstance(raw_permissions, list):
         rules = raw_permissions

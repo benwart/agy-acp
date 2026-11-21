@@ -495,3 +495,315 @@ async def test_stdio_probe_scrubs_ambient_and_empty_session_env_vars(
     bare_statuses = await prober.probe_servers([bare_decl], session_env=bare_env, cwd=str(tmp_path))
     assert bare_statuses[0].status == "connected", f"Unexpected error: {bare_statuses[0].error}"
     assert bare_statuses[0].tools[0].description == "port=5476 bound=unset key=unset"
+
+
+async def test_bare_401_rfc9728_discovery_and_security_invariants() -> None:
+    """Verify RFC 9728 OAuth metadata discovery on bare 401 and all security negative cases."""
+    from agy_acp import __version__ as agy_version
+    from agy_acp.logic.mcp_catalog_prober import (
+        _is_valid_authorization_server_url,
+        normalized_mcp_endpoint,
+    )
+
+    assert (
+        normalized_mcp_endpoint("HTTPS://Example.COM:443/mcp/?b=2#frag")
+        == "https://example.com/mcp?b=2"
+    )
+    assert normalized_mcp_endpoint("http://Example.COM:80/mcp/") == "http://example.com/mcp"
+    assert (
+        normalized_mcp_endpoint("http://user:pw@Example.COM:8080/mcp/")
+        == "http://user:pw@example.com:8080/mcp"
+    )
+    assert normalized_mcp_endpoint("ftp://example.com/mcp") is None
+    assert normalized_mcp_endpoint("https://example.com:99999/mcp") is None
+    assert normalized_mcp_endpoint(123) is None
+
+    # Non-loopback MCP server strictly requires non-local, non-IP-literal https:// auth server
+    assert _is_valid_authorization_server_url("https://auth.stripe.com", mcp_is_loopback=False)
+    assert not _is_valid_authorization_server_url("http://auth.stripe.com", mcp_is_loopback=False)
+    assert not _is_valid_authorization_server_url("https://127.0.0.1/oauth", mcp_is_loopback=False)
+    assert not _is_valid_authorization_server_url(
+        "https://192.168.1.10/oauth", mcp_is_loopback=False
+    )
+    assert not _is_valid_authorization_server_url(
+        "https://broker.local/oauth", mcp_is_loopback=False
+    )
+    assert _is_valid_authorization_server_url("http://127.0.0.1:9000/oauth", mcp_is_loopback=True)
+    assert not _is_valid_authorization_server_url(
+        "http://evil.example.com/oauth", mcp_is_loopback=True
+    )
+
+    seen_well_known_headers: list[dict[str, str]] = []
+    seen_client_versions: list[str] = []
+
+    class _Rfc9728Handler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+            _ = (format, args)
+
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+            if body.get("method") == "initialize":
+                seen_client_versions.append(
+                    str((body.get("params") or {}).get("clientInfo", {}).get("version", ""))
+                )
+            # All endpoints respond with bare 401 (no WWW-Authenticate, no auth URL in body)
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"error": "unauthorized"}')
+
+        def do_GET(self) -> None:
+            seen_well_known_headers.append({k.lower(): v for k, v in self.headers.items()})
+            assert isinstance(self.server, HTTPServer)
+            srv_port = self.server.server_port
+            origin = f"http://127.0.0.1:{srv_port}"
+            if self.path == "/.well-known/oauth-protected-resource/mcp":
+                self._send_json(
+                    {
+                        "resource": f"{origin}/mcp/",
+                        "authorization_servers": ["https://auth.example.com/path-inserted"],
+                    }
+                )
+                return
+            if self.path == "/.well-known/oauth-protected-resource/root-fallback":
+                self.send_response(404)
+                self.end_headers()
+                return
+            if self.path == "/.well-known/oauth-protected-resource":
+                # Resource list contains root-fallback (matching) and /other (sibling)
+                self._send_json(
+                    {
+                        "resource": [f"{origin}/other", f"{origin}/root-fallback"],
+                        "authorization_servers": [f"http://127.0.0.1:{srv_port}/as"],
+                    }
+                )
+                return
+            if self.path == "/.well-known/oauth-protected-resource/redirect-case":
+                self.send_response(302)
+                self.send_header("Location", "/.well-known/oauth-protected-resource/mcp")
+                self.end_headers()
+                return
+            if self.path == "/.well-known/oauth-protected-resource/oversized-case":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                padding = "x" * (17 * 1024)
+                payload = json.dumps(
+                    {
+                        "resource": f"{origin}/oversized-case",
+                        "authorization_servers": ["https://auth.example.com/oversized"],
+                        "pad": padding,
+                    }
+                ).encode("utf-8")
+                self.wfile.write(payload)
+                return
+            if self.path == "/.well-known/oauth-protected-resource/bad-query":
+                self._send_json(
+                    {
+                        "resource": f"{origin}/bad-query",
+                        "authorization_servers": ["https://auth.example.com/as?evil=1"],
+                    }
+                )
+                return
+            if self.path == "/.well-known/oauth-protected-resource/bad-frag":
+                self._send_json(
+                    {
+                        "resource": f"{origin}/bad-frag",
+                        "authorization_servers": ["https://auth.example.com/as#frag"],
+                    }
+                )
+                return
+            if self.path == "/.well-known/oauth-protected-resource/bad-userinfo":
+                self._send_json(
+                    {
+                        "resource": f"{origin}/bad-userinfo",
+                        "authorization_servers": ["https://user:pass@auth.example.com/as"],
+                    }
+                )
+                return
+            self.send_response(404)
+            self.end_headers()
+
+        def _send_json(self, doc: dict[str, Any]) -> None:
+            raw = json.dumps(doc).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(raw)
+
+    httpd = HTTPServer(("127.0.0.1", 0), _Rfc9728Handler)
+    port = httpd.server_port
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        prober = McpCatalogProber(timeout_secs=5.0)
+        secret_headers = [
+            {"name": "Authorization", "value": "Bearer TOP_SECRET_TOKEN"},
+            {"name": "X-Custom", "value": "SECRET_HEADER"},
+        ]
+        statuses = await prober.probe_servers(
+            [
+                {
+                    "name": "path-inserted",
+                    "url": f"http://127.0.0.1:{port}/mcp",
+                    "headers": secret_headers,
+                },
+                {
+                    "name": "root-fallback",
+                    "url": f"http://127.0.0.1:{port}/root-fallback",
+                    "headers": secret_headers,
+                },
+                {
+                    "name": "sibling-mismatch",
+                    "url": f"http://127.0.0.1:{port}/sibling-unmatched",
+                },
+                {
+                    "name": "redirect-case",
+                    "url": f"http://127.0.0.1:{port}/redirect-case",
+                },
+                {
+                    "name": "oversized-case",
+                    "url": f"http://127.0.0.1:{port}/oversized-case",
+                },
+                {"name": "bad-query", "url": f"http://127.0.0.1:{port}/bad-query"},
+                {"name": "bad-frag", "url": f"http://127.0.0.1:{port}/bad-frag"},
+                {"name": "bad-userinfo", "url": f"http://127.0.0.1:{port}/bad-userinfo"},
+            ]
+        )
+        by_name = {s.name: s for s in statuses}
+
+        assert by_name["path-inserted"].status == "authRequired"
+        assert by_name["path-inserted"].auth_url == "https://auth.example.com/path-inserted"
+
+        assert by_name["root-fallback"].status == "authRequired"
+        assert by_name["root-fallback"].auth_url == f"http://127.0.0.1:{port}/as"
+
+        for rejected in (
+            "sibling-mismatch",
+            "redirect-case",
+            "oversized-case",
+            "bad-query",
+            "bad-frag",
+            "bad-userinfo",
+        ):
+            assert by_name[rejected].status == "authRequired"
+            assert by_name[rejected].auth_url is None, f"Expected None for {rejected}"
+
+        # Custom/secret headers MUST NEVER be forwarded to well-known metadata GETs
+        assert seen_well_known_headers
+        for hdrs in seen_well_known_headers:
+            assert "authorization" not in hdrs
+            assert "x-custom" not in hdrs
+            assert hdrs.get("accept") == "application/json"
+            assert hdrs.get("accept-encoding") == "identity"
+
+        # Verify clientInfo.version matches agy_acp.__version__
+        assert seen_client_versions
+        assert all(v == agy_version for v in seen_client_versions)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+async def test_adaptive_initialize_deadline_stretch_and_eviction(tmp_path: Path) -> None:
+    """Verify 2x initialize deadline stretch, reset on success, non-timeout isolation, and cap."""
+    from agy_acp.logic.mcp_catalog_prober import (
+        INIT_DEADLINE_REAP_KEYS_MAX,
+        INIT_DEADLINE_STRETCH_CAP_SECS,
+        _probe_reap_slot,
+    )
+
+    # 1. Pure formula & eviction cap checks
+    cap_prober = McpCatalogProber(timeout_secs=30.0)
+    s0 = _probe_reap_slot("slow", "cmd", (), "")
+    assert cap_prober.initialize_timeout_for(s0) == 30.0
+    cap_prober._record_initialize_timeout(s0)
+    assert cap_prober.initialize_timeout_for(s0) == 60.0
+    cap_prober._record_initialize_timeout(s0)
+    assert cap_prober.initialize_timeout_for(s0) == INIT_DEADLINE_STRETCH_CAP_SECS
+    cap_prober._record_initialize_timeout(s0)
+    assert cap_prober.initialize_timeout_for(s0) == INIT_DEADLINE_STRETCH_CAP_SECS
+
+    # High base timeout (> 120s) is never lowered
+    high_prober = McpCatalogProber(timeout_secs=180.0)
+    high_prober._record_initialize_timeout(s0)
+    assert high_prober.initialize_timeout_for(s0) == 180.0
+
+    # Evicts oldest slot once exceeding INIT_DEADLINE_REAP_KEYS_MAX (256)
+    evict_prober = McpCatalogProber(timeout_secs=10.0)
+    first_slot = _probe_reap_slot("srv-0", "cmd", (), "")
+    for idx in range(INIT_DEADLINE_REAP_KEYS_MAX + 5):
+        evict_prober._record_initialize_timeout(_probe_reap_slot(f"srv-{idx}", "cmd", (), ""))
+    assert len(evict_prober._deadline_reaps) == INIT_DEADLINE_REAP_KEYS_MAX
+    assert first_slot not in evict_prober._deadline_reaps
+
+    # 2. Live stdio behavioral verification:
+    #    - 1st init hangs -> times out at 0.15s, stretches to 0.30s
+    #    - non-timeout failure (JSON-RPC error) -> leaves reap count at 1 (0.30s)
+    #    - 2nd init succeeds (sleeps 0.20s, which only passes because stretched to 0.30s!) -> resets
+    #    - tools/list timeout after init succeeds -> does NOT increment reap count
+    state_file = tmp_path / "mode.txt"
+    adaptive_script = tmp_path / "adaptive_mcp.py"
+    adaptive_script.write_text(
+        "import json, sys, time\n"
+        "from pathlib import Path\n"
+        f"mode = Path({str(state_file)!r}).read_text(encoding='utf-8').strip()\n"
+        "for raw in sys.stdin:\n"
+        "    msg = json.loads(raw)\n"
+        "    m = msg.get('method')\n"
+        "    if m == 'initialize':\n"
+        "        if mode == 'hang_init':\n"
+        "            time.sleep(5)\n"
+        "        elif mode == 'error_init':\n"
+        "            sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': msg['id'], "
+        "'error': {'code': -32000, 'message': 'init failed'}}) + '\\n')\n"
+        "            sys.stdout.flush()\n"
+        "            break\n"
+        "        elif mode == 'slow_init_ok':\n"
+        "            time.sleep(0.20)\n"
+        "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': msg['id'], "
+        "'result': {'protocolVersion': '2025-03-26', 'capabilities': {'tools': {}}}}) + '\\n')\n"
+        "        sys.stdout.flush()\n"
+        "    elif m == 'tools/list':\n"
+        "        if mode == 'hang_list':\n"
+        "            time.sleep(5)\n"
+        "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': msg['id'], "
+        "'result': {'tools': [{'name': 'ok_tool', 'description': 'ok'}]}}) + '\\n')\n"
+        "        sys.stdout.flush()\n"
+        "        break\n",
+        encoding="utf-8",
+    )
+
+    cfg = {
+        "name": "adaptive-srv",
+        "command": sys.executable,
+        "args": ["-u", str(adaptive_script)],
+    }
+    slot = _probe_reap_slot("adaptive-srv", sys.executable, ("-u", str(adaptive_script)), "")
+    prober = McpCatalogProber(timeout_secs=0.15)
+
+    state_file.write_text("hang_init", encoding="utf-8")
+    r1 = await prober.probe_server(cfg)
+    assert r1.status == "failed"
+    assert "0.15s" in (r1.error or "")
+    assert prober.initialize_timeout_for(slot) == pytest.approx(0.30)
+
+    # Non-timeout failure must leave reap count unchanged
+    state_file.write_text("error_init", encoding="utf-8")
+    r_err = await prober.probe_server(cfg)
+    assert r_err.status == "failed"
+    assert prober.initialize_timeout_for(slot) == pytest.approx(0.30)
+
+    # Slow init (0.20s) now succeeds under 0.30s stretched deadline and resets reap count
+    state_file.write_text("slow_init_ok", encoding="utf-8")
+    r2 = await prober.probe_server(cfg)
+    assert r2.status == "connected", f"Expected connected under stretched deadline: {r2.error}"
+    assert prober.initialize_timeout_for(slot) == pytest.approx(0.15)
+
+    # tools/list timeout after initialize succeeded does NOT increment reap count
+    state_file.write_text("hang_list", encoding="utf-8")
+    r3 = await prober.probe_server(cfg)
+    assert r3.status == "failed"
+    assert "0.15s" in (r3.error or "")
+    assert prober.initialize_timeout_for(slot) == pytest.approx(0.15)

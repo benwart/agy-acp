@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -18,6 +20,7 @@ from typing import Any
 import anyio
 from anyio.streams.buffered import BufferedByteReceiveStream
 
+from agy_acp import __version__ as _AGY_ACP_VERSION
 from agy_acp.logic.custom_agents import AgentOrigin
 from agy_acp.logic.tool_classifier import build_scrubbed_subprocess_env
 from agy_acp.logic.wire.base import McpServerStatus, McpToolDef
@@ -25,7 +28,10 @@ from agy_acp.providers.telemetry import get_telemetry
 
 MCP_PROTOCOL_LATEST = "2025-03-26"
 MCP_PROTOCOL_LEGACY = "2024-11-05"
+INIT_DEADLINE_STRETCH_CAP_SECS = 120.0
+INIT_DEADLINE_REAP_KEYS_MAX = 256
 _MAX_PAGINATION_PAGES = 20
+_MAX_OAUTH_METADATA_BYTES = 16 * 1024
 MAX_HTTP_BYTES = 4 * 1024 * 1024
 MAX_STDIO_CONTENT_LENGTH = 4 * 1024 * 1024
 MAX_STDIO_FRAMES = 256
@@ -33,6 +39,7 @@ MAX_TOOLS_PER_SERVER = 512
 MAX_CONCURRENT_PROBES = 8
 _MAX_HEADER_LINES = 32
 _MAX_ERROR_CHARS = 500
+_LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "localhost", "::1"})
 
 _AUTH_URI_PARAM_RE = re.compile(
     r'(?:authorization_uri|auth_url|oauth_url|resource_metadata)\s*=\s*"([^"]+)"',
@@ -94,6 +101,174 @@ def _build_safe_http_opener() -> urllib.request.OpenerDirector:
     opener.add_handler(urllib.request.HTTPErrorProcessor())
     opener.add_handler(_SafeRedirectHandler())
     return opener
+
+
+def _build_no_redirect_http_opener() -> urllib.request.OpenerDirector:
+    """Build an HTTP/HTTPS-only opener that never follows redirects (for RFC 9728 metadata)."""
+    opener = urllib.request.OpenerDirector()
+    opener.add_handler(urllib.request.HTTPHandler())
+    opener.add_handler(urllib.request.HTTPSHandler())
+    opener.add_handler(urllib.request.HTTPDefaultErrorHandler())
+    opener.add_handler(urllib.request.HTTPErrorProcessor())
+    return opener
+
+
+def normalized_mcp_endpoint(value: object) -> str | None:
+    """Normalize an HTTP/HTTPS MCP endpoint URL per KiroCrew `tool_aliases.normalized_endpoint`."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        parts = urllib.parse.urlsplit(text)
+        port = parts.port
+    except ValueError:
+        return None
+    scheme = parts.scheme.lower()
+    if scheme not in {"http", "https"} or not parts.hostname:
+        return None
+    host = parts.hostname.lower()
+    formatted_host = f"[{host}]" if ":" in host else host
+    default_port = 80 if scheme == "http" else 443
+    port_suffix = f":{port}" if port is not None and port != default_port else ""
+    userinfo = f"{parts.netloc.rsplit('@', 1)[0]}@" if "@" in parts.netloc else ""
+    netloc = f"{userinfo}{formatted_host}{port_suffix}"
+    trimmed_path = parts.path.rstrip("/")
+    return urllib.parse.urlunsplit((scheme, netloc, trimmed_path, parts.query, ""))
+
+
+def _protected_resource_metadata_urls(mcp_url: str) -> list[str]:
+    """Return RFC 9728 §3.1 metadata candidate URLs (path-inserted first, then origin root)."""
+    try:
+        parts = urllib.parse.urlsplit(mcp_url.strip())
+        port = parts.port
+    except ValueError:
+        return []
+    scheme = parts.scheme.lower()
+    if scheme not in {"http", "https"} or not parts.hostname:
+        return []
+    host = parts.hostname.lower()
+    formatted_host = f"[{host}]" if ":" in host else host
+    default_port = 80 if scheme == "http" else 443
+    port_suffix = f":{port}" if port is not None and port != default_port else ""
+    origin = f"{scheme}://{formatted_host}{port_suffix}"
+    trimmed_path = parts.path.rstrip("/")
+    root_url = f"{origin}/.well-known/oauth-protected-resource"
+    if trimmed_path:
+        return [f"{root_url}{trimmed_path}", root_url]
+    return [root_url]
+
+
+def _is_loopback_hostname(hostname: str) -> bool:
+    host = hostname.strip().lower().rstrip(".")
+    return host in _LOOPBACK_HOSTS
+
+
+def _is_valid_authorization_server_url(candidate: object, *, mcp_is_loopback: bool) -> bool:
+    """Validate RFC 9728 `authorization_servers[0]` without dereferencing it."""
+    if not isinstance(candidate, str) or not candidate:
+        return False
+    if any(ord(ch) <= 0x20 or ord(ch) == 0x7F for ch in candidate):
+        return False
+    if "?" in candidate or "#" in candidate:
+        return False
+    try:
+        parts = urllib.parse.urlsplit(candidate)
+        _ = parts.port
+    except ValueError:
+        return False
+    if parts.username is not None or parts.password is not None or "@" in parts.netloc:
+        return False
+    if parts.query or parts.fragment:
+        return False
+    scheme = parts.scheme.lower()
+    hostname = (parts.hostname or "").lower().rstrip(".")
+    if not hostname:
+        return False
+    try:
+        ip_addr = ipaddress.ip_address(hostname)
+    except ValueError:
+        ip_addr = None
+    server_is_loopback = hostname in _LOOPBACK_HOSTS or (
+        ip_addr is not None and ip_addr.is_loopback
+    )
+    if mcp_is_loopback:
+        return scheme == "https" or (scheme == "http" and server_is_loopback)
+    server_is_local = (
+        server_is_loopback
+        or hostname.endswith(".local")
+        or hostname.endswith(".localhost")
+        or ip_addr is not None
+    )
+    return scheme == "https" and not server_is_local
+
+
+def _discover_protected_resource_auth_url(mcp_url: str, timeout_secs: float) -> str | None:
+    """Probe RFC 9728 OAuth Protected Resource Metadata on a bare HTTP 401 response."""
+    expected_resource = normalized_mcp_endpoint(mcp_url)
+    if expected_resource is None:
+        return None
+    try:
+        mcp_host = urllib.parse.urlsplit(mcp_url.strip()).hostname or ""
+    except ValueError:
+        return None
+    mcp_is_loopback = _is_loopback_hostname(mcp_host)
+    meta_timeout = min(max(float(timeout_secs), 0.1), 5.0)
+    opener = _build_no_redirect_http_opener()
+
+    for meta_url in _protected_resource_metadata_urls(mcp_url):
+        request = urllib.request.Request(
+            meta_url,
+            headers={"Accept": "application/json", "Accept-Encoding": "identity"},
+            method="GET",
+        )
+        try:
+            with opener.open(request, timeout=meta_timeout) as resp:
+                if int(resp.status) != 200:
+                    continue
+                content_encoding = (resp.headers.get("Content-Encoding") or "").strip().lower()
+                if content_encoding not in {"", "identity"}:
+                    continue
+                raw = resp.read(_MAX_OAUTH_METADATA_BYTES + 1)
+                if len(raw) > _MAX_OAUTH_METADATA_BYTES:
+                    continue
+                document = json.loads(raw.decode("utf-8"))
+        except (
+            urllib.error.URLError,
+            OSError,
+            TimeoutError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            ValueError,
+        ):
+            continue
+
+        if not isinstance(document, dict):
+            continue
+        raw_resource = document.get("resource")
+        if isinstance(raw_resource, str):
+            resource_entries = [raw_resource]
+        elif isinstance(raw_resource, list) and all(isinstance(v, str) for v in raw_resource):
+            resource_entries = raw_resource
+        else:
+            continue
+        if not any(normalized_mcp_endpoint(v) == expected_resource for v in resource_entries):
+            continue
+
+        servers = document.get("authorization_servers")
+        if not isinstance(servers, list) or not servers:
+            continue
+        candidate = servers[0]
+        if _is_valid_authorization_server_url(candidate, mcp_is_loopback=mcp_is_loopback):
+            return candidate
+    return None
+
+
+def _probe_reap_slot(*identity_parts: object) -> str:
+    """Compute a stable SHA-256 hex digest slot for MCP initialize deadline stretch tracking."""
+    payload = json.dumps(identity_parts, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _extract_version_negotiation(server_cfg: Mapping[str, Any]) -> str:
@@ -227,6 +402,14 @@ class _HttpAuthRequiredError(Exception):
         self.detail = detail
 
 
+class _ProbeTimeoutError(TimeoutError):
+    """Internal timeout carrying the effective timeout duration used for the timed-out phase."""
+
+    def __init__(self, timeout_secs: float) -> None:
+        super().__init__(f"MCP server probe timed out after {timeout_secs:.2f}s")
+        self.timeout_secs = timeout_secs
+
+
 def _post_mcp_http_sync(
     url: str,
     payload: dict[str, Any],
@@ -269,6 +452,8 @@ def _post_mcp_http_sync(
             body_text = body_bytes.decode("utf-8", errors="replace")
             www_auth = exc.headers.get("WWW-Authenticate", "") if exc.headers else ""
             auth_url = _extract_auth_url(www_auth, body_text)
+            if exc.code == 401 and auth_url is None:
+                auth_url = _discover_protected_resource_auth_url(url, timeout_secs)
             raise _HttpAuthRequiredError(
                 exc.code,
                 auth_url,
@@ -318,6 +503,25 @@ class McpCatalogProber:
 
     def __init__(self, *, timeout_secs: float = 10.0) -> None:
         self._timeout_secs = float(timeout_secs)
+        self._deadline_reaps: dict[str, int] = {}
+
+    def initialize_timeout_for(self, slot: str) -> float:
+        """Return effective `initialize` timeout for `slot`, stretching 2x per consecutive reap."""
+        reaps = self._deadline_reaps.get(slot, 0)
+        if reaps <= 0:
+            return self._timeout_secs
+        stretched = min(self._timeout_secs * (2**reaps), INIT_DEADLINE_STRETCH_CAP_SECS)
+        return max(self._timeout_secs, stretched)
+
+    def _record_initialize_timeout(self, slot: str) -> None:
+        reaps = self._deadline_reaps.pop(slot, 0)
+        self._deadline_reaps[slot] = min(reaps + 1, 8)
+        while len(self._deadline_reaps) > INIT_DEADLINE_REAP_KEYS_MAX:
+            oldest_slot = next(iter(self._deadline_reaps))
+            self._deadline_reaps.pop(oldest_slot, None)
+
+    def _clear_initialize_timeout(self, slot: str) -> None:
+        self._deadline_reaps.pop(slot, None)
 
     async def probe_servers(
         self,
@@ -426,13 +630,16 @@ class McpCatalogProber:
                     error="MCP server config specifies neither 'command' nor 'url'",
                     origin=origin,
                 )
-            except TimeoutError:
+            except TimeoutError as exc:
                 result_status = "timeout"
+                timeout_used = (
+                    exc.timeout_secs if isinstance(exc, _ProbeTimeoutError) else self._timeout_secs
+                )
                 return McpServerStatus(
                     name=name,
                     display_name=display_name,
                     status="failed",
-                    error=f"MCP server probe timed out after {self._timeout_secs:.2f}s",
+                    error=f"MCP server probe timed out after {timeout_used:.2f}s",
                     origin=origin,
                 )
             except _HttpAuthRequiredError as auth_err:
@@ -486,79 +693,97 @@ class McpCatalogProber:
         proto_version = _extract_version_negotiation(server_cfg)
         disabled_tools = _extract_disabled_tools(server_cfg)
 
+        slot = _probe_reap_slot(name, command, tuple(args), effective_cwd or "")
+        effective_timeout = self.initialize_timeout_for(slot)
+        init_completed = False
         proc: anyio.abc.Process | None = None
         try:
-            with anyio.fail_after(self._timeout_secs):
-                proc = await anyio.open_process(
-                    [command, *args],
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                    env=merged_env,
-                    cwd=effective_cwd,
-                    start_new_session=True,
-                )
-                assert proc.stdin is not None
-                assert proc.stdout is not None
-                buffered_out = BufferedByteReceiveStream(proc.stdout)
+            try:
+                with anyio.fail_after(effective_timeout):
+                    proc = await anyio.open_process(
+                        [command, *args],
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                        env=merged_env,
+                        cwd=effective_cwd,
+                        start_new_session=True,
+                    )
+                    assert proc.stdin is not None
+                    assert proc.stdout is not None
+                    buffered_out = BufferedByteReceiveStream(proc.stdout)
 
-                req_id = 1
-                init_req = {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "method": "initialize",
-                    "params": {
-                        "protocolVersion": proto_version,
-                        "capabilities": {},
-                        "clientInfo": {"name": "agy-acp", "version": "1.2.0"},
-                    },
-                }
-                await proc.stdin.send((json.dumps(init_req) + "\n").encode("utf-8"))
-                init_resp = await _read_stdio_jsonrpc_response(buffered_out, req_id)
-                if "error" in init_resp:
-                    raise RuntimeError(f"MCP initialize error: {init_resp['error']}")
-
-                initialized_notif = {
-                    "jsonrpc": "2.0",
-                    "method": "notifications/initialized",
-                    "params": {},
-                }
-                await proc.stdin.send((json.dumps(initialized_notif) + "\n").encode("utf-8"))
-
-                discovered: list[McpToolDef] = []
-                cursor: str | None = None
-                for _ in range(_MAX_PAGINATION_PAGES):
-                    req_id += 1
-                    list_params: dict[str, Any] = {"cursor": cursor} if cursor else {}
-                    list_req = {
+                    req_id = 1
+                    init_req = {
                         "jsonrpc": "2.0",
                         "id": req_id,
-                        "method": "tools/list",
-                        "params": list_params,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": proto_version,
+                            "capabilities": {},
+                            "clientInfo": {"name": "agy-acp", "version": _AGY_ACP_VERSION},
+                        },
                     }
-                    await proc.stdin.send((json.dumps(list_req) + "\n").encode("utf-8"))
-                    list_resp = await _read_stdio_jsonrpc_response(buffered_out, req_id)
-                    if "error" in list_resp:
-                        raise RuntimeError(f"MCP tools/list error: {list_resp['error']}")
-                    result = list_resp.get("result")
-                    if not isinstance(result, Mapping):
-                        break
-                    discovered.extend(self._parse_tool_items(result.get("tools"), disabled_tools))
-                    if len(discovered) >= MAX_TOOLS_PER_SERVER:
-                        discovered = discovered[:MAX_TOOLS_PER_SERVER]
-                        break
-                    next_cursor = result.get("nextCursor")
-                    if not isinstance(next_cursor, str) or not next_cursor:
-                        break
-                    cursor = next_cursor
+                    await proc.stdin.send((json.dumps(init_req) + "\n").encode("utf-8"))
+                    init_resp = await _read_stdio_jsonrpc_response(buffered_out, req_id)
+            except TimeoutError as exc:
+                if not init_completed:
+                    self._record_initialize_timeout(slot)
+                raise _ProbeTimeoutError(effective_timeout) from exc
 
-                return McpServerStatus(
-                    name=name,
-                    display_name=display_name,
-                    status="connected",
-                    tools=tuple(discovered),
-                    origin=origin,
-                )
+            if "error" in init_resp:
+                raise RuntimeError(f"MCP initialize error: {init_resp['error']}")
+
+            init_completed = True
+            self._clear_initialize_timeout(slot)
+
+            try:
+                with anyio.fail_after(self._timeout_secs):
+                    initialized_notif = {
+                        "jsonrpc": "2.0",
+                        "method": "notifications/initialized",
+                        "params": {},
+                    }
+                    await proc.stdin.send((json.dumps(initialized_notif) + "\n").encode("utf-8"))
+
+                    discovered: list[McpToolDef] = []
+                    cursor: str | None = None
+                    for _ in range(_MAX_PAGINATION_PAGES):
+                        req_id += 1
+                        list_params: dict[str, Any] = {"cursor": cursor} if cursor else {}
+                        list_req = {
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "method": "tools/list",
+                            "params": list_params,
+                        }
+                        await proc.stdin.send((json.dumps(list_req) + "\n").encode("utf-8"))
+                        list_resp = await _read_stdio_jsonrpc_response(buffered_out, req_id)
+                        if "error" in list_resp:
+                            raise RuntimeError(f"MCP tools/list error: {list_resp['error']}")
+                        result = list_resp.get("result")
+                        if not isinstance(result, Mapping):
+                            break
+                        discovered.extend(
+                            self._parse_tool_items(result.get("tools"), disabled_tools)
+                        )
+                        if len(discovered) >= MAX_TOOLS_PER_SERVER:
+                            discovered = discovered[:MAX_TOOLS_PER_SERVER]
+                            break
+                        next_cursor = result.get("nextCursor")
+                        if not isinstance(next_cursor, str) or not next_cursor:
+                            break
+                        cursor = next_cursor
+
+                    return McpServerStatus(
+                        name=name,
+                        display_name=display_name,
+                        status="connected",
+                        tools=tuple(discovered),
+                        origin=origin,
+                    )
+            except TimeoutError as exc:
+                raise _ProbeTimeoutError(self._timeout_secs) from exc
         finally:
             if proc is not None:
                 with anyio.CancelScope(shield=True):
@@ -586,87 +811,103 @@ class McpCatalogProber:
         proto_version = _extract_version_negotiation(server_cfg)
         disabled_tools = _extract_disabled_tools(server_cfg)
 
-        with anyio.fail_after(self._timeout_secs):
-            req_id = 1
-            init_req = {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": proto_version,
-                    "capabilities": {},
-                    "clientInfo": {"name": "agy-acp", "version": "1.2.0"},
-                },
-            }
-            _, resp_headers, init_resp = await anyio.to_thread.run_sync(
-                lambda: _post_mcp_http_sync(url, init_req, headers, self._timeout_secs),
-                abandon_on_cancel=True,
-            )
-            if init_resp is not None and "error" in init_resp:
-                raise RuntimeError(f"MCP initialize error: {init_resp['error']}")
+        slot = _probe_reap_slot(name, url)
+        effective_timeout = self.initialize_timeout_for(slot)
+        init_completed = False
+        req_id = 1
+        init_req = {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": proto_version,
+                "capabilities": {},
+                "clientInfo": {"name": "agy-acp", "version": _AGY_ACP_VERSION},
+            },
+        }
+        try:
+            with anyio.fail_after(effective_timeout):
+                _, resp_headers, init_resp = await anyio.to_thread.run_sync(
+                    lambda: _post_mcp_http_sync(url, init_req, headers, effective_timeout),
+                    abandon_on_cancel=True,
+                )
+        except TimeoutError as exc:
+            if not init_completed:
+                self._record_initialize_timeout(slot)
+            raise _ProbeTimeoutError(effective_timeout) from exc
 
-            mcp_session_id = resp_headers.get("mcp-session-id")
-            if mcp_session_id:
-                headers = {**headers, "Mcp-Session-Id": mcp_session_id}
+        if init_resp is not None and "error" in init_resp:
+            raise RuntimeError(f"MCP initialize error: {init_resp['error']}")
 
-            initialized_notif = {
-                "jsonrpc": "2.0",
-                "method": "notifications/initialized",
-                "params": {},
-            }
-            await anyio.to_thread.run_sync(
-                lambda: _post_mcp_http_sync(
-                    url,
-                    initialized_notif,
-                    headers,
-                    self._timeout_secs,
-                ),
-                abandon_on_cancel=True,
-            )
+        init_completed = True
+        self._clear_initialize_timeout(slot)
 
-            discovered: list[McpToolDef] = []
-            cursor: str | None = None
-            for _ in range(_MAX_PAGINATION_PAGES):
-                req_id += 1
-                list_params: dict[str, Any] = {"cursor": cursor} if cursor else {}
-                list_req = {
+        try:
+            with anyio.fail_after(self._timeout_secs):
+                mcp_session_id = resp_headers.get("mcp-session-id")
+                if mcp_session_id:
+                    headers = {**headers, "Mcp-Session-Id": mcp_session_id}
+
+                initialized_notif = {
                     "jsonrpc": "2.0",
-                    "id": req_id,
-                    "method": "tools/list",
-                    "params": list_params,
+                    "method": "notifications/initialized",
+                    "params": {},
                 }
-                _, _, list_resp = await anyio.to_thread.run_sync(
-                    lambda req=list_req: _post_mcp_http_sync(
+                await anyio.to_thread.run_sync(
+                    lambda: _post_mcp_http_sync(
                         url,
-                        req,
+                        initialized_notif,
                         headers,
                         self._timeout_secs,
                     ),
                     abandon_on_cancel=True,
                 )
-                if list_resp is None:
-                    break
-                if "error" in list_resp:
-                    raise RuntimeError(f"MCP tools/list error: {list_resp['error']}")
-                result = list_resp.get("result")
-                if not isinstance(result, Mapping):
-                    break
-                discovered.extend(self._parse_tool_items(result.get("tools"), disabled_tools))
-                if len(discovered) >= MAX_TOOLS_PER_SERVER:
-                    discovered = discovered[:MAX_TOOLS_PER_SERVER]
-                    break
-                next_cursor = result.get("nextCursor")
-                if not isinstance(next_cursor, str) or not next_cursor:
-                    break
-                cursor = next_cursor
 
-            return McpServerStatus(
-                name=name,
-                display_name=display_name,
-                status="connected",
-                tools=tuple(discovered),
-                origin=origin,
-            )
+                discovered: list[McpToolDef] = []
+                cursor: str | None = None
+                for _ in range(_MAX_PAGINATION_PAGES):
+                    req_id += 1
+                    list_params: dict[str, Any] = {"cursor": cursor} if cursor else {}
+                    list_req = {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "method": "tools/list",
+                        "params": list_params,
+                    }
+                    _, _, list_resp = await anyio.to_thread.run_sync(
+                        lambda req=list_req: _post_mcp_http_sync(
+                            url,
+                            req,
+                            headers,
+                            self._timeout_secs,
+                        ),
+                        abandon_on_cancel=True,
+                    )
+                    if list_resp is None:
+                        break
+                    if "error" in list_resp:
+                        raise RuntimeError(f"MCP tools/list error: {list_resp['error']}")
+                    result = list_resp.get("result")
+                    if not isinstance(result, Mapping):
+                        break
+                    discovered.extend(self._parse_tool_items(result.get("tools"), disabled_tools))
+                    if len(discovered) >= MAX_TOOLS_PER_SERVER:
+                        discovered = discovered[:MAX_TOOLS_PER_SERVER]
+                        break
+                    next_cursor = result.get("nextCursor")
+                    if not isinstance(next_cursor, str) or not next_cursor:
+                        break
+                    cursor = next_cursor
+
+                return McpServerStatus(
+                    name=name,
+                    display_name=display_name,
+                    status="connected",
+                    tools=tuple(discovered),
+                    origin=origin,
+                )
+        except TimeoutError as exc:
+            raise _ProbeTimeoutError(self._timeout_secs) from exc
 
     @staticmethod
     def _parse_tool_items(raw_tools: Any, disabled_tools: frozenset[str]) -> list[McpToolDef]:
