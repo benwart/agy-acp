@@ -767,3 +767,87 @@ async def test_w4_prompt_file_atomic_regular_cap_and_agent_candidate_containment
 
     dumped = await run_agy_slash_json("/usage", agy_bin=env_dump_bin)
     assert dumped == {"token": None, "route": None, "inspect": None, "startup": None}
+
+
+def test_permissions_policies_bundle_beside_rules_validation_and_eval(tmp_path: Path) -> None:
+    """Verify `permissions.policies` bundle-beside-rules validation and fail-safe evaluation."""
+    from agy_acp.logic.custom_agents import validate_agent_spec_file
+
+    # 1. rules + non-empty policies
+    spec_both = tmp_path / "both.json"
+    spec_both.write_text(
+        json.dumps(
+            {
+                "name": "both-agent",
+                "permissions": {
+                    "policies": ["read-only"],
+                    "rules": [
+                        {"capability": "fs_read", "match": ["src/**"], "effect": "allow"},
+                        {"capability": "fs_write", "match": ["src/secrets/**"], "effect": "deny"},
+                        {"capability": "shell", "match": ["pytest*"], "effect": "ask"},
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    loaded_both = validate_agent_spec_file(spec_both)
+    assert loaded_both.evaluate_permission(capability="fs_read", resource="src/app.py") == "allow"
+    assert (
+        loaded_both.evaluate_permission(capability="fs_write", resource="src/secrets/k.pem")
+        == "deny"
+    )
+    assert loaded_both.evaluate_permission(capability="shell", resource="pytest -q") == "ask"
+    # Capabilities not explicitly granted in `rules` stay fail-safe at `"ask"` despite `policies`
+    assert (
+        loaded_both.evaluate_permission(capability="web_fetch", resource="https://x.com") == "ask"
+    )
+
+    # 2. rules + empty policies list
+    spec_empty_policies = tmp_path / "empty_policies.json"
+    spec_empty_policies.write_text(
+        json.dumps(
+            {
+                "name": "empty-pol",
+                "permissions": {
+                    "rules": [{"capability": "web_search", "effect": "allow"}],
+                    "policies": [],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    loaded_empty_pol = validate_agent_spec_file(spec_empty_policies)
+    assert loaded_empty_pol.evaluate_permission(capability="web_search", resource="q") == "allow"
+
+    # 3. policies-only (no `rules` key)
+    spec_policies_only = tmp_path / "policies_only.json"
+    spec_policies_only.write_text(
+        json.dumps(
+            {
+                "name": "pol-only",
+                "permissions": {"policies": ["dev-shell"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    loaded_pol_only = validate_agent_spec_file(spec_policies_only)
+    assert loaded_pol_only.evaluate_permission(capability="shell", resource="ls") == "ask"
+
+    # 4. Reject malformed `policies` values (`""`, `0`, `[123]`) and unknown keys
+    for idx, bad_perms in enumerate(
+        (
+            {"policies": ""},
+            {"policies": 0},
+            {"policies": [123]},
+            {"rules": [], "policies": "read-only"},
+            {"unknown": []},
+        )
+    ):
+        bad_file = tmp_path / f"bad_pol_{idx}.json"
+        bad_file.write_text(
+            json.dumps({"name": f"bad-{idx}", "permissions": bad_perms}),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError):
+            validate_agent_spec_file(bad_file)

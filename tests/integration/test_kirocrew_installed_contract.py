@@ -46,7 +46,11 @@ def _resolve_kirocrew_pkg_dir() -> Path:
     return pkg_dir
 
 
-def _extract_module_literals(py_file: Path) -> dict[str, Any]:
+def _extract_module_literals(
+    py_file: Path,
+    *,
+    pkg_root: Path | None = None,
+) -> dict[str, Any]:
     """Extract top-level and class-body literal assignments from `py_file` via `ast`."""
     tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
     values: dict[str, Any] = {}
@@ -54,6 +58,12 @@ def _extract_module_literals(py_file: Path) -> dict[str, Any]:
     def _eval_node(node: ast.AST) -> Any:
         if isinstance(node, ast.Name) and node.id in values:
             return values[node.id]
+        if isinstance(node, ast.Set):
+            return {_eval_node(elt) for elt in node.elts}
+        if isinstance(node, ast.Tuple):
+            return tuple(_eval_node(elt) for elt in node.elts)
+        if isinstance(node, ast.List):
+            return [_eval_node(elt) for elt in node.elts]
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             if node.func.id == "frozenset" and len(node.args) == 1:
                 return frozenset(_eval_node(node.args[0]))
@@ -61,7 +71,19 @@ def _extract_module_literals(py_file: Path) -> dict[str, Any]:
 
     def _collect(body: list[ast.stmt], prefix: str = "") -> None:
         for stmt in body:
-            if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+            if (
+                isinstance(stmt, ast.ImportFrom)
+                and pkg_root is not None
+                and stmt.module
+                and stmt.module.startswith("kiro_crew.")
+            ):
+                mod_path = pkg_root.joinpath(*stmt.module.split(".")[1:]).with_suffix(".py")
+                if mod_path.is_file():
+                    imported = _extract_module_literals(mod_path)
+                    for alias in stmt.names:
+                        if alias.name in imported:
+                            values[alias.asname or alias.name] = imported[alias.name]
+            elif isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
                 target = stmt.targets[0]
                 if isinstance(target, ast.Name):
                     try:
@@ -106,6 +128,7 @@ class InstalledKiroCrewContract:
     kas_tool_family_by_kiro_name: dict[str, tuple[str, ...]]
     allowed_tools_builtins: tuple[str, ...]
     policy_alias_deny_only_ids: frozenset[str]
+    crew_only_entry_keys: frozenset[str]
 
 
 @pytest.fixture(scope="module")
@@ -120,6 +143,7 @@ def installed_contract() -> InstalledKiroCrewContract:
     kas_refusal_vals = _extract_module_literals(pkg / "acp" / "kas_engine_refusal.py")
     kas_transport_vals = _extract_module_literals(pkg / "acp" / "kas_transport.py")
     kas_wire_vals = _extract_module_literals(pkg / "acp" / "kas_wire.py")
+    kas_perm_vals = _extract_module_literals(pkg / "acp" / "kas_permissions.py", pkg_root=pkg)
     kiro_harness_vals = _extract_module_literals(pkg / "acp" / "harness" / "kiro.py")
     kas_harness_vals = _extract_module_literals(pkg / "acp" / "harness" / "kas.py")
     types_vals = _extract_module_literals(pkg / "acp" / "types.py")
@@ -221,6 +245,7 @@ def installed_contract() -> InstalledKiroCrewContract:
         kas_tool_family_by_kiro_name=dict(tool_names_vals["KAS_TOOL_FAMILY_BY_KIRO_CLI_NAME"]),
         allowed_tools_builtins=tuple(tool_names_vals["ALLOWED_TOOLS_BUILTINS"]),
         policy_alias_deny_only_ids=frozenset(tool_names_vals["POLICY_ALIAS_DENY_ONLY_IDS"]),
+        crew_only_entry_keys=frozenset(kas_perm_vals["CREW_ONLY_ENTRY_KEYS"]),
     )
 
 
@@ -1076,3 +1101,144 @@ async def test_installed_kirocrew_mcp_dashboard_stdio_probe_succeeds(
         assert "chat_folder_tree" in tool_names
     finally:
         await mgr.close()
+
+
+async def test_installed_kirocrew_crew_only_keys_and_bare_401_reset_server_oauth(
+    installed_contract: InstalledKiroCrewContract,
+    tmp_path: Path,
+) -> None:
+    """Verify `CREW_ONLY_ENTRY_KEYS` superset parity and bare-401 `_kiro/mcp/resetServer` OAuth."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from agy_acp.logic.custom_agents import CREW_ONLY_ENTRY_KEYS
+
+    assert installed_contract.crew_only_entry_keys
+    assert installed_contract.crew_only_entry_keys <= CREW_ONLY_ENTRY_KEYS
+
+    expected_auth_url = "https://oauth.example.com/authorize-mcp"
+
+    class _Bare401McpHandler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+            _ = (format, args)
+
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length > 0:
+                _ = self.rfile.read(length)
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"error": "unauthorized"}')
+
+        def do_GET(self) -> None:
+            if self.path == "/.well-known/oauth-protected-resource":
+                assert isinstance(self.server, HTTPServer)
+                origin = f"http://127.0.0.1:{self.server.server_port}"
+                payload = json.dumps(
+                    {
+                        "resource": f"{origin}/mcp",
+                        "authorization_servers": [expected_auth_url],
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            self.send_response(404)
+            self.end_headers()
+
+    httpd = HTTPServer(("127.0.0.1", 0), _Bare401McpHandler)
+    port = httpd.server_port
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+
+    notifications: list[dict[str, Any]] = []
+    client_rpcs: list[tuple[str, dict[str, Any]]] = []
+
+    async def _sink(frame: dict[str, Any]) -> None:
+        notifications.append(frame)
+
+    async def _client_rpc(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        client_rpcs.append((method, params))
+        return {}
+
+    store = SqliteStateStoreProvider(tmp_path / "bare401_oauth.db")
+    v3_adapter = V3KasWireAdapter()
+    mgr = SessionManager(state_store=store, wire_adapter=v3_adapter)
+    dispatcher = AcpDispatcher(
+        notification_sink=_sink,
+        client_rpc_caller=_client_rpc,
+        session_manager=mgr,
+        wire_adapter=v3_adapter,
+    )
+    try:
+        init_resp = await dispatcher.handle_message(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": installed_contract.kas_v3_protocol_version,
+                        "clientCapabilities": {
+                            "_meta": {"kiro": {"openExternalUrl": True}},
+                        },
+                    },
+                }
+            )
+        )
+        assert init_resp is not None and "result" in init_resp
+
+        new_resp = await dispatcher.handle_message(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "session/new",
+                    "params": {
+                        "cwd": str(tmp_path),
+                        "mcpServers": [
+                            {
+                                "name": "stripe-like",
+                                "url": f"http://127.0.0.1:{port}/mcp",
+                            }
+                        ],
+                    },
+                }
+            )
+        )
+        assert new_resp is not None and "result" in new_resp
+        sid = new_resp["result"]["sessionId"]
+        dispatcher.pop_post_response_notifications()
+        notifications.clear()
+
+        reset_resp = await dispatcher.handle_message(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "_kiro/mcp/resetServer",
+                    "params": {
+                        "sessionId": sid,
+                        "serverName": "stripe-like",
+                        "startOAuth": True,
+                    },
+                }
+            )
+        )
+        assert reset_resp is not None and "result" in reset_resp
+
+        mcp_status_frames = [f for f in notifications if f.get("method") == "_kiro/mcp/status"]
+        assert mcp_status_frames
+        servers = mcp_status_frames[-1]["params"]["servers"]
+        target = next(s for s in servers if s["name"] == "stripe-like")
+        assert target["status"] == "authRequired"
+        assert target["authUrl"] == expected_auth_url
+
+        assert ("_kiro/openExternalUrl", {"url": expected_auth_url}) in client_rpcs
+    finally:
+        await mgr.close()
+        httpd.shutdown()
+        httpd.server_close()
