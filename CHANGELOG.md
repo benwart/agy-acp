@@ -1,3 +1,10 @@
+## [1.9.1](https://github.com/benwart/agy-acp/compare/v1.9.0...v1.9.1) (2026-11-22)
+
+### Bug Fixes
+
+* **acp:** terminate nothing_to_do turns cleanly and self-heal disallowed native tool calls ([10c7d4b](https://github.com/benwart/agy-acp/commit/10c7d4bb61a7bd713ca61d885fd3d0832c6f55f6))
+* **acp:** terminate nothing_to_do turns cleanly and self-heal disallowed native tool calls ([#17](https://github.com/benwart/agy-acp/issues/17)) ([6fa2e6f](https://github.com/benwart/agy-acp/commit/6fa2e6f03d9eb614285d0fb731c5e2eaed994954))
+
 ## [1.9.0](https://github.com/benwart/agy-acp/compare/v1.8.0...v1.9.0) (2026-11-22)
 
 ### Features
