@@ -1,3 +1,10 @@
+## [1.9.0](https://github.com/benwart/agy-acp/compare/v1.8.0...v1.9.0) (2026-11-22)
+
+### Features
+
+* **models:** default auto and new sessions to gemini-4-neon-medium ([00433ed](https://github.com/benwart/agy-acp/commit/00433edbb7ce64423a0277bc3b4afce003cc485b))
+* **models:** default auto and new sessions to gemini-4-neon-medium ([#16](https://github.com/benwart/agy-acp/issues/16)) ([821dd3c](https://github.com/benwart/agy-acp/commit/821dd3c67eb95d418d395bee7e528d93d7a097b3))
+
 ## [1.8.0](https://github.com/benwart/agy-acp/compare/v1.7.1...v1.8.0) (2026-11-22)
 
 ### Features
