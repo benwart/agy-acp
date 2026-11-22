@@ -15,6 +15,7 @@ from typing import Any
 MODELS_CACHE_TTL_SECONDS: float = 86_400.0
 TIER_CACHE_TTL_SECONDS: float = 86_400.0
 QUOTA_SNAPSHOT_TTL_SECONDS: float = 7 * 86_400.0
+DEFAULT_SESSION_MODEL_ID: str = "gemini-4-neon-medium"
 _ACCOUNT_TIER_KV_KEY: str = "account_tier"
 _QUOTA_GROUPS_KV_KEY: str = "quota_groups"
 _QUOTA_CREDITS_KV_KEY: str = "quota_credits"
@@ -40,7 +41,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     agy_conversation_id TEXT,
     cwd TEXT NOT NULL,
     mode TEXT NOT NULL DEFAULT 'auto',
-    model TEXT NOT NULL DEFAULT 'gemini-3.7-pro',
+    model TEXT NOT NULL DEFAULT 'gemini-4-neon-medium',
     reasoning_effort TEXT NOT NULL DEFAULT 'medium',
     cancelled INTEGER NOT NULL DEFAULT 0,
     last_step_idx INTEGER NOT NULL DEFAULT -1,
@@ -254,7 +255,7 @@ class SqliteStateStoreProvider:
         agy_conv_id = state.get("agyConversationId", existing.get("agyConversationId"))
         cwd = str(state.get("cwd", existing.get("cwd", "")))
         mode = str(state.get("mode", existing.get("mode", "auto")))
-        model = str(state.get("model", existing.get("model", "gemini-3.7-pro")))
+        model = str(state.get("model", existing.get("model", DEFAULT_SESSION_MODEL_ID)))
         effort = str(state.get("reasoning_effort", existing.get("reasoning_effort", "medium")))
         cancelled = int(bool(state.get("cancelled", existing.get("cancelled", False))))
         last_step_idx = int(state.get("lastStepIdx", existing.get("lastStepIdx", -1)))

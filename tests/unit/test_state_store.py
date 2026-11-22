@@ -392,3 +392,13 @@ def test_save_and_load_quota_groups_and_credits_with_ttl(tmp_path: Path) -> None
         assert reloaded_store.load_credits() is None
         assert reloaded_store.load_quota_groups(max_age_seconds=None) == sample_groups
         assert reloaded_store.load_credits(max_age_seconds=None) == sample_credits
+
+
+def test_sqlite_default_session_model_is_neon_medium(tmp_path: Path) -> None:
+    """Verify upserting a session without an explicit model defaults to `gemini-4-neon-medium`."""
+    store = SqliteStateStoreProvider(tmp_path)
+    created = store.upsert_session({"sessionId": "sess-default-model", "cwd": "/ws"})
+    assert created["model"] == "gemini-4-neon-medium"
+    loaded = store.get_session("sess-default-model")
+    assert loaded is not None
+    assert loaded["model"] == "gemini-4-neon-medium"

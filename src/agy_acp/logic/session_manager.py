@@ -35,11 +35,11 @@ from agy_acp.logic.tool_classifier import (
     translate_mcp_server,
 )
 from agy_acp.logic.wire import EngineWireAdapter, McpServerStatus, V2KiroWireAdapter
+from agy_acp.logic.wire.base import DEFAULT_MODEL_ID
 from agy_acp.providers.agy_acp_client import AgyAcpClientProvider
 from agy_acp.providers.state_store import SqliteStateStoreProvider
 from agy_acp.providers.telemetry import TelemetryCallbacks, get_telemetry
 
-DEFAULT_MODEL_ID = "gemini-3.7-pro"
 DEFAULT_REASONING_EFFORT = "medium"
 
 _KIROCREW_SPAWN_ROUTING_DIRECTIVE = (
@@ -592,8 +592,11 @@ class SessionManager:
             else SqliteStateStoreProvider(save_dir)
         )
         self._cli = cli_provider or AgyAcpClientProvider(state_store=self._store)
+        cleaned_model = default_model.strip() if default_model else None
         self._default_agent = default_agent
-        self._default_model = default_model
+        self._default_model = (
+            cleaned_model if cleaned_model and cleaned_model.lower() != "auto" else None
+        )
         self._default_effort = cleaned_effort
         self._wire_adapter: EngineWireAdapter = wire_adapter or V2KiroWireAdapter()
         self._mcp_prober: McpCatalogProber = mcp_prober or McpCatalogProber()
@@ -1277,10 +1280,11 @@ class SessionManager:
         available_models = await self._resolve_available_models(cwd=cwd)
         if self._default_model:
             initial_model = self._default_model
-        elif available_models and DEFAULT_MODEL_ID not in {
-            m.get("modelId") for m in available_models
-        }:
-            initial_model = str(available_models[0].get("modelId") or DEFAULT_MODEL_ID)
+        elif available_models:
+            initial_model = self._wire_adapter.resolve_concrete_model(
+                available_models,
+                DEFAULT_MODEL_ID,
+            )
         else:
             initial_model = DEFAULT_MODEL_ID
 
@@ -1451,6 +1455,7 @@ class SessionManager:
         session = self._require_session(session_id)
         prev_mcp = copy.deepcopy(session.get("mcp_servers", []))
         prev_prompt = session.get("agentPrompt")
+        prev_switched = session.get("switchedModel")
         old_agy_id = str(session.get("agyConversationId") or "").strip()
 
         cwd = str(session.get("cwd", ""))
@@ -1476,6 +1481,16 @@ class SessionManager:
                 cwd=cwd,
                 registry=registry,
                 allow_model_override=not bool(session.get("modelPinnedByUser", False)),
+            )
+
+        if (
+            prev_switched
+            and not session.get("switchedModel")
+            and not bool(session.get("modelPinnedByUser", False))
+        ):
+            session["model"] = self._default_model or self._wire_adapter.resolve_concrete_model(
+                self._store.load_models() or AVAILABLE_MODELS,
+                DEFAULT_MODEL_ID,
             )
 
         raw_wire = session.get("wire_mcp_servers", [])
@@ -1610,12 +1625,25 @@ class SessionManager:
             "outputTokens": max(1, int(outcome.usage.get("output_tokens", len(summary.split())))),
         }
 
+    def _apply_model_selection(self, session: dict[str, Any], value: str) -> None:
+        """Apply user model choice, treating `'auto'` as unpinned default resolution."""
+        cleaned = value.strip()
+        if cleaned.lower() == "auto":
+            available_models = self._store.load_models() or AVAILABLE_MODELS
+            session["model"] = self._default_model or self._wire_adapter.resolve_concrete_model(
+                available_models,
+                "auto",
+            )
+            session["modelPinnedByUser"] = False
+        else:
+            session["model"] = value
+            session["modelPinnedByUser"] = True
+
     async def set_model(self, *, session_id: str, model_id: str) -> dict[str, Any]:
         """Update active model (`session/set_model`) in SQLite and pin user override."""
         await anyio.sleep(0)
         session = self._require_session(session_id)
-        session["model"] = model_id
-        session["modelPinnedByUser"] = True
+        self._apply_model_selection(session, model_id)
         self._store.upsert_session(session)
         return {}
 
@@ -1630,8 +1658,7 @@ class SessionManager:
         await anyio.sleep(0)
         session = self._require_session(session_id)
         if config_id == "model":
-            session["model"] = value
-            session["modelPinnedByUser"] = True
+            self._apply_model_selection(session, value)
         elif config_id == "mode":
             if value not in VALID_MODE_IDS:
                 raise ValueError(f"Mode '{value}' not found")
