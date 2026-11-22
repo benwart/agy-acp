@@ -1484,3 +1484,128 @@ async def test_default_and_auto_model_resolve_to_neon_medium(tmp_path: Path) -> 
     assert by_id["model"] == "gemini-4-neon-medium"
     assert mgr_auto.get_session(sid)["model"] == "gemini-4-neon-medium"
     assert mgr_auto.get_session(sid)["modelPinnedByUser"] is False
+
+
+def test_build_system_prompt_append_includes_quiet_turn_contract_for_kirocrew_core_only() -> None:
+    """Verify `[KIROCREW QUIET TURN CONTRACT]` applies only to tool-enabled KiroCrew sessions."""
+    from agy_acp.logic.session_manager import _build_system_prompt_append
+
+    core_mcp = [{"name": "kirocrew-core", "command": "kirocrew-mcp", "args": []}]
+    conductor_session = {
+        "mcp_servers": core_mcp,
+        "agentTools": ["execute_bash", "fs_read", "@kirocrew-core"],
+        "agentExcludedTools": [],
+    }
+    appended = _build_system_prompt_append(conductor_session) or ""
+    assert "[KIROCREW QUIET TURN CONTRACT]" in appended
+    assert "nothing_to_do" in appended
+    assert "schedule" in appended
+    assert "[DISALLOWED NATIVE TOOLS]" in appended
+
+    # Zero-tool session must NOT receive quiet-turn tool-call instructions
+    zero_tool_session = {
+        "mcp_servers": core_mcp,
+        "agentTools": [],
+        "agentExcludedTools": [],
+    }
+    zero_appended = _build_system_prompt_append(zero_tool_session) or ""
+    assert "[DISALLOWED NATIVE TOOLS]" in zero_appended
+    assert "[KIROCREW QUIET TURN CONTRACT]" not in zero_appended
+
+    # Non-KiroCrew session must NOT receive KiroCrew quiet-turn contract
+    plain_session = {
+        "mcp_servers": [{"name": "other-mcp", "command": "echo", "args": []}],
+        "agentTools": None,
+        "agentExcludedTools": [],
+    }
+    assert _build_system_prompt_append(plain_session) is None
+
+
+async def test_prompt_passes_policy_recovery_and_reinforces_legacy_session_once(
+    tmp_path: Path,
+) -> None:
+    """Verify `prompt` passes `allow_policy_recovery` and reinforces legacy sessions once."""
+    from agy_acp.logic.tool_classifier import PromptOutcome
+    from agy_acp.providers.agy_acp_client import AgyAcpClientProvider
+    from agy_acp.providers.state_store import SqliteStateStoreProvider
+
+    captured_calls: list[dict[str, Any]] = []
+
+    class _RecordingCli(AgyAcpClientProvider):
+        async def stream_prompt(self, **kwargs: Any) -> PromptOutcome:
+            captured_calls.append(kwargs)
+            return PromptOutcome(
+                conversation_id=str(kwargs.get("conversation_id") or "agy-conv-new"),
+                stop_reason="end_turn",
+                response="ok",
+                usage={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+    store = SqliteStateStoreProvider(tmp_path / "state")
+    cli = _RecordingCli(state_store=store)
+    mgr = SessionManager(state_store=store, cli_provider=cli)
+
+    created = await mgr.create_session(
+        cwd=str(tmp_path),
+        mcp_servers=[{"name": "kirocrew-core", "command": "kirocrew-mcp", "args": []}],
+        meta={
+            "kiro": {
+                "customAgents": [
+                    {
+                        "id": "conductor",
+                        "name": "Conductor",
+                        "tools": ["execute_bash", "fs_read", "@kirocrew-core"],
+                        "prompt": "Conductor.",
+                    },
+                    {
+                        "id": "zero-tool",
+                        "name": "Zero Tool",
+                        "tools": [],
+                        "prompt": "Plain text only.",
+                    },
+                ]
+            }
+        },
+    )
+    sid = created["sessionId"]
+    await mgr.set_mode(session_id=sid, mode_id="conductor")
+
+    # Simulate a pre-v1.10 persisted conversation without a policyPromptVersion stamp
+    persisted = mgr.get_session(sid)
+    persisted["agyConversationId"] = "agy-legacy-1"
+    persisted["policyPromptVersion"] = 0
+    store.upsert_session(persisted)
+
+    await mgr.prompt(
+        session_id=sid,
+        prompt_blocks=[{"type": "text", "text": "[work-ledger wake] check items"}],
+    )
+    assert len(captured_calls) == 1
+    first_call = captured_calls[0]
+    assert first_call["allow_policy_recovery"] is True
+    first_text = first_call["content_blocks"][0]["text"]
+    assert "[DISALLOWED NATIVE TOOLS]" in first_text
+    assert "[KIROCREW QUIET TURN CONTRACT]" in first_text
+    assert "[work-ledger wake] check items" in first_text
+    assert mgr.get_session(sid)["policyPromptVersion"] == 2
+
+    # Second prompt on same conversation must NOT repeat the policy reinforcement prefix
+    await mgr.prompt(
+        session_id=sid,
+        prompt_blocks=[{"type": "text", "text": "[work-ledger wake] second check"}],
+    )
+    assert len(captured_calls) == 2
+    second_call = captured_calls[1]
+    assert second_call["allow_policy_recovery"] is True
+    second_text = second_call["content_blocks"][0]["text"]
+    assert "[DISALLOWED NATIVE TOOLS]" not in second_text
+    assert "[KIROCREW QUIET TURN CONTRACT]" not in second_text
+    assert second_text == "[work-ledger wake] second check"
+
+    # Zero-tool session must pass allow_policy_recovery=False
+    await mgr.set_mode(session_id=sid, mode_id="zero-tool")
+    await mgr.prompt(
+        session_id=sid,
+        prompt_blocks=[{"type": "text", "text": "plain reply"}],
+    )
+    assert captured_calls[2]["allow_policy_recovery"] is False
