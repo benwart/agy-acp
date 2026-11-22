@@ -1,3 +1,14 @@
+## [1.8.0](https://github.com/benwart/agy-acp/compare/v1.7.1...v1.8.0) (2026-11-22)
+
+### Features
+
+* **acp:** add KiroCrew 0.13.1-rc.2 zero-tool guard, MCP resource/arg classification, secretStorage lookup, and toolSearch parity ([de33b8d](https://github.com/benwart/agy-acp/commit/de33b8d5336aefe143025b0c7391cbc3ff74fc9d))
+* **acp:** KiroCrew 0.13.1-rc.2 zero-tool guard, MCP resource/arg classification, secretStorage lookup, and toolSearch parity ([#15](https://github.com/benwart/agy-acp/issues/15)) ([6820e2b](https://github.com/benwart/agy-acp/commit/6820e2b61f181424069ab0949faa367db04477ac))
+
+### Bug Fixes
+
+* **security:** block builtin fallback on unresolved MCP wrappers and strip auth on cross-origin redirects ([8bf0456](https://github.com/benwart/agy-acp/commit/8bf04567655254f825bf3b51b733acbbf9e388eb))
+
 ## [1.7.1](https://github.com/benwart/agy-acp/compare/v1.7.0...v1.7.1) (2026-11-21)
 
 ### Bug Fixes
