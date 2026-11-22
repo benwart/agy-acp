@@ -624,12 +624,19 @@ def _normalize_tool_arguments(
     tool_name: str = "",
 ) -> dict[str, Any]:
     """Normalize `agy` tool argument keys to ACP/KiroCrew standard keys (`command`, `path`)."""
-    if tool_name.lower() == "call_mcp_tool" or (
-        "ServerName" in arguments and "ToolName" in arguments
-    ):
+    lower_name = tool_name.strip().lower()
+    if lower_name == "call_mcp_tool" or ("ServerName" in arguments and "ToolName" in arguments):
         inner = arguments.get("Arguments")
         if isinstance(inner, Mapping):
             return dict(inner)
+        if inner is None:
+            return {}
+    if lower_name in {"list_resources", "read_resource"} and any(
+        k in arguments for k in ("ServerName", "server_name", "server")
+    ):
+        return {
+            k: v for k, v in arguments.items() if k not in {"ServerName", "server_name", "server"}
+        }
 
     normalized = dict(arguments)
     existing_cmd = normalized.get("command")
@@ -770,6 +777,8 @@ def _resolve_raw_tool_name(record: Mapping[str, Any], raw_args: Mapping[str, Any
 
     if "ServerName" in raw_args and "ToolName" in raw_args:
         return "call_mcp_tool"
+    if "ServerName" in raw_args and "Uri" in raw_args:
+        return "read_resource"
 
     title = str(record.get("title") or "").strip()
     if title and (" " not in title) and ("/" not in title or title.startswith("@")):
@@ -820,7 +829,12 @@ def _build_tool_event_from_record(
     ]
     acp_kind = (
         raw_kind
-        if (cls.acp_kind == "other" and not cls.mcp_server and raw_kind in _KIND_TO_FALLBACK_TOOL)
+        if (
+            cls.acp_kind == "other"
+            and not cls.mcp_server
+            and cls.kas_builtin_id != "mcp_resource"
+            and raw_kind in _KIND_TO_FALLBACK_TOOL
+        )
         else cls.acp_kind
     )
     event = ToolCallEvent(

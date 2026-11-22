@@ -125,6 +125,7 @@ _EXACT_BUILTIN_TABLE: dict[str, tuple[str, str, str]] = {
         ("invoke_sub_agent", "use_subagent", "other"),
     ),
     **dict.fromkeys(("todo_list", "task_boundary"), ("todo_list", "todo_list", "other")),
+    **dict.fromkeys(("list_resources", "read_resource"), ("mcp_resource", "mcp_resource", "other")),
 }
 
 _SUBSTRING_BUILTIN_RULES: tuple[tuple[tuple[str, ...], tuple[str, str, str]], ...] = (
@@ -141,7 +142,7 @@ _SUBSTRING_BUILTIN_RULES: tuple[tuple[tuple[str, ...], tuple[str, str, str]], ..
         ("str_replace", "fs_write", "edit"),
     ),
     (
-        ("view_file", "read_file", "view_code", "list_resources", "read_resource", "read_browser"),
+        ("view_file", "read_file", "view_code", "read_browser"),
         ("read_file", "fs_read", "read"),
     ),
     (("grep",), ("grep_search", "grep", "search")),
@@ -378,12 +379,20 @@ def _extract_mcp_identity(
     known_mcp_servers: Sequence[str] = (),
 ) -> tuple[str, str]:
     """Return `(server_name, tool_name)` when the step invokes an MCP tool, else `('', '')`."""
-    if raw_name.lower() == "call_mcp_tool" or (
-        "ServerName" in arguments and "ToolName" in arguments
-    ):
+    lower_name = raw_name.lower()
+    if lower_name == "call_mcp_tool" or ("ServerName" in arguments and "ToolName" in arguments):
         server = _extract_first_str(arguments, ("ServerName", "server_name", "server")).strip()
         tool = _extract_first_str(arguments, ("ToolName", "tool_name", "tool")).strip()
         if server and tool:
+            return server, tool
+    if lower_name in {"list_resources", "read_resource"} or (
+        not lower_name and "ServerName" in arguments and "Uri" in arguments
+    ):
+        server = _extract_first_str(arguments, ("ServerName", "server_name", "server")).strip()
+        if server:
+            tool = (
+                lower_name if lower_name in {"list_resources", "read_resource"} else "read_resource"
+            )
             return server, tool
     if raw_name.startswith("mcp__"):
         server, sep, tool = raw_name[len("mcp__") :].rpartition("__")

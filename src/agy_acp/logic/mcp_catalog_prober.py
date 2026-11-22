@@ -40,6 +40,15 @@ MAX_CONCURRENT_PROBES = 8
 _MAX_HEADER_LINES = 32
 _MAX_ERROR_CHARS = 500
 _LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "localhost", "::1"})
+_JS_TRIM_ASCII = " \t\n\v\f\r"
+
+
+def kas_mcp_tokens_secret_key(mcp_url: str) -> str:
+    """Return the KAS `_kiro/secret/get` key (`kiro.mcp.<sha256>.tokens`) for `mcp_url`."""
+    normalized = mcp_url.strip(_JS_TRIM_ASCII).lower()
+    digest = hashlib.sha256(f"{normalized}|".encode()).hexdigest()
+    return f"kiro.mcp.{digest}.tokens"
+
 
 _AUTH_URI_PARAM_RE = re.compile(
     r'(?:authorization_uri|auth_url|oauth_url|resource_metadata)\s*=\s*"([^"]+)"',

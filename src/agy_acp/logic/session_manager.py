@@ -70,6 +70,9 @@ _SPAWN_RUN_ALLOW_PATTERNS: frozenset[str] = frozenset(
     }
 )
 _SPAWN_RUN_DENY_PATTERNS: frozenset[str] = _SPAWN_RUN_ALLOW_PATTERNS | {"spawn_run"}
+_SPAWN_RUN_NEVER_DEFER_PATTERNS: frozenset[str] = frozenset(
+    {"kirocrew-core/spawn_run", "@kirocrew-core/spawn_run"}
+)
 
 AVAILABLE_MODES: list[dict[str, str]] = [
     {"id": "auto", "name": "Auto"},
@@ -95,6 +98,25 @@ _EXT_TO_MIME: dict[str, str] = {
 _IMAGE_EXTS: frozenset[str] = frozenset(_EXT_TO_MIME)
 _MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
 _USER_MESSAGE_BLOCK_RE = re.compile(r"<user_message>\s*(.*?)\s*</user_message>", re.DOTALL)
+
+
+def _extract_tool_search_never_defer(meta: Mapping[str, Any] | None) -> list[str]:
+    """Extract `_meta.kiro.settings.toolSearch.neverDefer` string entries when present."""
+    if not isinstance(meta, Mapping):
+        return []
+    kiro_meta = meta.get("kiro")
+    if not isinstance(kiro_meta, Mapping):
+        return []
+    settings = kiro_meta.get("settings")
+    if not isinstance(settings, Mapping):
+        return []
+    tool_search = settings.get("toolSearch")
+    if not isinstance(tool_search, Mapping):
+        return []
+    raw_never_defer = tool_search.get("neverDefer")
+    if not isinstance(raw_never_defer, list):
+        return []
+    return [entry.strip() for entry in raw_never_defer if isinstance(entry, str) and entry.strip()]
 
 
 def _session_has_kirocrew_spawn_run(session: Mapping[str, Any]) -> bool:
@@ -132,7 +154,12 @@ def _session_has_kirocrew_spawn_run(session: Mapping[str, Any]) -> bool:
 
     agent_tools = session.get("agentTools")
     if isinstance(agent_tools, list):
-        return any(str(tool).strip() in _SPAWN_RUN_ALLOW_PATTERNS for tool in agent_tools)
+        allowed = _SPAWN_RUN_ALLOW_PATTERNS | {"spawn_run", "kirocrew-core/spawn_run"}
+        return any(str(tool).strip() in allowed for tool in agent_tools)
+
+    never_defer = _extract_tool_search_never_defer(session.get("meta"))
+    if any(entry in _SPAWN_RUN_NEVER_DEFER_PATTERNS for entry in never_defer):
+        return True
     return True
 
 
@@ -188,6 +215,10 @@ _NATIVE_TOOL_POLICY_PATTERNS: tuple[tuple[str, frozenset[str]], ...] = (
         "send_message",
         frozenset({"invoke_sub_agent", "use_subagent", "subagent", "builtin"}),
     ),
+    ("schedule", frozenset({"schedule", "builtin"})),
+    ("run_workflow", frozenset({"run_workflow", "builtin"})),
+    ("swarm", frozenset({"swarm", "builtin"})),
+    ("ask_question", frozenset({"ask_question", "builtin"})),
 )
 
 
@@ -218,6 +249,17 @@ def _compute_disallowed_native_tools(session: Mapping[str, Any]) -> tuple[str, .
     return tuple(disallowed)
 
 
+def _is_zero_tool_session(session: Mapping[str, Any]) -> bool:
+    """Return True when `agentTools` is `[]` or `agentExcludedTools` contains `'*'`."""
+    raw_tools = session.get("agentTools")
+    if isinstance(raw_tools, list) and len(raw_tools) == 0:
+        return True
+    raw_excluded = session.get("agentExcludedTools")
+    return isinstance(raw_excluded, list) and any(
+        isinstance(t, str) and t.strip() == "*" for t in raw_excluded
+    )
+
+
 def _build_system_prompt_append(
     session: Mapping[str, Any],
     *,
@@ -243,16 +285,29 @@ def _build_system_prompt_append(
             )
     if _session_has_kirocrew_spawn_run(session) and "[KIROCREW SUBAGENT ROUTING]" not in user_text:
         sections.append(_KIROCREW_SPAWN_ROUTING_DIRECTIVE)
-    disallowed_native = _compute_disallowed_native_tools(session)
-    if disallowed_native and "[DISALLOWED NATIVE TOOLS]" not in user_text:
-        tool_list = ", ".join(f"`{name}`" for name in disallowed_native)
-        sections.append(
-            "[DISALLOWED NATIVE TOOLS]\n"
-            "The following built-in tools are NOT permitted by this agent's policy and will "
-            f"abort the turn if called: {tool_list}.\n"
-            "NEVER call any of these tools. Use only permitted tools and available MCP tools.\n"
-            "[END DISALLOWED NATIVE TOOLS]"
-        )
+    if "[DISALLOWED NATIVE TOOLS]" not in user_text:
+        if _is_zero_tool_session(session):
+            sections.append(
+                "[DISALLOWED NATIVE TOOLS]\n"
+                "ALL built-in and MCP tools (including `call_mcp_tool`, `list_resources`, "
+                "`read_resource`, `schedule`, `run_workflow`, `swarm`, `ask_question`, and all "
+                "file, shell, web, and subagent tools) are disabled (`tools: []`) and will abort "
+                "the turn if called.\n"
+                "You MUST respond strictly in plain text without calling any tool.\n"
+                "[END DISALLOWED NATIVE TOOLS]"
+            )
+        else:
+            disallowed_native = _compute_disallowed_native_tools(session)
+            if disallowed_native:
+                tool_list = ", ".join(f"`{name}`" for name in disallowed_native)
+                sections.append(
+                    "[DISALLOWED NATIVE TOOLS]\n"
+                    "The following built-in tools are NOT permitted by this agent's policy and "
+                    f"will abort the turn if called: {tool_list}.\n"
+                    "NEVER call any of these tools. Use only permitted tools and available "
+                    "MCP tools.\n"
+                    "[END DISALLOWED NATIVE TOOLS]"
+                )
     return "\n\n".join(sections) if sections else None
 
 
@@ -547,6 +602,7 @@ class SessionManager:
         self._turn_locks: dict[str, anyio.Lock] = {}
         self._mcp_status_cache: dict[str, dict[str, McpServerStatus]] = {}
         self._mcp_enabled: bool = True
+        self._mcp_token_resolver: Callable[[str], Awaitable[str | None]] | None = None
         self._process_session_ids: set[str] = set()
         get_telemetry(self._store.db_path).register_callbacks(
             TelemetryCallbacks(
@@ -738,7 +794,11 @@ class SessionManager:
         spec = registry.get(agent_id)
         if spec is not None:
             return spec
-        if session.get("agentPermissions") is not None or session.get("agentPrompt"):
+        if (
+            session.get("agentPermissions") is not None
+            or session.get("agentPrompt")
+            or session.get("agentTools") is not None
+        ):
             raw_tools = session.get("agentTools")
             return CustomAgentSpec(
                 agent_id=agent_id,
@@ -1062,6 +1122,13 @@ class SessionManager:
             if str(s.get("name") or "").strip()
         ]
 
+    def set_mcp_token_resolver(
+        self,
+        resolver: Callable[[str], Awaitable[str | None]] | None,
+    ) -> None:
+        """Configure an optional ephemeral Bearer token resolver for HTTP MCP probing."""
+        self._mcp_token_resolver = resolver
+
     async def probe_session_mcp_servers(
         self,
         session_id: str,
@@ -1081,16 +1148,47 @@ class SessionManager:
         if not merged_declarations:
             return []
 
+        probe_declarations = (
+            await self._attach_ephemeral_bearer_tokens(
+                merged_declarations,
+                self._mcp_token_resolver,
+            )
+            if self._mcp_token_resolver is not None
+            else merged_declarations
+        )
         session_env = _extract_session_mcp_env(
             session,
             session_id=session_id,
             state_db_path=self._store.db_path,
         )
         return await self._mcp_prober.probe_servers(
-            merged_declarations,
+            probe_declarations,
             session_env=session_env,
             cwd=cwd or None,
         )
+
+    @staticmethod
+    async def _attach_ephemeral_bearer_tokens(
+        declarations: Sequence[Mapping[str, Any]],
+        token_resolver: Callable[[str], Awaitable[str | None]],
+    ) -> list[dict[str, Any]]:
+        """Attach ephemeral Bearer headers to enabled HTTP servers lacking `Authorization`."""
+        enriched: list[dict[str, Any]] = []
+        for decl in declarations:
+            copy_decl = dict(decl)
+            raw_url = copy_decl.get("url")
+            if (
+                copy_decl.get("disabled") is not True
+                and isinstance(raw_url, str)
+                and raw_url.strip().lower().startswith(("http://", "https://"))
+            ):
+                headers_map = _pairs_to_dict(copy_decl.get("headers"))
+                if not any(k.lower() == "authorization" for k in headers_map):
+                    token = await token_resolver(raw_url.strip())
+                    if token:
+                        copy_decl["headers"] = {**headers_map, "Authorization": f"Bearer {token}"}
+            enriched.append(copy_decl)
+        return enriched
 
     async def _prepare_derived_session(
         self,
