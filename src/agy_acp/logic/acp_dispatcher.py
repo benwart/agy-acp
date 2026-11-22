@@ -100,6 +100,7 @@ _FS_TOOL_IDS: frozenset[str] = frozenset(
 _POLICY_ALIAS_DENY_ONLY_IDS: frozenset[str] = frozenset(
     {"delete_file", "control_bash_process", "control_pwsh_process"}
 )
+_UNRESOLVED_MCP_WRAPPER_IDS: frozenset[str] = frozenset({"call_mcp_tool", "mcp_resource"})
 _TOOL_CAPABILITY_ALIASES: dict[str, tuple[str, ...]] = {
     "read_file": ("fs_read", "read"),
     "list_directory": ("fs_read", "read"),
@@ -251,6 +252,9 @@ def _matches_agent_tool_list(
                 f"mcp_{norm.mcp_server}_{norm.mcp_tool}",
             }
         )
+    elif norm.kas_tool_id in _UNRESOLVED_MCP_WRAPPER_IDS:
+        # Unresolved MCP wrapper calls must never match the `"builtin"` allowlist/toolset.
+        candidates.add(norm.kas_tool_id)
     elif for_allowlist and (
         norm.kas_tool_id in _POLICY_ALIAS_DENY_ONLY_IDS or norm.kind == "delete"
     ):

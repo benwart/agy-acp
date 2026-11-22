@@ -928,6 +928,7 @@ class _ActiveTurnState:
     decisions: dict[str, bool] = field(default_factory=dict)
     rejection_reasons: dict[str, str] = field(default_factory=dict)
     evaluated_inputs: dict[str, dict[str, Any]] = field(default_factory=dict)
+    evaluated_identities: dict[str, tuple[str, str, str]] = field(default_factory=dict)
     policy_denied_tools: list[str] = field(default_factory=list)
     last_context_tokens: int = 0
     emitted_any_signal: bool = False
@@ -2179,19 +2180,23 @@ class AgyAcpClientProvider:
     ) -> tuple[bool, bool]:
         """Evaluate `on_tool_call(event)`, re-checking if `raw_input` populates later."""
         raw_input_snapshot = dict(event.raw_input)
+        identity_snapshot = (event.mcp_server, event.mcp_tool, event.kiro_tool_id)
         if tc_id in turn.decision_events:
             await turn.decision_events[tc_id].wait()
             prev_allowed = turn.decisions.get(tc_id, False)
-            if (
-                not prev_allowed
-                or not raw_input_snapshot
-                or turn.evaluated_inputs.get(tc_id) == raw_input_snapshot
+            identity_changed = turn.evaluated_identities.get(tc_id) != identity_snapshot
+            if not prev_allowed or (
+                not identity_changed
+                and (
+                    not raw_input_snapshot or turn.evaluated_inputs.get(tc_id) == raw_input_snapshot
+                )
             ):
                 return prev_allowed, turn.interrupt_event.is_set()
 
         dec_event = anyio.Event()
         turn.decision_events[tc_id] = dec_event
         turn.evaluated_inputs[tc_id] = raw_input_snapshot
+        turn.evaluated_identities[tc_id] = identity_snapshot
         turn.announced_tools.add(tc_id)
 
         try:

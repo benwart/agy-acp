@@ -568,3 +568,158 @@ def test_tool_search_never_defer_honors_spawn_run_and_respects_agent_tools() -> 
         )
         is False
     )
+
+
+# ---------------------------------------------------------------------------
+# 4. Security Audit Regressions (MCP Wrapper Auth + Redirect Authorization Strip)
+# ---------------------------------------------------------------------------
+
+
+def test_unresolved_mcp_wrappers_never_match_builtin_policy(tmp_path: Path) -> None:
+    store = SqliteStateStoreProvider(tmp_path)
+    mgr = SessionManager(state_store=store, wire_adapter=V3KasWireAdapter())
+    dispatcher = AcpDispatcher(session_manager=mgr, wire_adapter=V3KasWireAdapter())
+    from agy_acp.logic.acp_dispatcher import _to_normalized_tool_event
+
+    for raw_name in ("call_mcp_tool", "list_resources", "read_resource"):
+        _, _, ev = _build_tool_event_from_record(
+            f"tc-{raw_name}",
+            {"name": raw_name, "raw_args": {}},
+            known_mcp_servers=["docs"],
+        )
+        norm = _to_normalized_tool_event(ev, known_mcp_servers=["docs"])
+        assert (
+            dispatcher._evaluate_tool_permission(
+                session={
+                    "cwd": str(tmp_path),
+                    "agentTools": None,
+                    "agentExcludedTools": [],
+                    "agentAllowedTools": ["builtin"],
+                    "agentPermissions": [{"capability": "builtin", "effect": "allow"}],
+                },
+                spec=None,
+                norm=norm,
+                session_mode="auto",
+            )
+            == "ask"
+        )
+        assert (
+            dispatcher._evaluate_tool_permission(
+                session={
+                    "cwd": str(tmp_path),
+                    "agentTools": ["builtin"],
+                    "agentExcludedTools": [],
+                    "agentAllowedTools": ["builtin"],
+                    "agentPermissions": None,
+                },
+                spec=None,
+                norm=norm,
+                session_mode="auto",
+            )
+            == "deny"
+        )
+        assert (
+            dispatcher._evaluate_tool_permission(
+                session={
+                    "cwd": str(tmp_path),
+                    "agentTools": None,
+                    "agentExcludedTools": [],
+                    "agentAllowedTools": ["builtin"],
+                    "agentPermissions": [{"capability": "mcp", "effect": "deny"}],
+                },
+                spec=None,
+                norm=norm,
+                session_mode="auto",
+            )
+            == "deny"
+        )
+
+
+@pytest.mark.anyio
+async def test_evaluate_tool_call_once_rechecks_when_mcp_identity_resolves_with_empty_args(
+    tmp_path: Path,
+) -> None:
+    from agy_acp.providers.agy_acp_client import AgyAcpClientProvider, _ActiveTurnState
+
+    store = SqliteStateStoreProvider(tmp_path)
+    client = AgyAcpClientProvider(state_store=store)
+    seen_events: list[ToolCallEvent] = []
+
+    async def _on_tool_call(ev: ToolCallEvent) -> bool:
+        seen_events.append(ev)
+        # Allow unresolved stub, deny once resolved to a disabled MCP tool
+        return not (ev.mcp_server == "srv" and ev.mcp_tool in {"ping", "list_resources"})
+
+    for raw_name, resolved_args in (
+        ("call_mcp_tool", {"ServerName": "srv", "ToolName": "ping"}),
+        ("list_resources", {"ServerName": "srv"}),
+    ):
+        seen_events.clear()
+        turn = _ActiveTurnState(
+            session_id="sess-1",
+            agy_session_id="agy-1",
+            route_spawn_run=False,
+            skip_permissions=False,
+            known_mcp_servers=("srv",),
+            on_thought=None,
+            on_text=None,
+            on_tool_call=_on_tool_call,
+            on_tool_update=None,
+            on_usage=None,
+            collected_texts=[],
+            usage={},
+        )
+        tc_id = f"tc-{raw_name}"
+        _, _, initial_ev = _build_tool_event_from_record(
+            tc_id,
+            {"name": raw_name, "raw_args": {}},
+            known_mcp_servers=["srv"],
+        )
+        allowed1, _ = await client._evaluate_tool_call_once(turn, tc_id, initial_ev)
+        assert allowed1 is True
+
+        _, _, resolved_ev = _build_tool_event_from_record(
+            tc_id,
+            {"name": raw_name, "raw_args": resolved_args},
+            known_mcp_servers=["srv"],
+        )
+        assert resolved_ev.raw_input == {}
+        allowed2, _ = await client._evaluate_tool_call_once(turn, tc_id, resolved_ev)
+        assert allowed2 is False
+        assert len(seen_events) == 2
+
+
+def test_safe_redirect_handler_strips_authorization_on_cross_origin_and_downgrade() -> None:
+    import urllib.request
+
+    from agy_acp.logic.mcp_catalog_prober import _SafeRedirectHandler
+
+    handler = _SafeRedirectHandler()
+    base_req = urllib.request.Request(
+        "https://mcp.example.com/v1",
+        headers={"Authorization": "Bearer secret-tok", "X-Keep": "1"},
+        method="GET",
+    )
+
+    cross_req = handler.redirect_request(
+        base_req, None, 302, "Found", {}, "https://evil.example.net/steal"
+    )
+    assert cross_req is not None
+    assert not any(k.lower() == "authorization" for k in cross_req.headers)
+    assert not any(k.lower() == "authorization" for k in cross_req.unredirected_hdrs)
+
+    downgrade_req = handler.redirect_request(
+        base_req, None, 302, "Found", {}, "http://mcp.example.com/v1"
+    )
+    assert downgrade_req is not None
+    assert not any(k.lower() == "authorization" for k in downgrade_req.headers)
+    assert not any(k.lower() == "authorization" for k in downgrade_req.unredirected_hdrs)
+
+    same_origin_req = handler.redirect_request(
+        base_req, None, 302, "Found", {}, "https://mcp.example.com/v2"
+    )
+    assert same_origin_req is not None
+    assert any(
+        k.lower() == "authorization" and v == "Bearer secret-tok"
+        for k, v in same_origin_req.headers.items()
+    )
