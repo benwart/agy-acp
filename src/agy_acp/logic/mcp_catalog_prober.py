@@ -40,6 +40,15 @@ MAX_CONCURRENT_PROBES = 8
 _MAX_HEADER_LINES = 32
 _MAX_ERROR_CHARS = 500
 _LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "localhost", "::1"})
+_JS_TRIM_ASCII = " \t\n\v\f\r"
+
+
+def kas_mcp_tokens_secret_key(mcp_url: str) -> str:
+    """Return the KAS `_kiro/secret/get` key (`kiro.mcp.<sha256>.tokens`) for `mcp_url`."""
+    normalized = mcp_url.strip(_JS_TRIM_ASCII).lower()
+    digest = hashlib.sha256(f"{normalized}|".encode()).hexdigest()
+    return f"kiro.mcp.{digest}.tokens"
+
 
 _AUTH_URI_PARAM_RE = re.compile(
     r'(?:authorization_uri|auth_url|oauth_url|resource_metadata)\s*=\s*"([^"]+)"',
@@ -74,8 +83,22 @@ def sanitize_mcp_error(raw_error: str) -> str:
     return scrubbed
 
 
+def _http_origin(url: str) -> tuple[str, str, int] | None:
+    """Return `(scheme, hostname, effective_port)` for an HTTP(S) URL, else `None`."""
+    try:
+        parts = urllib.parse.urlsplit(url.strip())
+        port = parts.port
+    except ValueError:
+        return None
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").lower()
+    if scheme not in {"http", "https"} or not host:
+        return None
+    return scheme, host, port if port is not None else (443 if scheme == "https" else 80)
+
+
 class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Redirect handler restricting targets strictly to `http://` and `https://` with hostnames."""
+    """Redirect handler restricting targets to HTTP(S) and stripping auth across origins."""
 
     def redirect_request(  # type: ignore[override]
         self,
@@ -89,7 +112,15 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         resolved = urllib.parse.urljoin(req.full_url, newurl)
         if not _is_safe_http_url(resolved):
             raise urllib.error.URLError("Unsafe HTTP redirect target")
-        return super().redirect_request(req, fp, code, msg, headers, resolved)
+        new_req = super().redirect_request(req, fp, code, msg, headers, resolved)
+        if new_req is not None:
+            src_origin = _http_origin(req.full_url)
+            dst_origin = _http_origin(resolved)
+            if src_origin is None or dst_origin is None or src_origin != dst_origin:
+                for hdr_map in (new_req.headers, new_req.unredirected_hdrs):
+                    for key in [k for k in hdr_map if k.lower() == "authorization"]:
+                        hdr_map.pop(key, None)
+        return new_req
 
 
 def _build_safe_http_opener() -> urllib.request.OpenerDirector:

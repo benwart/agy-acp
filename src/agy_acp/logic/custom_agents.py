@@ -936,11 +936,12 @@ def evaluate_tool_call_permission(
     cwd: str = "",
 ) -> PermissionDecision:
     """Map a tool invocation to `(capability, resource)` and evaluate KAS permissions."""
-    if is_mcp or (server_name and tool_name):
+    if is_mcp or (server_name and tool_name) or tool_id in {"call_mcp_tool", "mcp_resource"}:
+        mcp_resource = f"{server_name}/{tool_name}" if (server_name and tool_name) else tool_id
         return evaluate_kas_permissions(
             permissions,
             capability="mcp",
-            resource=f"{server_name}/{tool_name}",
+            resource=mcp_resource,
         )
 
     capability = _CAPABILITY_BY_TOOL_NAME.get(tool_id)

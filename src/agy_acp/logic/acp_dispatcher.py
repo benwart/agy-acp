@@ -28,6 +28,7 @@ from agy_acp.logic.custom_agents import (
     PermissionDecision,
     evaluate_tool_call_permission,
 )
+from agy_acp.logic.mcp_catalog_prober import kas_mcp_tokens_secret_key
 from agy_acp.logic.quota_tracker import QuotaTracker, TurnTelemetry
 from agy_acp.logic.retry_warning_filter import (
     RetryWarningStreamFilter,
@@ -99,6 +100,7 @@ _FS_TOOL_IDS: frozenset[str] = frozenset(
 _POLICY_ALIAS_DENY_ONLY_IDS: frozenset[str] = frozenset(
     {"delete_file", "control_bash_process", "control_pwsh_process"}
 )
+_UNRESOLVED_MCP_WRAPPER_IDS: frozenset[str] = frozenset({"call_mcp_tool", "mcp_resource"})
 _TOOL_CAPABILITY_ALIASES: dict[str, tuple[str, ...]] = {
     "read_file": ("fs_read", "read"),
     "list_directory": ("fs_read", "read"),
@@ -250,6 +252,9 @@ def _matches_agent_tool_list(
                 f"mcp_{norm.mcp_server}_{norm.mcp_tool}",
             }
         )
+    elif norm.kas_tool_id in _UNRESOLVED_MCP_WRAPPER_IDS:
+        # Unresolved MCP wrapper calls must never match the `"builtin"` allowlist/toolset.
+        candidates.add(norm.kas_tool_id)
     elif for_allowlist and (
         norm.kas_tool_id in _POLICY_ALIAS_DENY_ONLY_IDS or norm.kind == "delete"
     ):
@@ -591,6 +596,33 @@ def _extract_fork_message_id(
     return raw_top_msg_id.strip() or None if isinstance(raw_top_msg_id, str) else None
 
 
+def _extract_bearer_token_from_secret_result(result: Any) -> str | None:
+    """Parse a KAS `_kiro/secret/get` JSON `value` and return a safe Bearer access token."""
+    if not isinstance(result, Mapping):
+        return None
+    raw_value = result.get("value")
+    if isinstance(raw_value, str):
+        try:
+            parsed = json.loads(raw_value)
+        except json.JSONDecodeError, ValueError:
+            return None
+    elif isinstance(raw_value, Mapping):
+        parsed = raw_value
+    else:
+        return None
+    if not isinstance(parsed, Mapping):
+        return None
+    token = parsed.get("access_token")
+    if not isinstance(token, str) or not token.strip():
+        token = parsed.get("accessToken")
+    if not isinstance(token, str):
+        return None
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in token):
+        return None
+    cleaned = token.strip()
+    return cleaned or None
+
+
 class AcpDispatcher:
     """Routes ACP JSON-RPC 2.0 messages between KiroCrew stdio and SessionManager."""
 
@@ -622,6 +654,8 @@ class AcpDispatcher:
         )
         self._mcp_status_cache: dict[str, dict[str, McpServerStatus]] = {}
         self._client_opens_external_url: bool = False
+        self._client_secret_storage: bool = False
+        self._client_settings: dict[str, Any] = {}
         self._bg_tasks: set[asyncio.Task[Any]] = set()
         self._closed: bool = False
 
@@ -1603,6 +1637,34 @@ class AcpDispatcher:
                 }
             )
 
+    async def _resolve_kas_mcp_bearer_token(self, mcp_url: str) -> str | None:
+        """Best-effort `_kiro/secret/get` lookup for an HTTP MCP server's OAuth token."""
+        if not self._client_secret_storage or self._client_rpc_caller is None:
+            return None
+        try:
+            result = await self._client_rpc_caller(
+                "_kiro/secret/get",
+                {"key": kas_mcp_tokens_secret_key(mcp_url)},
+            )
+        except Exception:  # noqa: BLE001 - best-effort secret lookup must not break MCP probing
+            return None
+        return _extract_bearer_token_from_secret_result(result)
+
+    def _merge_client_settings_into_meta(
+        self,
+        meta: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Merge initialize-time `_meta.kiro.settings` defaults into session `_meta`."""
+        if not self._client_settings:
+            return meta
+        merged = dict(meta) if isinstance(meta, dict) else {}
+        raw_kiro = merged.get("kiro")
+        kiro_meta = dict(raw_kiro) if isinstance(raw_kiro, Mapping) else {}
+        if "settings" not in kiro_meta:
+            kiro_meta["settings"] = dict(self._client_settings)
+            merged["kiro"] = kiro_meta
+        return merged
+
     async def _emit_or_queue_mcp_readiness(
         self,
         session_id: str,
@@ -1615,6 +1677,11 @@ class AcpDispatcher:
             await self._emit_mcp_servers_initialized(session_id)
             return
 
+        self._session_manager.set_mcp_token_resolver(
+            self._resolve_kas_mcp_bearer_token
+            if (self._client_secret_storage and self._client_rpc_caller is not None)
+            else None
+        )
         if server_filter is None:
             statuses = await self._session_manager.probe_session_mcp_servers(
                 session_id,
@@ -1712,7 +1779,7 @@ class AcpDispatcher:
         desc = await self._session_manager.create_session(
             cwd=cwd,
             mcp_servers=mcp_servers,
-            meta=meta,
+            meta=self._merge_client_settings_into_meta(meta),
             additional_directories=additional_dirs,
         )
         await self._emit_post_session_open(desc["sessionId"], include_persisted_usage=True)
@@ -1754,7 +1821,7 @@ class AcpDispatcher:
                 session_id=session_id,
                 cwd=cwd,
                 mcp_servers=mcp_servers,
-                meta=meta,
+                meta=self._merge_client_settings_into_meta(meta),
                 additional_directories=additional_dirs,
             )
         except KeyError as exc:
@@ -1800,7 +1867,7 @@ class AcpDispatcher:
                 source_session_id=source_session_id,
                 cwd=cwd,
                 mcp_servers=mcp_servers,
-                meta=meta,
+                meta=self._merge_client_settings_into_meta(meta),
                 message_id=fork_msg_id,
                 additional_directories=additional_dirs,
             )
@@ -2462,6 +2529,11 @@ class AcpDispatcher:
                 raw_client_kiro = raw_client_meta.get("kiro")
                 if isinstance(raw_client_kiro, Mapping):
                     self._client_opens_external_url = raw_client_kiro.get("openExternalUrl") is True
+                    self._client_secret_storage = raw_client_kiro.get("secretStorage") is True
+                    raw_settings = raw_client_kiro.get("settings")
+                    self._client_settings = (
+                        dict(raw_settings) if isinstance(raw_settings, Mapping) else {}
+                    )
 
         init_res = self._wire_adapter.build_initialize_result(
             version=KIRO_CLI_COMPAT_VERSION,

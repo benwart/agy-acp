@@ -624,12 +624,19 @@ def _normalize_tool_arguments(
     tool_name: str = "",
 ) -> dict[str, Any]:
     """Normalize `agy` tool argument keys to ACP/KiroCrew standard keys (`command`, `path`)."""
-    if tool_name.lower() == "call_mcp_tool" or (
-        "ServerName" in arguments and "ToolName" in arguments
-    ):
+    lower_name = tool_name.strip().lower()
+    if lower_name == "call_mcp_tool" or ("ServerName" in arguments and "ToolName" in arguments):
         inner = arguments.get("Arguments")
         if isinstance(inner, Mapping):
             return dict(inner)
+        if inner is None:
+            return {}
+    if lower_name in {"list_resources", "read_resource"} and any(
+        k in arguments for k in ("ServerName", "server_name", "server")
+    ):
+        return {
+            k: v for k, v in arguments.items() if k not in {"ServerName", "server_name", "server"}
+        }
 
     normalized = dict(arguments)
     existing_cmd = normalized.get("command")
@@ -770,6 +777,8 @@ def _resolve_raw_tool_name(record: Mapping[str, Any], raw_args: Mapping[str, Any
 
     if "ServerName" in raw_args and "ToolName" in raw_args:
         return "call_mcp_tool"
+    if "ServerName" in raw_args and "Uri" in raw_args:
+        return "read_resource"
 
     title = str(record.get("title") or "").strip()
     if title and (" " not in title) and ("/" not in title or title.startswith("@")):
@@ -820,7 +829,12 @@ def _build_tool_event_from_record(
     ]
     acp_kind = (
         raw_kind
-        if (cls.acp_kind == "other" and not cls.mcp_server and raw_kind in _KIND_TO_FALLBACK_TOOL)
+        if (
+            cls.acp_kind == "other"
+            and not cls.mcp_server
+            and cls.kas_builtin_id != "mcp_resource"
+            and raw_kind in _KIND_TO_FALLBACK_TOOL
+        )
         else cls.acp_kind
     )
     event = ToolCallEvent(
@@ -914,6 +928,7 @@ class _ActiveTurnState:
     decisions: dict[str, bool] = field(default_factory=dict)
     rejection_reasons: dict[str, str] = field(default_factory=dict)
     evaluated_inputs: dict[str, dict[str, Any]] = field(default_factory=dict)
+    evaluated_identities: dict[str, tuple[str, str, str]] = field(default_factory=dict)
     policy_denied_tools: list[str] = field(default_factory=list)
     last_context_tokens: int = 0
     emitted_any_signal: bool = False
@@ -2165,19 +2180,23 @@ class AgyAcpClientProvider:
     ) -> tuple[bool, bool]:
         """Evaluate `on_tool_call(event)`, re-checking if `raw_input` populates later."""
         raw_input_snapshot = dict(event.raw_input)
+        identity_snapshot = (event.mcp_server, event.mcp_tool, event.kiro_tool_id)
         if tc_id in turn.decision_events:
             await turn.decision_events[tc_id].wait()
             prev_allowed = turn.decisions.get(tc_id, False)
-            if (
-                not prev_allowed
-                or not raw_input_snapshot
-                or turn.evaluated_inputs.get(tc_id) == raw_input_snapshot
+            identity_changed = turn.evaluated_identities.get(tc_id) != identity_snapshot
+            if not prev_allowed or (
+                not identity_changed
+                and (
+                    not raw_input_snapshot or turn.evaluated_inputs.get(tc_id) == raw_input_snapshot
+                )
             ):
                 return prev_allowed, turn.interrupt_event.is_set()
 
         dec_event = anyio.Event()
         turn.decision_events[tc_id] = dec_event
         turn.evaluated_inputs[tc_id] = raw_input_snapshot
+        turn.evaluated_identities[tc_id] = identity_snapshot
         turn.announced_tools.add(tc_id)
 
         try:
