@@ -47,7 +47,7 @@ from agy_acp.logic.tool_classifier import (
     resolve_model_for_effort,
     translate_mcp_server,
 )
-from agy_acp.logic.wire.base import synthesize_task_command
+from agy_acp.logic.wire.base import DEFAULT_MODEL_ID, synthesize_task_command
 from agy_acp.providers.acp_logger import log_acp_event, redact_sensitive_data
 from agy_acp.providers.state_store import SqliteStateStoreProvider
 from agy_acp.providers.telemetry import get_telemetry
@@ -1763,8 +1763,26 @@ class AgyAcpClientProvider:
         )
         fallback_from_model = ""
 
-        if model and model.strip() and model.strip().lower() != "auto":
-            clean_model = model.strip()
+        clean_model = model.strip() if model else ""
+        is_auto = not clean_model or clean_model.lower() == "auto"
+        known_ids = {
+            str(entry.get("modelId") or "").strip()
+            for entry in available_models
+            if isinstance(entry, Mapping) and entry.get("modelId")
+        }
+        if is_auto and DEFAULT_MODEL_ID in known_ids:
+            candidate = (
+                resolve_model_for_effort(DEFAULT_MODEL_ID, effort, available_models)
+                or DEFAULT_MODEL_ID
+            )
+            with contextlib.suppress(AgyAcpRpcError):
+                await conn.request(
+                    "session/set_model",
+                    {"sessionId": agy_sid, "modelId": candidate},
+                    timeout=self._rpc_timeout,
+                )
+                resolved_model = candidate
+        elif not is_auto:
             candidate = resolve_model_for_effort(clean_model, effort, available_models) or (
                 clean_model
             )

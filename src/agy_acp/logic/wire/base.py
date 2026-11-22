@@ -16,6 +16,8 @@ CompactionPhase = Literal["started", "completed", "failed"]
 ModelFallbackTrigger = Literal["availability", "refusal"]
 ModelFallbackScope = Literal["turn", "session"]
 
+DEFAULT_MODEL_ID = "gemini-4-neon-medium"
+
 DEFAULT_BASE_MODES: tuple[dict[str, str], ...] = (
     {
         "id": "read-only",
@@ -278,17 +280,20 @@ class EngineWireAdapter(ABC):
         models: Sequence[Mapping[str, str]],
         current_model: str,
     ) -> str:
-        """Resolve `"auto"` or unknown model IDs to the first concrete option when needed."""
+        """Resolve `"auto"` or unknown model IDs to the preferred default or first option."""
         option_ids = [
             str(m.get("modelId") or m.get("id") or "")
             for m in models
             if m.get("modelId") or m.get("id")
         ]
-        if current_model and current_model in option_ids:
-            return current_model
+        cleaned = current_model.strip() if current_model else ""
+        if cleaned and cleaned.lower() != "auto" and cleaned in option_ids:
+            return cleaned
+        if DEFAULT_MODEL_ID in option_ids:
+            return DEFAULT_MODEL_ID
         if option_ids:
             return option_ids[0]
-        return current_model or "gemini-3.7-pro"
+        return cleaned if (cleaned and cleaned.lower() != "auto") else DEFAULT_MODEL_ID
 
     @staticmethod
     def build_permission_options() -> list[dict[str, str]]:

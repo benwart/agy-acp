@@ -753,3 +753,23 @@ def test_normalize_agy_tool_event_maps_manage_task_and_send_command_input() -> N
     assert ev_sci.kas_tool_id == "run_command"
     assert ev_sci.kiro_v2_tool_name == "execute_bash"
     assert ev_sci.command == "send_command_input c1"
+
+
+def test_resolve_concrete_model_prefers_neon_medium_on_auto_and_empty_catalog() -> None:
+    """Verify `resolve_concrete_model` selects `gemini-4-neon-medium` for `auto` when present."""
+    from agy_acp.logic.wire.base import EngineWireAdapter
+
+    live_like_models = [
+        {"modelId": "gemini-4-neon-high", "name": "Gemini 4 Neon (High)"},
+        {"modelId": "gemini-4-neon-xhigh", "name": "Gemini 4 Neon (XHigh)"},
+        {"modelId": "gemini-4-neon-medium", "name": "Gemini 4 Neon (Medium)"},
+        {"modelId": "gemini-4-neon-low", "name": "Gemini 4 Neon (Low)"},
+    ]
+    assert EngineWireAdapter.resolve_concrete_model(live_like_models, "auto") == (
+        "gemini-4-neon-medium"
+    )
+    assert EngineWireAdapter.resolve_concrete_model(live_like_models, "") == (
+        "gemini-4-neon-medium"
+    )
+    assert EngineWireAdapter.resolve_concrete_model([], "auto") == "gemini-4-neon-medium"
+    assert EngineWireAdapter.resolve_concrete_model([], "") == "gemini-4-neon-medium"

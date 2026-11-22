@@ -2622,3 +2622,122 @@ async def test_should_only_report_policy_denied_tool_when_sibling_tools_are_inte
     assert res.response == "Tool `search_web` is not permitted in this session."
     assert "read_file" not in res.response
     assert "call_mcp_tool" not in res.response
+
+
+async def test_stream_prompt_auto_and_none_model_selects_neon_medium_on_backend(
+    tmp_path: Path,
+) -> None:
+    """Verify `model=None` and `model='auto'` switch backend `agy acp` to `gemini-4-neon-medium`."""
+    import stat
+
+    fake_agy = tmp_path / "fake-agy-neon"
+    fake_agy.write_text(
+        """#!/usr/bin/env python3
+import json
+import sys
+
+MODELS = [
+    {"modelId": "gemini-4-neon-high", "name": "Gemini 4 Neon (High)"},
+    {"modelId": "gemini-4-neon-xhigh", "name": "Gemini 4 Neon (XHigh)"},
+    {"modelId": "gemini-4-neon-medium", "name": "Gemini 4 Neon (Medium)"},
+    {"modelId": "gemini-4-neon-low", "name": "Gemini 4 Neon (Low)"},
+    {"modelId": "claude-sonnet-5-5-medium", "name": "Claude Sonnet 5.5 (Medium)"},
+]
+sessions = {}
+seq = 0
+
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method", "")
+    params = msg.get("params") or {}
+    if mid is None:
+        continue
+    if method == "initialize":
+        resp = {"protocolVersion": 1, "agentCapabilities": {"loadSession": True}}
+    elif method == "session/new":
+        seq += 1
+        sid = f"agy-neon-{seq}"
+        # Upstream agy acp starts on gemini-4-neon-high by default
+        sessions[sid] = {"model": "gemini-4-neon-high", "models_set": []}
+        resp = {
+            "sessionId": sid,
+            "models": {"currentModelId": "gemini-4-neon-high", "availableModels": MODELS},
+            "configOptions": [],
+        }
+    elif method in ("session/resume", "session/load"):
+        sid = params["sessionId"]
+        s = sessions.setdefault(sid, {"model": "gemini-4-neon-high", "models_set": []})
+        resp = {
+            "sessionId": sid,
+            "models": {"currentModelId": s["model"], "availableModels": MODELS},
+            "configOptions": [],
+        }
+    elif method == "session/set_model":
+        s = sessions[params["sessionId"]]
+        s["model"] = params["modelId"]
+        s["models_set"].append(params["modelId"])
+        resp = {}
+    elif method == "session/set_config_option":
+        resp = {"configOptions": []}
+    elif method == "session/prompt":
+        sid = params["sessionId"]
+        s = sessions[sid]
+        sys.stdout.write(json.dumps({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": sid,
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": json.dumps(s)},
+                },
+            },
+        }) + "\\n")
+        resp = {"stopReason": "end_turn", "usage": {"inputTokens": 2, "outputTokens": 2}}
+    else:
+        resp = {}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": resp}) + "\\n")
+    sys.stdout.flush()
+""",
+        encoding="utf-8",
+    )
+    fake_agy.chmod(fake_agy.stat().st_mode | stat.S_IEXEC)
+
+    store = SqliteStateStoreProvider(tmp_path / "state")
+    async with AgyAcpClientProvider(bin_path=fake_agy, state_store=store) as client:
+        # 1. model=None (default) -> switches backend from neon-high to neon-medium
+        first = await client.stream_prompt(
+            cwd=str(tmp_path),
+            session_id="sess-auto-neon",
+            prompt="hello",
+            model=None,
+        )
+        assert first.resolved_model == "gemini-4-neon-medium"
+        assert json.loads(first.response)["model"] == "gemini-4-neon-medium"
+
+        # 2. Switch to claude on resident backend session, then back to model="auto"
+        second = await client.stream_prompt(
+            cwd=str(tmp_path),
+            session_id="sess-auto-neon",
+            agy_session_id=first.conversation_id,
+            prompt="use claude",
+            model="claude-sonnet-5-5-medium",
+        )
+        assert second.resolved_model == "claude-sonnet-5-5-medium"
+        assert json.loads(second.response)["model"] == "claude-sonnet-5-5-medium"
+
+        third = await client.stream_prompt(
+            cwd=str(tmp_path),
+            session_id="sess-auto-neon",
+            agy_session_id=first.conversation_id,
+            prompt="back to auto",
+            model="auto",
+        )
+        assert third.resolved_model == "gemini-4-neon-medium"
+        third_state = json.loads(third.response)
+        assert third_state["model"] == "gemini-4-neon-medium"
+        assert "auto" not in third_state["models_set"]

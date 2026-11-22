@@ -9,11 +9,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from agy_acp.logic.wire.base import synthesize_task_command
+from agy_acp.logic.wire.base import DEFAULT_MODEL_ID, synthesize_task_command
 
 VALID_EFFORTS: frozenset[str] = frozenset({"low", "medium", "high", "xhigh", "max"})
 
 FALLBACK_MODELS: list[dict[str, str]] = [
+    {
+        "modelId": DEFAULT_MODEL_ID,
+        "name": "Gemini 4 Neon (Medium)",
+        "description": "Gemini 4 Neon (Medium)",
+    },
     {
         "modelId": "gemini-3.7-pro",
         "name": "Gemini 3.7 Pro",

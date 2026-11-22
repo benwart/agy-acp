@@ -1406,3 +1406,81 @@ def test_should_handle_excluded_and_unrestricted_agent_tools_in_system_prompt_ap
         )
         is None
     )
+
+
+async def test_default_and_auto_model_resolve_to_neon_medium(tmp_path: Path) -> None:
+    """Verify default and `auto` model selection resolve to `gemini-4-neon-medium`."""
+    from agy_acp.logic.session_manager import DEFAULT_MODEL_ID
+    from agy_acp.logic.tool_classifier import FALLBACK_MODELS
+
+    assert DEFAULT_MODEL_ID == "gemini-4-neon-medium"
+    assert FALLBACK_MODELS[0]["modelId"] == "gemini-4-neon-medium"
+
+    live_catalog = [
+        {"modelId": "gemini-4-neon-high", "name": "Gemini 4 Neon (High)"},
+        {"modelId": "gemini-4-neon-xhigh", "name": "Gemini 4 Neon (XHigh)"},
+        {"modelId": "gemini-4-neon-medium", "name": "Gemini 4 Neon (Medium)"},
+        {"modelId": "gemini-4-neon-low", "name": "Gemini 4 Neon (Low)"},
+        {"modelId": "claude-sonnet-5-5-medium", "name": "Claude Sonnet 5.5 (Medium)"},
+    ]
+
+    mgr_default = SessionManager(save_dir=tmp_path / "default")
+    mgr_default.state_store.save_models(live_catalog)
+    s_default = await mgr_default.create_session(cwd=str(tmp_path))
+    assert s_default["models"]["currentModelId"] == "gemini-4-neon-medium"
+    assert mgr_default.get_session(s_default["sessionId"])["model"] == "gemini-4-neon-medium"
+    assert mgr_default.get_session(s_default["sessionId"])["modelPinnedByUser"] is False
+
+    mgr_auto = SessionManager(save_dir=tmp_path / "auto", default_model="auto")
+    mgr_auto.state_store.save_models(live_catalog)
+    s_auto = await mgr_auto.create_session(
+        cwd=str(tmp_path),
+        meta={
+            "kiro": {
+                "customAgents": [
+                    {
+                        "id": "pinned-agent",
+                        "name": "Pinned Agent",
+                        "model": "claude-sonnet-5-5-medium",
+                        "prompt": "Pinned.",
+                    },
+                    {
+                        "id": "auto-agent",
+                        "name": "Auto Agent",
+                        "model": "auto",
+                        "prompt": "Auto.",
+                    },
+                ]
+            }
+        },
+    )
+    sid = s_auto["sessionId"]
+    assert s_auto["models"]["currentModelId"] == "gemini-4-neon-medium"
+    assert mgr_auto.get_session(sid)["model"] == "gemini-4-neon-medium"
+    assert mgr_auto.get_session(sid)["modelPinnedByUser"] is False
+
+    # Custom agent with pinned model can override `--model auto`, and switching to `"auto"` agent
+    # or base `"auto"` mode reverts back to `gemini-4-neon-medium`
+    await mgr_auto.set_mode(session_id=sid, mode_id="pinned-agent")
+    assert mgr_auto.get_session(sid)["model"] == "claude-sonnet-5-5-medium"
+    await mgr_auto.set_mode(session_id=sid, mode_id="auto-agent")
+    assert mgr_auto.get_session(sid)["model"] == "gemini-4-neon-medium"
+
+    # Explicit user pin via set_model / set_config_option, then unpin via "auto"
+    await mgr_auto.set_model(session_id=sid, model_id="claude-sonnet-5-5-medium")
+    assert mgr_auto.get_session(sid)["model"] == "claude-sonnet-5-5-medium"
+    assert mgr_auto.get_session(sid)["modelPinnedByUser"] is True
+
+    await mgr_auto.set_model(session_id=sid, model_id="auto")
+    assert mgr_auto.get_session(sid)["model"] == "gemini-4-neon-medium"
+    assert mgr_auto.get_session(sid)["modelPinnedByUser"] is False
+
+    await mgr_auto.set_config_option(
+        session_id=sid, config_id="model", value="claude-sonnet-5-5-medium"
+    )
+    assert mgr_auto.get_session(sid)["modelPinnedByUser"] is True
+    cfg_auto = await mgr_auto.set_config_option(session_id=sid, config_id="model", value="auto")
+    by_id = {opt["id"]: opt["currentValue"] for opt in cfg_auto["configOptions"]}
+    assert by_id["model"] == "gemini-4-neon-medium"
+    assert mgr_auto.get_session(sid)["model"] == "gemini-4-neon-medium"
+    assert mgr_auto.get_session(sid)["modelPinnedByUser"] is False
