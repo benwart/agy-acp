@@ -2741,3 +2741,364 @@ for raw in sys.stdin:
         third_state = json.loads(third.response)
         assert third_state["model"] == "gemini-4-neon-medium"
         assert "auto" not in third_state["models_set"]
+
+
+def _write_fake_quiet_and_policy_agy(tmp_path: Path) -> tuple[Path, Path]:
+    """Create a deterministic mock `agy acp` binary for quiet-turn and policy-recovery tests."""
+    script = tmp_path / "fake-agy-quiet-policy"
+    log_file = tmp_path / "fake-agy-quiet-policy.jsonl"
+    script.write_text(
+        f"""#!/usr/bin/env python3
+import json
+import sys
+import threading
+import time
+from pathlib import Path
+
+LOG_PATH = Path({str(log_file)!r})
+lock = threading.Lock()
+cancelled = set()
+prompt_count = 0
+
+
+def record(obj):
+    with lock:
+        with LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(obj) + "\\n")
+
+
+def send(obj):
+    with lock:
+        sys.stdout.write(json.dumps(obj) + "\\n")
+        sys.stdout.flush()
+
+
+def handle_prompt(mid, params):
+    global prompt_count
+    sid = params["sessionId"]
+    cancelled.discard(sid)
+    prompt_count += 1
+    blocks = params.get("prompt") or []
+    text = " ".join(
+        b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text"
+    )
+    record({{"type": "prompt", "count": prompt_count, "text": text}})
+
+    if "QUIET_NOTHING_TO_DO" in text:
+        send({{
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {{
+                "sessionId": sid,
+                "update": {{
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "tc_ntd_1",
+                    "name": "call_mcp_tool",
+                    "status": "in_progress",
+                    "rawInput": {{
+                        "ServerName": "kirocrew-core",
+                        "ToolName": "nothing_to_do",
+                        "Arguments": {{}},
+                    }},
+                }},
+            }},
+        }})
+        time.sleep(0.02)
+        directive_out = (
+            'Turn ended quietly.\\n[[KIROCREW_SESSION_DIRECTIVE]]'
+            '{{"kind":"nothing_to_do","reason":"quiet wake"}}'
+        )
+        send({{
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {{
+                "sessionId": sid,
+                "update": {{
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "tc_ntd_1",
+                    "status": "completed",
+                    "rawOutput": directive_out,
+                }},
+            }},
+        }})
+        # Wait up to 0.3s to see if client cancels before Gemini runs a post-directive step
+        deadline = time.monotonic() + 0.3
+        while time.monotonic() < deadline and sid not in cancelled:
+            time.sleep(0.01)
+        if sid in cancelled:
+            # Simulate a racing trailing "." chunk after cancel to ensure suppression
+            send({{
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {{
+                    "sessionId": sid,
+                    "update": {{
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {{"type": "text", "text": "."}},
+                    }},
+                }},
+            }})
+            send({{"jsonrpc": "2.0", "id": mid, "result": {{"stopReason": "cancelled"}}}})
+            return
+        send({{
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {{
+                "sessionId": sid,
+                "update": {{
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {{"type": "text", "text": "."}},
+                }},
+            }},
+        }})
+        send({{"jsonrpc": "2.0", "id": mid, "result": {{"stopReason": "end_turn"}}}})
+        return
+
+    if "REFUSED_NOTHING_TO_DO" in text:
+        send({{
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {{
+                "sessionId": sid,
+                "update": {{
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "tc_ntd_refused",
+                    "name": "call_mcp_tool",
+                    "status": "in_progress",
+                    "rawInput": {{
+                        "ServerName": "kirocrew-core",
+                        "ToolName": "nothing_to_do",
+                        "Arguments": {{}},
+                    }},
+                }},
+            }},
+        }})
+        time.sleep(0.02)
+        send({{
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {{
+                "sessionId": sid,
+                "update": {{
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "tc_ntd_refused",
+                    "status": "completed",
+                    "rawOutput": "Refused: a human is waiting on your reply.",
+                }},
+            }},
+        }})
+        time.sleep(0.05)
+        send({{
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {{
+                "sessionId": sid,
+                "update": {{
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {{"type": "text", "text": "Still here"}},
+                }},
+            }},
+        }})
+        send({{"jsonrpc": "2.0", "id": mid, "result": {{"stopReason": "end_turn"}}}})
+        return
+
+    if (
+        "DENY_SCHEDULE_THEN_RECOVER" in text
+        or "DENY_SCHEDULE_ALWAYS" in text
+        or "[TOOL POLICY]" in text
+    ):
+        if "[TOOL POLICY]" in text and not Path({str(tmp_path / "always_deny")!r}).exists():
+            send({{
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {{
+                    "sessionId": sid,
+                    "update": {{
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {{"type": "text", "text": "Recovered cleanly"}},
+                    }},
+                }},
+            }})
+            send({{"jsonrpc": "2.0", "id": mid, "result": {{"stopReason": "end_turn"}}}})
+            return
+        send({{
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {{
+                "sessionId": sid,
+                "update": {{
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": f"tc_sched_{{prompt_count}}",
+                    "name": "schedule",
+                    "kind": "other",
+                    "status": "in_progress",
+                    "rawInput": {{"DurationSeconds": 60, "Prompt": "check"}},
+                }},
+            }},
+        }})
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline and sid not in cancelled:
+            time.sleep(0.01)
+        send({{"jsonrpc": "2.0", "id": mid, "result": {{"stopReason": "cancelled"}}}})
+        return
+
+    send({{"jsonrpc": "2.0", "id": mid, "result": {{"stopReason": "end_turn"}}}})
+
+
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method", "")
+    params = msg.get("params") or {{}}
+    if method == "session/cancel":
+        sid = params.get("sessionId", "")
+        cancelled.add(sid)
+        record({{"type": "cancel", "sessionId": sid}})
+        continue
+    if mid is None:
+        continue
+    if method == "initialize":
+        init_res = {{"protocolVersion": 1, "agentCapabilities": {{"loadSession": True}}}}
+        send({{"jsonrpc": "2.0", "id": mid, "result": init_res}})
+    elif method == "session/new":
+        new_res = {{
+            "sessionId": "agy-qp-1",
+            "models": {{"currentModelId": "gemini-4-neon-medium", "availableModels": []}},
+            "configOptions": [],
+        }}
+        send({{"jsonrpc": "2.0", "id": mid, "result": new_res}})
+    elif method == "session/prompt":
+        threading.Thread(target=handle_prompt, args=(mid, params), daemon=True).start()
+    else:
+        send({{"jsonrpc": "2.0", "id": mid, "result": {{}}}})
+""",
+        encoding="utf-8",
+    )
+    script.chmod(script.stat().st_mode | stat.S_IEXEC)
+    return script, log_file
+
+
+async def test_nothing_to_do_directive_terminates_turn_cleanly_without_trailing_dot(
+    tmp_path: Path,
+) -> None:
+    """Verify `kirocrew-core` `nothing_to_do` with directive cancels cleanly as `end_turn`."""
+    script, log_file = _write_fake_quiet_and_policy_agy(tmp_path)
+    store = SqliteStateStoreProvider(tmp_path / "state")
+    text_chunks: list[str] = []
+    tool_updates: list[ToolCallEvent] = []
+
+    async def on_text(chunk: str) -> None:
+        text_chunks.append(chunk)
+
+    async def on_tool_update(ev: ToolCallEvent) -> None:
+        tool_updates.append(ev)
+
+    async with AgyAcpClientProvider(bin_path=script, state_store=store) as client:
+        res = await client.stream_prompt(
+            cwd=str(tmp_path),
+            session_id="sess-quiet-end",
+            prompt="QUIET_NOTHING_TO_DO",
+            known_mcp_servers=("kirocrew-core",),
+            on_text=on_text,
+            on_tool_update=on_tool_update,
+        )
+
+    assert res.stop_reason == "end_turn"
+    assert res.response == ""
+    assert text_chunks == []
+    assert len(tool_updates) == 1
+    assert tool_updates[0].status == "completed"
+    assert "[[KIROCREW_SESSION_DIRECTIVE]]" in tool_updates[0].output
+    records = [json.loads(line) for line in log_file.read_text(encoding="utf-8").splitlines()]
+    assert any(r["type"] == "cancel" for r in records)
+
+
+async def test_nothing_to_do_refusal_does_not_terminate_turn_early(
+    tmp_path: Path,
+) -> None:
+    """Verify refused `nothing_to_do` (no directive payload) lets the model finish normally."""
+    script, log_file = _write_fake_quiet_and_policy_agy(tmp_path)
+    store = SqliteStateStoreProvider(tmp_path / "state")
+
+    async with AgyAcpClientProvider(bin_path=script, state_store=store) as client:
+        res = await client.stream_prompt(
+            cwd=str(tmp_path),
+            session_id="sess-refused-ntd",
+            prompt="REFUSED_NOTHING_TO_DO",
+            known_mcp_servers=("kirocrew-core",),
+        )
+
+    assert res.stop_reason == "end_turn"
+    assert res.response == "Still here"
+    records = [json.loads(line) for line in log_file.read_text(encoding="utf-8").splitlines()]
+    assert not any(r["type"] == "cancel" for r in records)
+
+
+async def test_policy_recovery_retries_once_and_recovers_cleanly(
+    tmp_path: Path,
+) -> None:
+    """Verify `allow_policy_recovery=True` steers once in-turn instead of emitting a chat notice."""
+    script, log_file = _write_fake_quiet_and_policy_agy(tmp_path)
+    store = SqliteStateStoreProvider(tmp_path / "state")
+    text_chunks: list[str] = []
+
+    async def on_text(chunk: str) -> None:
+        text_chunks.append(chunk)
+
+    async def on_tool_call(ev: ToolCallEvent) -> bool:
+        return ev.v2_tool_name != "schedule"
+
+    async with AgyAcpClientProvider(bin_path=script, state_store=store) as client:
+        res = await client.stream_prompt(
+            cwd=str(tmp_path),
+            session_id="sess-policy-recover",
+            prompt="DENY_SCHEDULE_THEN_RECOVER",
+            allow_policy_recovery=True,
+            on_text=on_text,
+            on_tool_call=on_tool_call,
+        )
+
+    assert res.stop_reason == "end_turn"
+    assert res.response == "Recovered cleanly"
+    assert text_chunks == ["Recovered cleanly"]
+    prompts = [
+        json.loads(line)
+        for line in log_file.read_text(encoding="utf-8").splitlines()
+        if json.loads(line)["type"] == "prompt"
+    ]
+    assert len(prompts) == 2
+    assert "[TOOL POLICY]" in prompts[1]["text"]
+    assert "`schedule`" in prompts[1]["text"]
+
+
+async def test_policy_recovery_falls_back_to_notice_when_retry_also_denied(
+    tmp_path: Path,
+) -> None:
+    """Verify policy recovery retries at most once and falls back to the policy notice."""
+    (tmp_path / "always_deny").write_text("1", encoding="utf-8")
+    script, log_file = _write_fake_quiet_and_policy_agy(tmp_path)
+    store = SqliteStateStoreProvider(tmp_path / "state")
+
+    async def on_tool_call(_ev: ToolCallEvent) -> bool:
+        return False
+
+    async with AgyAcpClientProvider(bin_path=script, state_store=store) as client:
+        res = await client.stream_prompt(
+            cwd=str(tmp_path),
+            session_id="sess-policy-fallback",
+            prompt="DENY_SCHEDULE_ALWAYS",
+            allow_policy_recovery=True,
+            on_tool_call=on_tool_call,
+        )
+
+    assert res.stop_reason == "end_turn"
+    assert res.response == "Tool `schedule` is not permitted in this session."
+    prompts = [
+        json.loads(line)
+        for line in log_file.read_text(encoding="utf-8").splitlines()
+        if json.loads(line)["type"] == "prompt"
+    ]
+    assert len(prompts) == 2

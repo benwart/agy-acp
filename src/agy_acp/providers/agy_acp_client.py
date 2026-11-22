@@ -796,6 +796,23 @@ def _is_native_subagent_tool(raw_tool_name: str, cls: ToolCallClassification) ->
     )
 
 
+def _is_terminal_nothing_to_do_update(
+    cls: ToolCallClassification,
+    event: ToolCallEvent,
+    raw_status: str,
+) -> bool:
+    """Return True when `kirocrew-core` `nothing_to_do` completes with its session directive."""
+    if raw_status not in _DONE_TOOL_STATUSES:
+        return False
+    is_nothing_to_do = (cls.mcp_server == "kirocrew-core" and cls.mcp_tool == "nothing_to_do") or (
+        event.mcp_server == "kirocrew-core" and event.mcp_tool == "nothing_to_do"
+    )
+    if not is_nothing_to_do:
+        return False
+    output = event.output or ""
+    return "[[KIROCREW_SESSION_DIRECTIVE]]" in output and '"nothing_to_do"' in output
+
+
 def _build_tool_event_from_record(
     tc_id: str,
     record: Mapping[str, Any],
@@ -930,6 +947,7 @@ class _ActiveTurnState:
     evaluated_inputs: dict[str, dict[str, Any]] = field(default_factory=dict)
     evaluated_identities: dict[str, tuple[str, str, str]] = field(default_factory=dict)
     policy_denied_tools: list[str] = field(default_factory=list)
+    quiet_end_completed: bool = False
     last_context_tokens: int = 0
     emitted_any_signal: bool = False
     in_flight_handlers: int = 0
@@ -2182,7 +2200,11 @@ class AgyAcpClientProvider:
     async def _flush_turn_retry_boundary(self, turn: _ActiveTurnState) -> None:
         async with turn.stream_lock:
             step = turn.retry_filter.flush_before_boundary()
-            allow = not (turn.interrupt_event.is_set() or turn.policy_denied_tools)
+            allow = not (
+                turn.interrupt_event.is_set()
+                or turn.policy_denied_tools
+                or turn.quiet_end_completed
+            )
             await self._apply_retry_step(
                 turn,
                 step,
@@ -2409,7 +2431,9 @@ class AgyAcpClientProvider:
         kind: str,
         update: Mapping[str, Any],
     ) -> None:
-        if (turn.interrupt_event.is_set() or turn.policy_denied_tools) and kind not in {
+        if (
+            turn.interrupt_event.is_set() or turn.policy_denied_tools or turn.quiet_end_completed
+        ) and kind not in {
             "tool_call",
             "tool_call_update",
         }:
@@ -2511,6 +2535,14 @@ class AgyAcpClientProvider:
         if raw_status in (_DONE_TOOL_STATUSES | _FAILED_TOOL_STATUSES):
             terminal = "failed" if raw_status in _FAILED_TOOL_STATUSES else "completed"
             await self._emit_terminal_tool_update(turn, tc_id, replace(event, status=terminal))
+            if (
+                _is_terminal_nothing_to_do_update(cls, event, raw_status)
+                and not self._steer_queues.get(turn.session_id)
+                and not turn.quiet_end_completed
+            ):
+                turn.quiet_end_completed = True
+                turn.interrupt_event.set()
+                await self._send_agy_cancel(turn.agy_session_id)
 
     @classmethod
     async def _emit_rejected_tool_update(
@@ -2644,6 +2676,7 @@ class AgyAcpClientProvider:
         sandbox: bool = False,
         effort: str | None = "medium",
         route_spawn_run: bool = False,
+        allow_policy_recovery: bool = False,
         known_mcp_servers: Sequence[str] = (),
         env: Mapping[str, str] | None = None,
         on_thought: Callable[[str], Awaitable[None]] | None = None,
@@ -2696,6 +2729,7 @@ class AgyAcpClientProvider:
         outcome_error = ""
         current_blocks = normalize_acp_content_blocks(content_blocks, prompt=prompt)
         recovered_once = False
+        policy_recovered_once = False
 
         self._active_turns.add(sid)
         try:
@@ -2765,6 +2799,7 @@ class AgyAcpClientProvider:
                             allow_tail = not (
                                 turn_state.interrupt_event.is_set()
                                 or turn_state.policy_denied_tools
+                                or turn_state.quiet_end_completed
                             )
                             await self._apply_retry_step(
                                 turn_state,
@@ -2806,6 +2841,7 @@ class AgyAcpClientProvider:
                 was_user_cancelled = sid in self._cancelled_sessions or (
                     not self._steer_queues.get(sid)
                     and not turn_state.policy_denied_tools
+                    and not turn_state.quiet_end_completed
                     and str(prompt_res.get("stopReason") or "").lower() in {"cancelled", "canceled"}
                 )
                 self._cancelled_sessions.discard(sid)
@@ -2835,12 +2871,33 @@ class AgyAcpClientProvider:
                     current_blocks = [block for entry in entries for block in entry.content_blocks]
                     continue
 
-                if turn_state.policy_denied_tools and not collected_texts:
+                if turn_state.quiet_end_completed:
+                    break
+
+                if turn_state.policy_denied_tools:
                     unique_denied = list(dict.fromkeys(turn_state.policy_denied_tools))
-                    notice = f"Tool `{', '.join(unique_denied)}` is not permitted in this session."
-                    collected_texts.append(notice)
-                    if on_text is not None:
-                        await on_text(notice)
+                    denied_csv = ", ".join(unique_denied)
+                    if allow_policy_recovery and not policy_recovered_once:
+                        policy_recovered_once = True
+                        current_blocks = [
+                            {
+                                "type": "text",
+                                "text": (
+                                    f"[TOOL POLICY] Built-in tool `{denied_csv}` is disabled in "
+                                    f"this session and was cancelled. Do NOT call `{denied_csv}`. "
+                                    "Use only your permitted session and MCP tools (for example "
+                                    "`kirocrew-core` `nothing_to_do` for quiet turn ends, "
+                                    "`monitor_start`/`wait`, or `kirocrew-cron`), or reply "
+                                    "directly in plain text."
+                                ),
+                            }
+                        ]
+                        continue
+                    if not collected_texts:
+                        notice = f"Tool `{denied_csv}` is not permitted in this session."
+                        collected_texts.append(notice)
+                        if on_text is not None:
+                            await on_text(notice)
                 break
         finally:
             self._active_turns.discard(sid)

@@ -229,6 +229,7 @@ class SqliteStateStoreProvider:
             "modelPinnedByUser": bool(auth_cfg.get("_model_pinned_by_user", False)),
             "compactedSummary": auth_cfg.get("_compacted_summary"),
             "reinjectAgentPrompt": bool(auth_cfg.get("_reinject_agent_prompt", False)),
+            "policyPromptVersion": int(auth_cfg.get("_policy_prompt_version") or 0),
             "contextPaths": context_paths,
             "knowledgeEntries": knowledge_entries,
             "model": str(row["model"]),
@@ -327,6 +328,12 @@ class SqliteStateStoreProvider:
                 auth_config["_reinject_agent_prompt"] = True
             else:
                 auth_config.pop("_reinject_agent_prompt", None)
+        if "policyPromptVersion" in state:
+            policy_ver = int(state["policyPromptVersion"] or 0)
+            if policy_ver > 0:
+                auth_config["_policy_prompt_version"] = policy_ver
+            else:
+                auth_config.pop("_policy_prompt_version", None)
         if "additionalDirectories" in state:
             if isinstance(state["additionalDirectories"], list) and state["additionalDirectories"]:
                 auth_config["_additional_directories"] = [

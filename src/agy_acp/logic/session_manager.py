@@ -41,6 +41,7 @@ from agy_acp.providers.state_store import SqliteStateStoreProvider
 from agy_acp.providers.telemetry import TelemetryCallbacks, get_telemetry
 
 DEFAULT_REASONING_EFFORT = "medium"
+_POLICY_PROMPT_VERSION = 2
 
 _KIROCREW_SPAWN_ROUTING_DIRECTIVE = (
     "[KIROCREW SUBAGENT ROUTING]\n"
@@ -49,6 +50,17 @@ _KIROCREW_SPAWN_ROUTING_DIRECTIVE = (
     "`Arguments={...}`; read `<appDataDir>/mcp/kirocrew-core/spawn_run.json` first if needed). "
     "NEVER call built-in `invoke_subagent`, `define_subagent`, or `manage_subagents`, "
     "because native subagents bypass KiroCrew chat cards and completion events."
+)
+
+_KIROCREW_QUIET_TURN_CONTRACT = (
+    "[KIROCREW QUIET TURN CONTRACT]\n"
+    "- NEVER call native `schedule` (use `kirocrew-cron`, `monitor_start`, or `wait` when "
+    "permitted, or `nothing_to_do` on quiet wakes).\n"
+    "- On ANY non-user wake (`[Heartbeat]`, `[Worker report]`, `[work-ledger wake]`, "
+    "`[monitor wake]`, `[auto-nudge cycle]`) that needs no user-visible chat message, "
+    "ALWAYS end the turn by calling `kirocrew-core` `nothing_to_do` -- NEVER output a bare "
+    "`.` or filler text to satisfy an empty-output check.\n"
+    "[END KIROCREW QUIET TURN CONTRACT]"
 )
 
 _READ_ONLY_TOOL_NAMES: frozenset[str] = _READ_ONLY_KIRO_TOOLS | {
@@ -260,6 +272,61 @@ def _is_zero_tool_session(session: Mapping[str, Any]) -> bool:
     )
 
 
+def _session_has_kirocrew_core(session: Mapping[str, Any]) -> bool:
+    """Return whether `session` exposes an enabled `kirocrew-core` MCP server."""
+    raw_servers = session.get("mcp_servers")
+    if not isinstance(raw_servers, list) or not raw_servers:
+        raw_servers = session.get("wire_mcp_servers")
+    if not isinstance(raw_servers, list):
+        return False
+    return any(
+        isinstance(srv, Mapping)
+        and str(srv.get("name") or "").strip() == "kirocrew-core"
+        and srv.get("disabled") is not True
+        for srv in raw_servers
+    )
+
+
+def _build_policy_guidance_sections(
+    session: Mapping[str, Any],
+    *,
+    user_text: str = "",
+) -> list[str]:
+    """Build `[DISALLOWED NATIVE TOOLS]` and `[KIROCREW QUIET TURN CONTRACT]` sections."""
+    sections: list[str] = []
+    is_zero_tool = _is_zero_tool_session(session)
+    if "[DISALLOWED NATIVE TOOLS]" not in user_text:
+        if is_zero_tool:
+            sections.append(
+                "[DISALLOWED NATIVE TOOLS]\n"
+                "ALL built-in and MCP tools (including `call_mcp_tool`, `list_resources`, "
+                "`read_resource`, `schedule`, `run_workflow`, `swarm`, `ask_question`, and all "
+                "file, shell, web, and subagent tools) are disabled (`tools: []`) and will abort "
+                "the turn if called.\n"
+                "You MUST respond strictly in plain text without calling any tool.\n"
+                "[END DISALLOWED NATIVE TOOLS]"
+            )
+        else:
+            disallowed_native = _compute_disallowed_native_tools(session)
+            if disallowed_native:
+                tool_list = ", ".join(f"`{name}`" for name in disallowed_native)
+                sections.append(
+                    "[DISALLOWED NATIVE TOOLS]\n"
+                    "The following built-in tools are NOT permitted by this agent's policy and "
+                    f"will abort the turn if called: {tool_list}.\n"
+                    "NEVER call any of these tools. Use only permitted tools and available "
+                    "MCP tools.\n"
+                    "[END DISALLOWED NATIVE TOOLS]"
+                )
+    if (
+        not is_zero_tool
+        and _session_has_kirocrew_core(session)
+        and "[KIROCREW QUIET TURN CONTRACT]" not in user_text
+    ):
+        sections.append(_KIROCREW_QUIET_TURN_CONTRACT)
+    return sections
+
+
 def _build_system_prompt_append(
     session: Mapping[str, Any],
     *,
@@ -285,29 +352,7 @@ def _build_system_prompt_append(
             )
     if _session_has_kirocrew_spawn_run(session) and "[KIROCREW SUBAGENT ROUTING]" not in user_text:
         sections.append(_KIROCREW_SPAWN_ROUTING_DIRECTIVE)
-    if "[DISALLOWED NATIVE TOOLS]" not in user_text:
-        if _is_zero_tool_session(session):
-            sections.append(
-                "[DISALLOWED NATIVE TOOLS]\n"
-                "ALL built-in and MCP tools (including `call_mcp_tool`, `list_resources`, "
-                "`read_resource`, `schedule`, `run_workflow`, `swarm`, `ask_question`, and all "
-                "file, shell, web, and subagent tools) are disabled (`tools: []`) and will abort "
-                "the turn if called.\n"
-                "You MUST respond strictly in plain text without calling any tool.\n"
-                "[END DISALLOWED NATIVE TOOLS]"
-            )
-        else:
-            disallowed_native = _compute_disallowed_native_tools(session)
-            if disallowed_native:
-                tool_list = ", ".join(f"`{name}`" for name in disallowed_native)
-                sections.append(
-                    "[DISALLOWED NATIVE TOOLS]\n"
-                    "The following built-in tools are NOT permitted by this agent's policy and "
-                    f"will abort the turn if called: {tool_list}.\n"
-                    "NEVER call any of these tools. Use only permitted tools and available "
-                    "MCP tools.\n"
-                    "[END DISALLOWED NATIVE TOOLS]"
-                )
+    sections.extend(_build_policy_guidance_sections(session, user_text=user_text))
     return "\n\n".join(sections) if sections else None
 
 
@@ -1317,6 +1362,7 @@ class SessionManager:
             "agent": self._default_agent,
             "model": initial_model,
             "modelPinnedByUser": bool(self._default_model),
+            "policyPromptVersion": _POLICY_PROMPT_VERSION,
             "reasoning_effort": self._default_effort or DEFAULT_REASONING_EFFORT,
             "cancelled": False,
         }
@@ -1744,6 +1790,27 @@ class SessionManager:
                 prefix_sections.append(f"[Compacted Session Summary]\n{compacted_summary.strip()}")
                 consumed_compacted_summary = True
 
+            effective_session = (
+                session
+                if self._mcp_enabled
+                else {**session, "mcp_servers": [], "wire_mcp_servers": []}
+            )
+            needs_policy_stamp = (
+                int(session.get("policyPromptVersion") or 0) < _POLICY_PROMPT_VERSION
+            )
+            if conversation_id is not None and needs_policy_stamp:
+                incoming_text = "\n".join(
+                    str(b.get("text") or "")
+                    for b in prompt_blocks
+                    if isinstance(b, Mapping) and b.get("type") == "text"
+                )
+                policy_sections = _build_policy_guidance_sections(
+                    effective_session,
+                    user_text=incoming_text,
+                )
+                if policy_sections:
+                    prefix_sections.extend(policy_sections)
+
             prefix_str = "\n\n".join(prefix_sections).strip()
             formatted_prompt, content_blocks = _build_acp_content_blocks(
                 prompt_blocks,
@@ -1756,6 +1823,9 @@ class SessionManager:
                 else formatted_prompt
             )
             dedup_user_text = "" if reinjected_prompt else raw_user_text
+            allow_policy_recovery = not _is_zero_tool_session(session) and bool(
+                _compute_disallowed_native_tools(session)
+            )
 
             outcome = None
             with self.turn_cancel_scope(session_id) as scope:
@@ -1768,6 +1838,7 @@ class SessionManager:
                     mode=mode,
                     effort=effort,
                     skip_permissions=skip_permissions,
+                    allow_policy_recovery=allow_policy_recovery,
                     on_thought=on_thought,
                     on_text=on_text,
                     on_tool_call=on_tool_call,
@@ -1819,6 +1890,7 @@ class SessionManager:
                 or ctx_tokens > 0
                 or consumed_compacted_summary
                 or reinjected_prompt
+                or needs_policy_stamp
             ):
                 if outcome.conversation_id:
                     latest["agyConversationId"] = outcome.conversation_id
@@ -1826,6 +1898,8 @@ class SessionManager:
                     latest["compactedSummary"] = None
                 if reinjected_prompt:
                     latest["reinjectAgentPrompt"] = False
+                if needs_policy_stamp:
+                    latest["policyPromptVersion"] = _POLICY_PROMPT_VERSION
                 if has_fallback:
                     latest["model"] = effective_resolved_model
                 elif (
