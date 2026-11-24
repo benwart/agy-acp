@@ -1,3 +1,12 @@
+## [1.10.0](https://github.com/benwart/agy-acp/compare/v1.9.1...v1.10.0) (2026-11-24)
+
+### Features
+
+* **acp:** KiroCrew 0.14.0-rc.1 [@mcp](https://github.com/mcp) wildcard exclusions and unresolved wrapper guard ([#19](https://github.com/benwart/agy-acp/issues/19)) ([760d4ed](https://github.com/benwart/agy-acp/commit/760d4edefb45925a2efe97cb46d1db755883c5a6))
+* **acp:** support KiroCrew 0.14.0-rc.1 [@mcp](https://github.com/mcp) wildcard exclusions and unresolved wrapper guard ([1f1887f](https://github.com/benwart/agy-acp/commit/1f1887f7a8a130bc79039c9369f045b199393f6b))
+* **acp:** sync kiro-cli 3.6.0 compatibility ([ad35066](https://github.com/benwart/agy-acp/commit/ad3506645dcc11f84f0a24370393e91feda9c3cd))
+* **acp:** sync kiro-cli 3.6.0 compatibility ([#18](https://github.com/benwart/agy-acp/issues/18)) ([8a2f351](https://github.com/benwart/agy-acp/commit/8a2f3510b2260482683025d4c00b7a3d0e22fef6))
+
 ## [1.9.1](https://github.com/benwart/agy-acp/compare/v1.9.0...v1.9.1) (2026-11-22)
 
 ### Bug Fixes
