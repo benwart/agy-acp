@@ -20,13 +20,13 @@ def test_cli_scaffold_help_and_version(capsys: pytest.CaptureFixture[str]) -> No
         (Path(__file__).resolve().parents[2] / "pyproject.toml").read_text(encoding="utf-8")
     )
     assert __version__ == pyproject["project"]["version"]
-    assert KIRO_CLI_COMPAT_VERSION == "3.5.0"
+    assert KIRO_CLI_COMPAT_VERSION == "3.6.0"
     app(["--version"], result_action="return_value")
     version_out = capsys.readouterr().out.strip()
     assert f"{__version__} kiro-cli {KIRO_CLI_COMPAT_VERSION}" in version_out
     last_token = version_out.split()[-1]
     major, minor, patch = (int(part) for part in last_token.split(".")[:3])
-    assert (major, minor, patch) >= (3, 5, 0)
+    assert (major, minor, patch) >= (3, 6, 0)
 
     app(["--help"], result_action="return_value")
     root_help = capsys.readouterr().out
@@ -61,7 +61,7 @@ def test_update_command_refreshes_wrapper_mtime(
     assert rc == 0
     out = capsys.readouterr().out
     assert __version__ in out
-    assert "3.5.0" in out
+    assert "3.6.0" in out
     assert fake_bin.stat().st_mtime > 1_700_000_000
 
 
