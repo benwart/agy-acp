@@ -100,7 +100,9 @@ _FS_TOOL_IDS: frozenset[str] = frozenset(
 _POLICY_ALIAS_DENY_ONLY_IDS: frozenset[str] = frozenset(
     {"delete_file", "control_bash_process", "control_pwsh_process"}
 )
-_UNRESOLVED_MCP_WRAPPER_IDS: frozenset[str] = frozenset({"call_mcp_tool", "mcp_resource"})
+_UNRESOLVED_MCP_WRAPPER_IDS: frozenset[str] = frozenset(
+    {"call_mcp_tool", "mcp_resource", "list_resources", "read_resource"}
+)
 _TOOL_CAPABILITY_ALIASES: dict[str, tuple[str, ...]] = {
     "read_file": ("fs_read", "read"),
     "list_directory": ("fs_read", "read"),
@@ -141,7 +143,7 @@ def _resolve_event_mcp_identity(
         return matched if matched != ("", "") else (event.mcp_server, event.mcp_tool)
 
     for raw_candidate in (event.kiro_tool_id, event.kiro_tool_name, event.title):
-        if not isinstance(raw_candidate, str):
+        if not isinstance(raw_candidate, str) or raw_candidate in _UNRESOLVED_MCP_WRAPPER_IDS:
             continue
         if raw_candidate.startswith("mcp_") and len(raw_candidate) > 4:
             after_prefix = raw_candidate[4:]
@@ -238,6 +240,7 @@ def _matches_agent_tool_list(
     norm: NormalizedToolEvent,
     *,
     for_allowlist: bool = False,
+    for_exclusions: bool = False,
 ) -> bool:
     """Return True if `norm` matches an entry in `tools`, `excludedTools`, or `allowedTools`."""
     if not patterns:
@@ -246,6 +249,8 @@ def _matches_agent_tool_list(
     if norm.is_mcp:
         candidates.update(
             {
+                "@*",
+                "@mcp",
                 f"@{norm.mcp_server}",
                 f"@{norm.mcp_server}/*",
                 f"@{norm.mcp_server}/{norm.mcp_tool}",
@@ -253,8 +258,11 @@ def _matches_agent_tool_list(
             }
         )
     elif norm.kas_tool_id in _UNRESOLVED_MCP_WRAPPER_IDS:
-        # Unresolved MCP wrapper calls must never match the `"builtin"` allowlist/toolset.
+        # Unresolved MCP wrapper calls must never match `"builtin"` or wildcard MCP allowlists,
+        # but wildcard MCP exclusions (`@*`, `@mcp`) must still deny them fail-closed.
         candidates.add(norm.kas_tool_id)
+        if for_exclusions:
+            candidates.update({"@*", "@mcp"})
     elif for_allowlist and (
         norm.kas_tool_id in _POLICY_ALIAS_DENY_ONLY_IDS or norm.kind == "delete"
     ):
@@ -916,7 +924,7 @@ class AcpDispatcher:
                 if isinstance(x, str) and x
             )
         )
-        if _matches_agent_tool_list(excluded_tools, norm, for_allowlist=False):
+        if _matches_agent_tool_list(excluded_tools, norm, for_allowlist=False, for_exclusions=True):
             return "deny"
 
         raw_session_tools = session.get("agentTools")
