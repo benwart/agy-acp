@@ -75,6 +75,8 @@ _READ_ONLY_TOOL_NAMES: frozenset[str] = _READ_ONLY_KIRO_TOOLS | {
 _SPAWN_RUN_ALLOW_PATTERNS: frozenset[str] = frozenset(
     {
         "*",
+        "@*",
+        "@mcp",
         "@kirocrew-core",
         "@kirocrew-core/*",
         "@kirocrew-core/spawn_run",
