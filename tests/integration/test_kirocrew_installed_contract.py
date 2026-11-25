@@ -264,13 +264,13 @@ def test_installed_kirocrew_version_floors_and_cli_version_probe(
     installed_contract: InstalledKiroCrewContract,
     run_cli: Callable[[list[str]], CliResult],
 ) -> None:
-    """Verify `agy-acp --version` reports kiro-cli 3.6.0 and satisfies all KiroCrew floors."""
-    assert KIRO_CLI_COMPAT_VERSION == "3.6.0"
+    """Verify `agy-acp --version` reports kiro-cli 3.6.1 and satisfies all KiroCrew floors."""
+    assert KIRO_CLI_COMPAT_VERSION == "3.6.1"
     res = run_cli(["--version"])
     assert res.exit_code == 0
 
     parsed = _parse_kiro_cli_version_token(res.stdout)
-    assert parsed == (3, 6, 0), f"Unexpected version output: {res.stdout!r}"
+    assert parsed == (3, 6, 1), f"Unexpected version output: {res.stdout!r}"
 
     for floor_name, floor_tuple in installed_contract.version_floors.items():
         assert parsed >= floor_tuple, f"{parsed} < {floor_name} ({floor_tuple})"
@@ -380,7 +380,7 @@ async def test_installed_kirocrew_v2_and_v3_initialize_and_extension_methods(
     )
     assert "result" in v2_init, f"KiroHarness v2 initialize rejected: {v2_init}"
     assert v2_init["result"]["protocolVersion"] == 1
-    assert v2_init["result"]["agentInfo"]["version"] == "3.6.0"
+    assert v2_init["result"]["agentInfo"]["version"] == "3.6.1"
     assert v2_init["result"]["agentCapabilities"]["loadSession"] is True
     assert v2_init["result"]["agentCapabilities"]["promptCapabilities"]["image"] is True
 
@@ -408,7 +408,7 @@ async def test_installed_kirocrew_v2_and_v3_initialize_and_extension_methods(
     )
     assert "result" in v3_init, f"KasHarness v3 initialize rejected: {v3_init}"
     assert v3_init["result"]["protocolVersion"] == 1
-    assert v3_init["result"]["agentInfo"]["version"] == "3.6.0"
+    assert v3_init["result"]["agentInfo"]["version"] == "3.6.1"
     kiro_meta = v3_init["result"]["agentCapabilities"]["_meta"]["kiro"]
     assert kiro_meta["strictSessionLoad"] is True
     for cap_key in installed_contract.kas_capabilities:
