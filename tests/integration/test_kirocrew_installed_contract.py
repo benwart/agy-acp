@@ -711,6 +711,8 @@ def _import_installed_kirocrew_modules() -> dict[str, Any]:
         ),
         "tool_paths": importlib.import_module("kiro_crew.platform.tool_paths"),
         "security": importlib.import_module("kiro_crew.security"),
+        "transport_errors": importlib.import_module("kiro_crew.acp.transport_errors"),
+        "structured_error_data": importlib.import_module("kiro_crew.acp.structured_error_data"),
     }
 
 
@@ -1242,3 +1244,140 @@ async def test_installed_kirocrew_crew_only_keys_and_bare_401_reset_server_oauth
         await mgr.close()
         httpd.shutdown()
         httpd.server_close()
+
+
+async def test_installed_kirocrew_turn_error_classification_contract(
+    tmp_path: Path,
+) -> None:
+    """Verify `session/prompt` error frames classify cleanly in installed `kiro_crew`."""
+    from agy_acp.providers.agy_acp_client import AgyAcpClientProvider, PromptOutcome
+
+    kc = _import_installed_kirocrew_modules()
+    transport_errors = kc["transport_errors"]
+    structured_error_data = kc["structured_error_data"]
+
+    next_error = ""
+
+    class _ErrorStubCli(AgyAcpClientProvider):
+        def probe_models(self) -> list[Any]:
+            return []
+
+        def probe_quotas(self) -> list[Any]:
+            return []
+
+        async def stream_prompt(self, **kwargs: Any) -> PromptOutcome:
+            _ = kwargs
+            return PromptOutcome(
+                conversation_id="conv-turn-err-contract",
+                stop_reason="end_turn",
+                response="",
+                error=next_error,
+                usage={"input_tokens": 2, "output_tokens": 0, "total_tokens": 2},
+            )
+
+        async def cancel_prompt(self, conversation_id: str | None = None) -> None:
+            _ = conversation_id
+
+        async def close(self) -> None:
+            return None
+
+    store = SqliteStateStoreProvider(tmp_path / "turn_error_contract.db")
+    v3_adapter = V3KasWireAdapter()
+    cli = _ErrorStubCli(save_dir=tmp_path, state_store=store)
+    mgr = SessionManager(state_store=store, cli_provider=cli, wire_adapter=v3_adapter)
+    dispatcher = AcpDispatcher(
+        session_manager=mgr,
+        wire_adapter=v3_adapter,
+    )
+    try:
+        new_resp = await dispatcher.handle_message(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "session/new",
+                    "params": {"cwd": str(tmp_path), "mcpServers": []},
+                }
+            )
+        )
+        assert new_resp is not None and "result" in new_resp
+        sid = new_resp["result"]["sessionId"]
+
+        cases = [
+            (
+                "Your organization's prepaid balance is insufficient. "
+                "Contact your administrator to add funds.",
+                "MonthlyLimitError",
+                "usage_limit",
+                False,
+            ),
+            (
+                "Organization prepaid wallet is empty",
+                "MonthlyLimitError",
+                "usage_limit",
+                False,
+            ),
+            (
+                "You have exhausted your quota on this model.",
+                "MonthlyLimitError",
+                "usage_limit",
+                False,
+            ),
+            (
+                "MODEL_CAPACITY_EXHAUSTED",
+                "ServiceUnavailableException",
+                "http_5xx",
+                True,
+            ),
+            (
+                "UNAUTHENTICATED: request had invalid authentication credentials",
+                "SignInRequiredError",
+                "session_expired",
+                False,
+            ),
+            (
+                "Sign-in update needed",
+                "SignInRequiredError",
+                "session_expired",
+                False,
+            ),
+        ]
+        for req_id, (err_text, expected_type, expected_kind, expected_transient) in enumerate(
+            cases,
+            start=10,
+        ):
+            next_error = err_text
+            resp = await dispatcher.handle_message(
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "method": "session/prompt",
+                        "params": {
+                            "sessionId": sid,
+                            "prompt": [{"type": "text", "text": "check"}],
+                        },
+                    }
+                )
+            )
+            assert resp is not None and "error" in resp, f"Expected error frame for {err_text!r}"
+            err_frame = resp["error"]
+            assert err_frame["data"] == {"errorType": expected_type}
+
+            data_text = structured_error_data.provider_data_text(err_frame)
+            haystack = f"{data_text} {err_frame.get('message', '')}"
+            verdict = transport_errors.classify_provider_error(haystack, data=data_text)
+            transient = transport_errors._is_transient_raw_error(err_frame)
+
+            assert verdict.kind == expected_kind, (
+                f"{err_text!r}: expected kind={expected_kind!r}, got {verdict!r}"
+            )
+            assert verdict.retryable is expected_transient, (
+                f"{err_text!r}: expected retryable={expected_transient}, got {verdict!r}"
+            )
+            assert transient is expected_transient, (
+                f"{err_text!r}: expected _is_transient_raw_error={expected_transient}, "
+                f"got {transient}"
+            )
+    finally:
+        await mgr.close()
