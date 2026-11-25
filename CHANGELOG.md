@@ -1,3 +1,10 @@
+## [1.10.1](https://github.com/benwart/agy-acp/compare/v1.10.0...v1.10.1) (2026-11-25)
+
+### Bug Fixes
+
+* **acp:** isolate quota probes from conversations DB and retry transient session/new races ([19129f4](https://github.com/benwart/agy-acp/commit/19129f411eb29a76a501dee5624d2b84e308b5b9))
+* **acp:** isolate quota probes from conversations DB and retry transient session/new races ([#20](https://github.com/benwart/agy-acp/issues/20)) ([6516801](https://github.com/benwart/agy-acp/commit/651680150f228008ce4b7a9e019ef2aa17f50bfa))
+
 ## [1.10.0](https://github.com/benwart/agy-acp/compare/v1.9.1...v1.10.0) (2026-11-24)
 
 ### Features
