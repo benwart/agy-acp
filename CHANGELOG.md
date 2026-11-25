@@ -1,3 +1,15 @@
+## [1.11.0](https://github.com/benwart/agy-acp/compare/v1.10.1...v1.11.0) (2026-11-25)
+
+### Features
+
+* **acp:** sync kiro-cli 3.6.1 compatibility ([8d2889e](https://github.com/benwart/agy-acp/commit/8d2889e644ca091fd010a53eaafe7b4d404f46e7))
+* **acp:** sync kiro-cli 3.6.1 compatibility ([#22](https://github.com/benwart/agy-acp/issues/22)) ([3a12c9d](https://github.com/benwart/agy-acp/commit/3a12c9db9d874af2d5c85b28fb0dda204cf6cf73))
+
+### Bug Fixes
+
+* **acp:** classify agy 1.5.17 prepaid-wallet, quota, capacity, and auth turn errors ([d1a6310](https://github.com/benwart/agy-acp/commit/d1a631043586bdcc6b2cda5b3d609261d12bd3d7))
+* **acp:** classify agy 1.5.17 prepaid-wallet, quota, capacity, and auth turn errors ([#21](https://github.com/benwart/agy-acp/issues/21)) ([c7f4ea8](https://github.com/benwart/agy-acp/commit/c7f4ea8714fbac1b75e6e0cd0ada1fb137e55d9b))
+
 ## [1.10.1](https://github.com/benwart/agy-acp/compare/v1.10.0...v1.10.1) (2026-11-25)
 
 ### Bug Fixes
