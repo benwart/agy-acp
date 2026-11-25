@@ -464,30 +464,40 @@ def _jsonrpc_error(
 
 _RE_MONTHLY_LIMIT_ERROR = re.compile(
     r"monthly\s+usage\s+limit|monthly.*limit|usage\s+limit\s+has\s+been\s+reached"
-    r"|quota\s+(?:limit|exhausted|exceeded)|freetierlimitexceeded|monthlylimiterror",
+    r"|quota\s+(?:limit|exhausted|exceeded)|exhausted\s+(?:your\s+)?quota"
+    r"|prepaid\s+balance\s+is\s+insufficient|prepaid\s+wallet\s+is\s+empty"
+    r"|freetierlimitexceeded|monthlylimiterror",
     re.IGNORECASE,
 )
 _RE_THROTTLE_ERROR = re.compile(
     r"\b429\b|too\s+many\s+requests|rate[\s_-]?limit|throttl",
     re.IGNORECASE,
 )
+_RE_SIGN_IN_REQUIRED_ERROR = re.compile(
+    r"\bunauthenticated\b|authentication\s+required"
+    r"|sign-in\s+update\s+needed|not\s+logged\s+in|signinrequirederror",
+    re.IGNORECASE,
+)
 _RE_SERVICE_UNAVAILABLE_ERROR = re.compile(
     r"econnreset|econnrefused|etimedout|epipe"
     r"|connection\s+(?:reset|refused|closed|error|aborted)"
     r"|temporarily\s+unavailable|service\s+unavailable"
-    r"|\b50[0234]\b|bad\s+gateway|gateway\s+timeout|overloaded",
+    r"|\b50[0234]\b|bad\s+gateway|gateway\s+timeout|overloaded"
+    r"|\bmodel_capacity_exhausted\b",
     re.IGNORECASE,
 )
 
 
 def _classify_turn_error_type(turn_error: str) -> str:
-    """Classify a turn-level error message into KiroCrew 0.12.2 `data.errorType`."""
+    """Classify a turn-level error message into KiroCrew `data.errorType`."""
     if _RE_MONTHLY_LIMIT_ERROR.search(turn_error):
         return "MonthlyLimitError"
     if _RE_THROTTLE_ERROR.search(turn_error):
         return "ThrottlingException"
+    if _RE_SIGN_IN_REQUIRED_ERROR.search(turn_error):
+        return "SignInRequiredError"
     if _RE_SERVICE_UNAVAILABLE_ERROR.search(turn_error):
-        return "ServiceUnavailableError"
+        return "ServiceUnavailableException"
     return "ProviderError"
 
 

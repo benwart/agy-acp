@@ -2892,7 +2892,7 @@ async def test_session_prompt_returns_jsonrpc_error_on_unrecovered_cli_error(
         "error": {
             "code": -32603,
             "message": "read ECONNRESET",
-            "data": {"errorType": "ServiceUnavailableError"},
+            "data": {"errorType": "ServiceUnavailableException"},
         },
     }
     assert mgr.state_store.get_session_turns(sid) == []
@@ -3727,8 +3727,27 @@ async def test_session_prompt_structured_error_type_classification(tmp_path: Pat
 
     cases = [
         ("The monthly usage limit has been reached for this account", "MonthlyLimitError"),
+        (
+            "Your organization's prepaid balance is insufficient. "
+            "Contact your administrator to add funds.",
+            "MonthlyLimitError",
+        ),
+        ("Organization prepaid wallet is empty", "MonthlyLimitError"),
+        ("You have exhausted your quota on this model.", "MonthlyLimitError"),
         ("HTTP 429 Too Many Requests: rate limit exceeded", "ThrottlingException"),
-        ("503 Service Temporarily Unavailable", "ServiceUnavailableError"),
+        ("503 Service Temporarily Unavailable", "ServiceUnavailableException"),
+        ("MODEL_CAPACITY_EXHAUSTED", "ServiceUnavailableException"),
+        (
+            "UNAUTHENTICATED: request had invalid authentication credentials",
+            "SignInRequiredError",
+        ),
+        ("Sign-in update needed", "SignInRequiredError"),
+        ("Authentication required for this workspace", "SignInRequiredError"),
+        ("User is not logged in", "SignInRequiredError"),
+        ("SignInRequiredError: token expired", "SignInRequiredError"),
+        ("UNAUTHENTICATED: connection reset by peer", "SignInRequiredError"),
+        ("HTTP 429 Too Many Requests: unauthenticated retry", "ThrottlingException"),
+        ("You have exhausted your quota: MODEL_CAPACITY_EXHAUSTED", "MonthlyLimitError"),
         ("Unexpected model decoding failure", "ProviderError"),
     ]
     for idx, (err_text, expected_type) in enumerate(cases, start=10):
