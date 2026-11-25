@@ -1315,3 +1315,166 @@ async def test_nonblocking_turn_telemetry_conserves_background_credit_deltas(
     assert warm_tel.delta_credits == round(760.0 - expected_now, 4)
     assert warm_tel.metadata_params["planTierId"] == "g1-ultra-tier"
     assert tracker._last_session_effective_credits["sess-nb"] == expected_now
+
+
+async def test_run_agy_slash_json_isolates_home_and_cleans_up_temp_dir(
+    tmp_path: Any,
+    monkeypatch: Any,
+) -> None:
+    """Verify `run_agy_slash_json` isolates `HOME/.gemini/antigravity-cli` and cleans up."""
+    import stat
+    from pathlib import Path
+
+    import pytest
+
+    from agy_acp.providers.quota_provider import run_agy_slash_json
+
+    fake_home = tmp_path / "real-home"
+    (fake_home / "Library").mkdir(parents=True)
+    (fake_home / ".config").mkdir(parents=True)
+    (fake_home / ".gemini" / "config").mkdir(parents=True)
+    (fake_home / ".gemini" / "GEMINI.md").write_text("# user rules\n", encoding="utf-8")
+    (fake_home / ".gemini" / "antigravity-cli" / "conversations").mkdir(parents=True)
+    real_db = fake_home / ".gemini" / "antigravity-cli" / "conversations" / "keep.db"
+    real_db.write_text("do-not-touch", encoding="utf-8")
+    (fake_home / ".gemini" / "antigravity").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    record_file = tmp_path / "slash_homes.txt"
+    fake_bin = tmp_path / "fake-agy-home-check"
+    fake_bin.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "home = Path(os.environ['HOME'])\n"
+        f"with open({str(record_file)!r}, 'a', encoding='utf-8') as fh:\n"
+        "    fh.write(str(home) + '\\n')\n"
+        "if sys.argv[-1] == '/fail':\n"
+        "    sys.stderr.write('simulated error\\n')\n"
+        "    sys.exit(3)\n"
+        "gemini = home / '.gemini'\n"
+        "print(json.dumps({\n"
+        "    'home': str(home),\n"
+        "    'has_library': (home / 'Library').is_symlink(),\n"
+        "    'has_config_dir': (home / '.config').is_symlink(),\n"
+        "    'has_gemini_config': (gemini / 'config').is_symlink(),\n"
+        "    'has_gemini_md': (gemini / 'GEMINI.md').is_symlink(),\n"
+        "    'has_antigravity_cli': (gemini / 'antigravity-cli').exists()\n"
+        "        or (gemini / 'antigravity-cli').is_symlink(),\n"
+        "    'has_antigravity': (gemini / 'antigravity').exists()\n"
+        "        or (gemini / 'antigravity').is_symlink(),\n"
+        "}))\n",
+        encoding="utf-8",
+    )
+    fake_bin.chmod(fake_bin.stat().st_mode | stat.S_IEXEC)
+
+    res = await run_agy_slash_json("/usage", agy_bin=fake_bin, cwd=str(tmp_path))
+    assert res["home"] != str(fake_home)
+    assert res["has_library"] is True
+    assert res["has_config_dir"] is True
+    assert res["has_gemini_config"] is True
+    assert res["has_gemini_md"] is True
+    assert res["has_antigravity_cli"] is False
+    assert res["has_antigravity"] is False
+    assert not Path(res["home"]).exists()
+    assert real_db.read_text(encoding="utf-8") == "do-not-touch"
+
+    with pytest.raises(RuntimeError, match="exited with code 3: simulated error"):
+        await run_agy_slash_json("/fail", agy_bin=fake_bin)
+
+    recorded_homes = [
+        line.strip()
+        for line in record_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(recorded_homes) == 2
+    for isolated in recorded_homes:
+        assert not Path(isolated).exists()
+
+
+async def test_run_agy_acp_tier_json_isolates_gemini_dir_and_cleans_up(
+    tmp_path: Any,
+    monkeypatch: Any,
+) -> None:
+    """Verify `run_agy_acp_tier_json` passes isolated `--gemini-dir` and cleans up on exit."""
+    import stat
+    from pathlib import Path
+
+    from agy_acp.providers.quota_provider import run_agy_acp_tier_json
+
+    fake_home = tmp_path / "real-home"
+    (fake_home / ".gemini" / "config").mkdir(parents=True)
+    (fake_home / ".gemini" / "antigravity-cli" / "conversations").mkdir(parents=True)
+    (fake_home / ".gemini" / "antigravity").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    record_file = tmp_path / "tier_gemini_dirs.txt"
+    fake_acp = tmp_path / "fake-agy-tier-isolated"
+    fake_acp.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "argv = sys.argv[1:]\n"
+        "idx = argv.index('--gemini-dir')\n"
+        "gdir = Path(argv[idx + 1])\n"
+        "assert (gdir / 'config').is_symlink()\n"
+        "assert not (gdir / 'antigravity-cli').exists()\n"
+        "assert not (gdir / 'antigravity-cli').is_symlink()\n"
+        "assert not (gdir / 'antigravity').exists()\n"
+        "assert not (gdir / 'antigravity').is_symlink()\n"
+        f"with open({str(record_file)!r}, 'a', encoding='utf-8') as fh:\n"
+        "    fh.write(str(gdir) + '\\n')\n"
+        "for line in sys.stdin:\n"
+        "    if not line.strip(): continue\n"
+        "    msg = json.loads(line)\n"
+        "    mid = msg.get('id')\n"
+        "    method = msg.get('method')\n"
+        "    if method == 'initialize':\n"
+        "        res = {'jsonrpc': '2.0', 'id': mid, 'result': {\n"
+        "            'protocolVersion': 1,\n"
+        "            'agentCapabilities': {'_meta': {'antigravity': {'tier': True}}},\n"
+        "        }}\n"
+        "        sys.stdout.write(json.dumps(res) + '\\n')\n"
+        "        sys.stdout.flush()\n"
+        "    elif method == 'authenticate':\n"
+        "        res = {'jsonrpc': '2.0', 'id': mid, 'result': {\n"
+        "            '_meta': {'antigravity': {'tier': {\n"
+        "                'id': 'g1-ultra-tier', 'name': 'Google AI Ultra', 'upgradeUri': '',\n"
+        "            }}}\n"
+        "        }}\n"
+        "        sys.stdout.write(json.dumps(res) + '\\n')\n"
+        "        sys.stdout.flush()\n",
+        encoding="utf-8",
+    )
+    fake_acp.chmod(fake_acp.stat().st_mode | stat.S_IEXEC)
+
+    tier = await run_agy_acp_tier_json(agy_bin=fake_acp)
+    assert tier == {"id": "g1-ultra-tier", "name": "Google AI Ultra", "upgradeUri": ""}
+    recorded = [
+        line.strip()
+        for line in record_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(recorded) == 1
+    assert not Path(recorded[0]).exists()
+
+    # Error path (missing binary / non-zero exit) also cleans up its temp dir
+    failing_acp = tmp_path / "fake-agy-tier-fail"
+    failing_acp.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "idx = sys.argv.index('--gemini-dir')\n"
+        f"with open({str(record_file)!r}, 'a', encoding='utf-8') as fh:\n"
+        "    fh.write(sys.argv[idx + 1] + '\\n')\n"
+        "sys.exit(1)\n",
+        encoding="utf-8",
+    )
+    failing_acp.chmod(failing_acp.stat().st_mode | stat.S_IEXEC)
+    assert await run_agy_acp_tier_json(agy_bin=failing_acp) is None
+    recorded_after = [
+        line.strip()
+        for line in record_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(recorded_after) == 2
+    assert not Path(recorded_after[1]).exists()

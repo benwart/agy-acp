@@ -86,6 +86,21 @@ class AgyAcpRpcError(AgyAcpError):
         self.data = data
 
 
+_SESSION_NEW_RETRY_DELAYS: tuple[float, ...] = (0.15, 0.35, 0.7)
+_TRANSIENT_SESSION_NEW_MARKERS: tuple[str, ...] = (
+    "failed to start antigravity conversation",
+    "initialized by another opener",
+)
+
+
+def _is_transient_session_new_error(exc: AgyAcpRpcError) -> bool:
+    """Return True when `exc` is a transient `-32603` conversation DB opener race."""
+    if exc.code != -32603:
+        return False
+    haystack = f"{exc} {exc.data or ''}".lower()
+    return any(marker in haystack for marker in _TRANSIENT_SESSION_NEW_MARKERS)
+
+
 def _unlink_temp_files(paths: Iterable[Path]) -> None:
     for tmp in paths:
         with contextlib.suppress(OSError):
@@ -1719,6 +1734,40 @@ class AgyAcpClientProvider:
 
         return self._store.load_tier(max_age_seconds=None)
 
+    async def _session_new_with_retry(
+        self,
+        params: dict[str, Any],
+        *,
+        profile_key: str = "",
+        lazy_mcp_config: Mapping[str, Any] | None = None,
+    ) -> tuple[_AcpSubprocessConnection, dict[str, Any]]:
+        """Execute `session/new`, retrying transient `-32603` conversation DB opener races."""
+        max_attempts = len(_SESSION_NEW_RETRY_DELAYS) + 1
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return await self._rpc_with_reconnect(
+                    "session/new",
+                    params,
+                    timeout=self._rpc_timeout,
+                    profile_key=profile_key,
+                    lazy_mcp_config=lazy_mcp_config,
+                )
+            except AgyAcpRpcError as exc:
+                if not _is_transient_session_new_error(exc) or attempt >= max_attempts:
+                    raise
+                delay = _SESSION_NEW_RETRY_DELAYS[attempt - 1]
+                log_acp_event(
+                    "agy_acp.session_new_retry",
+                    save_dir_or_db=self._save_dir_or_db,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    delay_s=delay,
+                    code=exc.code,
+                    error=str(exc),
+                )
+                await anyio.sleep(delay)
+        raise AssertionError("unreachable")  # pragma: no cover
+
     async def discover_models(
         self,
         *,
@@ -1736,10 +1785,8 @@ class AgyAcpClientProvider:
         resolved_cwd = str(Path(cwd).resolve()) if cwd else str(Path.cwd())
         temp_sid = ""
         try:
-            conn, res = await self._rpc_with_reconnect(
-                "session/new",
+            conn, res = await self._session_new_with_retry(
                 {"cwd": resolved_cwd, "mcpServers": []},
-                timeout=self._rpc_timeout,
             )
             temp_sid = str(res.get("sessionId") or "").strip()
             self._cache_tier(self._extract_tier(res))
@@ -1886,28 +1933,35 @@ class AgyAcpClientProvider:
             if not init_conn.supports_session_resume:
                 effective_method = "session/load"
 
-        try:
-            conn, res = await self._rpc_with_reconnect(
-                effective_method,
+        if effective_method == "session/new":
+            conn, res = await self._session_new_with_retry(
                 params,
-                timeout=self._rpc_timeout,
                 profile_key=profile_key,
                 lazy_mcp_config=lazy_mcp_config,
             )
-        except AgyAcpRpcError as exc:
-            if effective_method != "session/resume" or exc.code != -32601:
-                raise
-            active_conn = self._conns.get(profile_key)
-            if active_conn is not None:
-                active_conn.supports_session_resume = False
-            effective_method = "session/load"
-            conn, res = await self._rpc_with_reconnect(
-                effective_method,
-                params,
-                timeout=self._rpc_timeout,
-                profile_key=profile_key,
-                lazy_mcp_config=lazy_mcp_config,
-            )
+        else:
+            try:
+                conn, res = await self._rpc_with_reconnect(
+                    effective_method,
+                    params,
+                    timeout=self._rpc_timeout,
+                    profile_key=profile_key,
+                    lazy_mcp_config=lazy_mcp_config,
+                )
+            except AgyAcpRpcError as exc:
+                if effective_method != "session/resume" or exc.code != -32601:
+                    raise
+                active_conn = self._conns.get(profile_key)
+                if active_conn is not None:
+                    active_conn.supports_session_resume = False
+                effective_method = "session/load"
+                conn, res = await self._rpc_with_reconnect(
+                    effective_method,
+                    params,
+                    timeout=self._rpc_timeout,
+                    profile_key=profile_key,
+                    lazy_mcp_config=lazy_mcp_config,
+                )
         sid = str(res.get("sessionId") or (agy_session_id or "")).strip()
         if not sid:
             err_code = -32002 if effective_method in {"session/load", "session/resume"} else -32603

@@ -3102,3 +3102,244 @@ async def test_policy_recovery_falls_back_to_notice_when_retry_also_denied(
         if json.loads(line)["type"] == "prompt"
     ]
     assert len(prompts) == 2
+
+
+def _write_fake_session_new_race_agy(
+    tmp_path: Path,
+    *,
+    fail_count: int,
+    error_code: int = -32603,
+    error_message: str = "Failed to start Antigravity conversation",
+    prompt_error: tuple[int, str] | None = None,
+) -> tuple[Path, Path]:
+    """Create a fake `agy acp` server that fails `session/new` `fail_count` times with JSON-RPC."""
+    script = tmp_path / f"fake_agy_race_{fail_count}_{abs(error_code)}.py"
+    log_file = tmp_path / f"race_{fail_count}_{abs(error_code)}.jsonl"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        f"LOG = {str(log_file)!r}\n"
+        f"FAIL_COUNT = {fail_count!r}\n"
+        f"ERR_CODE = {error_code!r}\n"
+        f"ERR_MSG = {error_message!r}\n"
+        f"PROMPT_ERR = {prompt_error!r}\n"
+        "session_new_calls = 0\n"
+        "def emit(obj):\n"
+        "    sys.stdout.write(json.dumps(obj) + '\\n')\n"
+        "    sys.stdout.flush()\n"
+        "for raw in sys.stdin:\n"
+        "    if not raw.strip():\n"
+        "        continue\n"
+        "    msg = json.loads(raw)\n"
+        "    mid = msg.get('id')\n"
+        "    method = msg.get('method')\n"
+        "    with open(LOG, 'a', encoding='utf-8') as fh:\n"
+        "        fh.write(json.dumps({'method': method}) + '\\n')\n"
+        "    if method == 'initialize':\n"
+        "        emit({'jsonrpc': '2.0', 'id': mid, 'result': {\n"
+        "            'protocolVersion': 1, 'agentCapabilities': {},\n"
+        "        }})\n"
+        "    elif method == 'session/new':\n"
+        "        session_new_calls += 1\n"
+        "        if session_new_calls <= FAIL_COUNT:\n"
+        "            emit({'jsonrpc': '2.0', 'id': mid, 'error': {\n"
+        "                'code': ERR_CODE, 'message': ERR_MSG,\n"
+        "            }})\n"
+        "        else:\n"
+        "            emit({'jsonrpc': '2.0', 'id': mid, 'result': {\n"
+        "                'sessionId': f'agy-race-{session_new_calls}',\n"
+        "                'models': {\n"
+        "                    'currentModelId': 'gemini-4-carbon-medium',\n"
+        "                    'availableModels': [{\n"
+        "                        'modelId': 'gemini-4-carbon-medium',\n"
+        "                        'name': 'Gemini 4 Carbon',\n"
+        "                    }],\n"
+        "                },\n"
+        "            }})\n"
+        "    elif method == 'session/prompt' and PROMPT_ERR is not None:\n"
+        "        emit({'jsonrpc': '2.0', 'id': mid, 'error': {\n"
+        "            'code': PROMPT_ERR[0], 'message': PROMPT_ERR[1],\n"
+        "        }})\n"
+        "    elif method in {'session/set_model', 'session/set_config_option', 'session/close'}:\n"
+        "        emit({'jsonrpc': '2.0', 'id': mid, 'result': {}})\n",
+        encoding="utf-8",
+    )
+    script.chmod(script.stat().st_mode | stat.S_IEXEC)
+    return script, log_file
+
+
+async def test_session_new_retries_transient_opener_race_and_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify `session/new` retries transient `-32603` opener races in create and discover."""
+    import agy_acp.providers.agy_acp_client as client_mod
+
+    sleep_delays: list[float] = []
+    retry_events: list[dict[str, Any]] = []
+
+    async def _fake_sleep(delay: float) -> None:
+        sleep_delays.append(delay)
+
+    orig_log = client_mod.log_acp_event
+
+    def _capture_log(event: str, **kwargs: Any) -> None:
+        if event == "agy_acp.session_new_retry":
+            retry_events.append(dict(kwargs))
+        orig_log(event, **kwargs)
+
+    monkeypatch.setattr(client_mod.anyio, "sleep", _fake_sleep)
+    monkeypatch.setattr(client_mod, "log_acp_event", _capture_log)
+
+    script, log_file = _write_fake_session_new_race_agy(
+        tmp_path,
+        fail_count=2,
+        error_code=-32603,
+        error_message="Failed to start Antigravity conversation",
+    )
+    store = SqliteStateStoreProvider(tmp_path / "state")
+    async with AgyAcpClientProvider(bin_path=script, state_store=store) as client:
+        created = await client.create_backend_session(cwd=str(tmp_path))
+
+    assert created["agySessionId"] == "agy-race-3"
+    assert sleep_delays == [0.15, 0.35]
+    assert len(retry_events) == 2
+    assert [e["attempt"] for e in retry_events] == [1, 2]
+    calls = [
+        json.loads(line)["method"] for line in log_file.read_text(encoding="utf-8").splitlines()
+    ]
+    assert calls.count("session/new") == 3
+
+    # Also verify `discover_models` retries on "initialized by another opener"
+    sleep_delays.clear()
+    retry_events.clear()
+    disc_dir = tmp_path / "discover"
+    disc_dir.mkdir()
+    disc_script, disc_log = _write_fake_session_new_race_agy(
+        disc_dir,
+        fail_count=1,
+        error_code=-32603,
+        error_message="its database was initialized by another opener",
+    )
+    disc_store = SqliteStateStoreProvider(disc_dir / "state")
+    async with AgyAcpClientProvider(bin_path=disc_script, state_store=disc_store) as client:
+        models = await client.discover_models(cwd=str(disc_dir), refresh=True)
+
+    assert [m["modelId"] for m in models] == ["gemini-4-carbon-medium"]
+    assert sleep_delays == [0.15]
+    assert len(retry_events) == 1
+    disc_calls = [
+        json.loads(line)["method"] for line in disc_log.read_text(encoding="utf-8").splitlines()
+    ]
+    assert disc_calls.count("session/new") == 2
+
+
+async def test_session_new_retry_exhaustion_and_non_retry_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify max retries exhaust cleanly and non-transient errors / session/prompt never retry."""
+    import agy_acp.providers.agy_acp_client as client_mod
+    from agy_acp.providers.agy_acp_client import AgyAcpRpcError
+
+    sleep_delays: list[float] = []
+
+    async def _fake_sleep(delay: float) -> None:
+        sleep_delays.append(delay)
+
+    monkeypatch.setattr(client_mod.anyio, "sleep", _fake_sleep)
+
+    # 1. Exhausts after 4 total attempts (3 retries)
+    exhaust_dir = tmp_path / "exhaust"
+    exhaust_dir.mkdir()
+    exhaust_script, exhaust_log = _write_fake_session_new_race_agy(
+        exhaust_dir,
+        fail_count=10,
+        error_code=-32603,
+        error_message="Failed to start Antigravity conversation",
+    )
+    async with AgyAcpClientProvider(
+        bin_path=exhaust_script,
+        state_store=SqliteStateStoreProvider(exhaust_dir / "state"),
+    ) as client:
+        with pytest.raises(AgyAcpRpcError, match="Failed to start Antigravity conversation"):
+            await client.create_backend_session(cwd=str(exhaust_dir))
+
+    assert sleep_delays == [0.15, 0.35, 0.7]
+    exhaust_calls = [
+        json.loads(line)["method"] for line in exhaust_log.read_text(encoding="utf-8").splitlines()
+    ]
+    assert exhaust_calls.count("session/new") == 4
+
+    # 2. Non-transient -32603 message is NOT retried
+    sleep_delays.clear()
+    other_msg_dir = tmp_path / "other_msg"
+    other_msg_dir.mkdir()
+    other_msg_script, other_msg_log = _write_fake_session_new_race_agy(
+        other_msg_dir,
+        fail_count=5,
+        error_code=-32603,
+        error_message="Internal error: unsupported workspace",
+    )
+    async with AgyAcpClientProvider(
+        bin_path=other_msg_script,
+        state_store=SqliteStateStoreProvider(other_msg_dir / "state"),
+    ) as client:
+        with pytest.raises(AgyAcpRpcError, match="unsupported workspace"):
+            await client.create_backend_session(cwd=str(other_msg_dir))
+
+    assert sleep_delays == []
+    assert [
+        json.loads(line)["method"]
+        for line in other_msg_log.read_text(encoding="utf-8").splitlines()
+    ].count("session/new") == 1
+
+    # 3. Non--32603 error code (e.g. -32602 invalid params) is NOT retried even with matching text
+    sleep_delays.clear()
+    other_code_dir = tmp_path / "other_code"
+    other_code_dir.mkdir()
+    other_code_script, other_code_log = _write_fake_session_new_race_agy(
+        other_code_dir,
+        fail_count=5,
+        error_code=-32602,
+        error_message="Failed to start Antigravity conversation",
+    )
+    async with AgyAcpClientProvider(
+        bin_path=other_code_script,
+        state_store=SqliteStateStoreProvider(other_code_dir / "state"),
+    ) as client:
+        with pytest.raises(AgyAcpRpcError, match="-32602"):
+            await client.create_backend_session(cwd=str(other_code_dir))
+
+    assert sleep_delays == []
+    assert [
+        json.loads(line)["method"]
+        for line in other_code_log.read_text(encoding="utf-8").splitlines()
+    ].count("session/new") == 1
+
+    # 4. session/prompt -32603 is NEVER retried
+    sleep_delays.clear()
+    prompt_dir = tmp_path / "prompt_err"
+    prompt_dir.mkdir()
+    prompt_script, prompt_log = _write_fake_session_new_race_agy(
+        prompt_dir,
+        fail_count=0,
+        prompt_error=(-32603, "Failed to start Antigravity conversation"),
+    )
+    async with AgyAcpClientProvider(
+        bin_path=prompt_script,
+        state_store=SqliteStateStoreProvider(prompt_dir / "state"),
+    ) as client:
+        outcome = await client.stream_prompt(
+            cwd=str(prompt_dir),
+            session_id="sess-no-prompt-retry",
+            prompt="hello",
+        )
+
+    assert outcome.error is not None
+    assert "Failed to start Antigravity conversation" in outcome.error
+    assert sleep_delays == []
+    prompt_calls = [
+        json.loads(line)["method"] for line in prompt_log.read_text(encoding="utf-8").splitlines()
+    ]
+    assert prompt_calls.count("session/prompt") == 1

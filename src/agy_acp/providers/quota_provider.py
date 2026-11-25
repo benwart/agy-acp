@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import contextlib
 import json
+import shutil
 import subprocess
+import tempfile
 import time
-from collections.abc import Mapping
+from collections.abc import Generator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +19,52 @@ from agy_acp.logic.tool_classifier import build_scrubbed_subprocess_env, resolve
 from agy_acp.providers.telemetry import get_telemetry
 
 DEFAULT_QUOTA_RPC_TIMEOUT_SECONDS: float = 6.0
+_EXCLUDED_GEMINI_CHILDREN: frozenset[str] = frozenset({"antigravity-cli", "antigravity"})
+_ISOLATED_HOME_PASSTHROUGH_ENTRIES: tuple[str, ...] = ("Library", ".config", ".local", ".cache")
+
+
+def _symlink_gemini_children(src_gemini: Path, dst_gemini: Path) -> None:
+    """Symlink non-store entries from `src_gemini` into `dst_gemini`."""
+    if not src_gemini.is_dir():
+        return
+    with contextlib.suppress(OSError):
+        for child in src_gemini.iterdir():
+            if child.name in _EXCLUDED_GEMINI_CHILDREN:
+                continue
+            target = dst_gemini / child.name
+            if not target.exists() and not target.is_symlink():
+                with contextlib.suppress(OSError):
+                    target.symlink_to(child)
+
+
+@contextlib.contextmanager
+def _isolated_quota_home() -> Generator[Path]:
+    """Create an ephemeral `HOME` isolating `antigravity-cli` while keeping OS auth intact."""
+    real_home = Path.home()
+    tmp_home = Path(tempfile.mkdtemp(prefix="agy-quota-home-"))
+    try:
+        for name in _ISOLATED_HOME_PASSTHROUGH_ENTRIES:
+            src = real_home / name
+            if src.exists():
+                with contextlib.suppress(OSError):
+                    (tmp_home / name).symlink_to(src)
+        tmp_gemini = tmp_home / ".gemini"
+        tmp_gemini.mkdir(mode=0o700, exist_ok=True)
+        _symlink_gemini_children(real_home / ".gemini", tmp_gemini)
+        yield tmp_home
+    finally:
+        shutil.rmtree(tmp_home, ignore_errors=True)
+
+
+@contextlib.contextmanager
+def _isolated_quota_gemini_dir() -> Generator[Path]:
+    """Create an ephemeral `--gemini-dir` isolating `antigravity-cli` for `agy acp` probes."""
+    tmp_gemini = Path(tempfile.mkdtemp(prefix="agy-quota-gemini-"))
+    try:
+        _symlink_gemini_children(Path.home() / ".gemini", tmp_gemini)
+        yield tmp_gemini
+    finally:
+        shutil.rmtree(tmp_gemini, ignore_errors=True)
 
 
 async def run_agy_slash_json(
@@ -37,8 +85,11 @@ async def run_agy_slash_json(
         args.extend(["--add-dir", cwd])
     args.extend(["--output-format", "json", "-p", normalized])
 
-    with anyio.fail_after(timeout):
-        result = await anyio.run_process(args, check=False, env=build_scrubbed_subprocess_env())
+    with _isolated_quota_home() as tmp_home:
+        env = build_scrubbed_subprocess_env()
+        env["HOME"] = str(tmp_home)
+        with anyio.fail_after(timeout):
+            result = await anyio.run_process(args, check=False, env=env)
 
     stdout = result.stdout.decode("utf-8", errors="replace").strip()
     stderr = result.stderr.decode("utf-8", errors="replace").strip()
@@ -90,70 +141,77 @@ async def run_agy_acp_tier_json(
     """Probe `agy acp --stdio` via `initialize` + `authenticate` for `_meta.antigravity.tier`."""
     bin_path = resolve_agy_binary(agy_bin)
     try:
-        with anyio.fail_after(timeout):
-            proc = await anyio.open_process(
-                [bin_path, "acp", "--stdio"],
-                env=build_scrubbed_subprocess_env(),
-                stderr=subprocess.DEVNULL,
-            )
-            async with proc:
-                try:
-                    if proc.stdin is None or proc.stdout is None:
-                        return None
-                    reader = BufferedByteReceiveStream(proc.stdout)
+        with _isolated_quota_gemini_dir() as tmp_gemini_dir:
+            with anyio.fail_after(timeout):
+                proc = await anyio.open_process(
+                    [bin_path, "acp", "--stdio", "--gemini-dir", str(tmp_gemini_dir)],
+                    env=build_scrubbed_subprocess_env(),
+                    stderr=subprocess.DEVNULL,
+                )
+                async with proc:
+                    try:
+                        if proc.stdin is None or proc.stdout is None:
+                            return None
+                        reader = BufferedByteReceiveStream(proc.stdout)
 
-                    async def _rpc(
-                        req_id: int,
-                        method: str,
-                        params: dict[str, Any],
-                    ) -> dict[str, Any]:
-                        assert proc.stdin is not None
-                        payload = {
-                            "jsonrpc": "2.0",
-                            "id": req_id,
-                            "method": method,
-                            "params": params,
+                        async def _rpc(
+                            req_id: int,
+                            method: str,
+                            params: dict[str, Any],
+                        ) -> dict[str, Any]:
+                            assert proc.stdin is not None
+                            payload = {
+                                "jsonrpc": "2.0",
+                                "id": req_id,
+                                "method": method,
+                                "params": params,
+                            }
+                            frame = (json.dumps(payload) + "\n").encode("utf-8")
+                            await proc.stdin.send(frame)
+                            while True:
+                                raw_line = await reader.receive_until(b"\n", 1024 * 1024)
+                                line = raw_line.decode("utf-8", errors="replace").strip()
+                                if not line:
+                                    continue
+                                with contextlib.suppress(json.JSONDecodeError):
+                                    msg = json.loads(line)
+                                    if isinstance(msg, dict) and msg.get("id") == req_id:
+                                        res = msg.get("result")
+                                        return dict(res) if isinstance(res, Mapping) else {}
+
+                        init_res = await _rpc(
+                            1, "initialize", {"protocolVersion": 1, "clientCapabilities": {}}
+                        )
+                        if not _supports_tier_capability(init_res):
+                            return None
+                        auth_res = await _rpc(2, "authenticate", {"methodId": "oauth-personal"})
+                        meta = auth_res.get("_meta")
+                        agy_meta = meta.get("antigravity") if isinstance(meta, Mapping) else None
+                        tier = agy_meta.get("tier") if isinstance(agy_meta, Mapping) else None
+                        if not isinstance(tier, Mapping):
+                            return None
+                        tier_id = str(tier.get("id") or "").strip()
+                        if not tier_id:
+                            return None
+                        return {
+                            "id": tier_id,
+                            "name": str(tier.get("name") or "").strip(),
+                            "upgradeUri": str(tier.get("upgradeUri") or "").strip(),
                         }
-                        frame = (json.dumps(payload) + "\n").encode("utf-8")
-                        await proc.stdin.send(frame)
-                        while True:
-                            raw_line = await reader.receive_until(b"\n", 1024 * 1024)
-                            line = raw_line.decode("utf-8", errors="replace").strip()
-                            if not line:
-                                continue
-                            with contextlib.suppress(json.JSONDecodeError):
-                                msg = json.loads(line)
-                                if isinstance(msg, dict) and msg.get("id") == req_id:
-                                    res = msg.get("result")
-                                    return dict(res) if isinstance(res, Mapping) else {}
-
-                    init_res = await _rpc(
-                        1, "initialize", {"protocolVersion": 1, "clientCapabilities": {}}
-                    )
-                    if not _supports_tier_capability(init_res):
-                        return None
-                    auth_res = await _rpc(2, "authenticate", {"methodId": "oauth-personal"})
-                    meta = auth_res.get("_meta")
-                    agy_meta = meta.get("antigravity") if isinstance(meta, Mapping) else None
-                    tier = agy_meta.get("tier") if isinstance(agy_meta, Mapping) else None
-                    if not isinstance(tier, Mapping):
-                        return None
-                    tier_id = str(tier.get("id") or "").strip()
-                    if not tier_id:
-                        return None
-                    return {
-                        "id": tier_id,
-                        "name": str(tier.get("name") or "").strip(),
-                        "upgradeUri": str(tier.get("upgradeUri") or "").strip(),
-                    }
-                finally:
-                    if proc.stdin is not None:
-                        with contextlib.suppress(Exception):
-                            await proc.stdin.aclose()
-                    if proc.returncode is None:
-                        with contextlib.suppress(ProcessLookupError):
-                            proc.terminate()
-    except OSError, TimeoutError, anyio.EndOfStream, anyio.BrokenResourceError:
+                    finally:
+                        if proc.stdin is not None:
+                            with contextlib.suppress(Exception):
+                                await proc.stdin.aclose()
+                        if proc.returncode is None:
+                            with contextlib.suppress(ProcessLookupError):
+                                proc.terminate()
+    except (
+        OSError,
+        TimeoutError,
+        anyio.EndOfStream,
+        anyio.IncompleteRead,
+        anyio.BrokenResourceError,
+    ):
         return None
 
 
