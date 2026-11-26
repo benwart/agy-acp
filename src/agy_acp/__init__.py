@@ -5,4 +5,4 @@ from __future__ import annotations
 __all__ = ["KIRO_CLI_COMPAT_VERSION", "__version__"]
 
 __version__ = "1.11.0"
-KIRO_CLI_COMPAT_VERSION: str = "3.6.1"
+KIRO_CLI_COMPAT_VERSION: str = "3.6.2"
