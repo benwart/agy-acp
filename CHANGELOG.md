@@ -1,3 +1,10 @@
+## [1.11.1](https://github.com/benwart/agy-acp/compare/v1.11.0...v1.11.1) (2026-11-26)
+
+### Bug Fixes
+
+* **acp:** handle setup RPC timeouts with reconnect and sync kiro-cli 3.6.2 ([be5698d](https://github.com/benwart/agy-acp/commit/be5698dd4eca2a4514e2570bd5b80b4af2124a5c))
+* **acp:** handle setup RPC timeouts with reconnect and sync kiro-cli 3.6.2 ([#23](https://github.com/benwart/agy-acp/issues/23)) ([82f7ed8](https://github.com/benwart/agy-acp/commit/82f7ed8755e4945a3c9c411b487a0a14311491dc))
+
 ## [1.11.0](https://github.com/benwart/agy-acp/compare/v1.10.1...v1.11.0) (2026-11-25)
 
 ### Features
