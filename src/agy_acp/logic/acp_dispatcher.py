@@ -52,6 +52,7 @@ from agy_acp.logic.wire import (
     WireTurnTelemetry,
 )
 from agy_acp.providers.acp_logger import log_acp_event
+from agy_acp.providers.agy_acp_client import AgyAcpError
 from agy_acp.providers.quota_provider import QuotaProvider
 from agy_acp.providers.telemetry import get_telemetry
 
@@ -483,7 +484,8 @@ _RE_SERVICE_UNAVAILABLE_ERROR = re.compile(
     r"|connection\s+(?:reset|refused|closed|error|aborted)"
     r"|temporarily\s+unavailable|service\s+unavailable"
     r"|\b50[0234]\b|bad\s+gateway|gateway\s+timeout|overloaded"
-    r"|\bmodel_capacity_exhausted\b",
+    r"|\bmodel_capacity_exhausted\b"
+    r"|\btimed?\s*out\b|\btimeouterror\b|\btimeout\b",
     re.IGNORECASE,
 )
 
@@ -1502,6 +1504,22 @@ class AcpDispatcher:
             )
         except KeyError as exc:
             return _jsonrpc_error(message_id, -32002, str(exc))
+        except (TimeoutError, AgyAcpError, OSError) as exc:
+            await _flush_stream_at_turn_end()
+            telemetry.record_turn(
+                stop_reason="error",
+                model=self._resolve_session_model(session_id),
+                engine=self._wire_adapter.engine_id,
+                duration_s=time.perf_counter() - turn_start,
+                ttft_s=ttft_s,
+            )
+            err_msg = str(exc).strip() or f"{type(exc).__name__} during session/prompt"
+            return _jsonrpc_error(
+                message_id,
+                -32603,
+                err_msg,
+                data={"errorType": _classify_turn_error_type(err_msg)},
+            )
         finally:
             telemetry.turn_finished()
             for dangling_span in tool_spans.values():

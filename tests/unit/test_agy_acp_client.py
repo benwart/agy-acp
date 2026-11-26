@@ -3343,3 +3343,145 @@ async def test_session_new_retry_exhaustion_and_non_retry_errors(
         json.loads(line)["method"] for line in prompt_log.read_text(encoding="utf-8").splitlines()
     ]
     assert prompt_calls.count("session/prompt") == 1
+
+
+def _write_fake_setup_timeout_agy(
+    tmp_path: Path,
+    *,
+    hang_method: str,
+    hang_count: int,
+) -> tuple[Path, Path]:
+    """Create a fake `agy acp` binary that hangs `hang_method` for the first `hang_count` calls."""
+    import sys
+
+    safe_name = hang_method.replace("/", "_")
+    script = tmp_path / f"fake_agy_timeout_{safe_name}_{hang_count}.py"
+    log_file = tmp_path / f"timeout_{safe_name}_{hang_count}.jsonl"
+    counter_file = tmp_path / f"timeout_{safe_name}_{hang_count}.count"
+    script.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys, time\n"
+        f"LOG = {str(log_file)!r}\n"
+        f"COUNTER = {str(counter_file)!r}\n"
+        f"HANG_METHOD = {hang_method!r}\n"
+        f"HANG_COUNT = {hang_count!r}\n"
+        "def emit(obj):\n"
+        "    sys.stdout.write(json.dumps(obj) + '\\n')\n"
+        "    sys.stdout.flush()\n"
+        "def bump_hang_counter():\n"
+        "    n = int(open(COUNTER).read().strip()) if os.path.exists(COUNTER) else 0\n"
+        "    n += 1\n"
+        "    with open(COUNTER, 'w', encoding='utf-8') as fh:\n"
+        "        fh.write(str(n))\n"
+        "    return n\n"
+        "for raw in sys.stdin:\n"
+        "    if not raw.strip():\n"
+        "        continue\n"
+        "    msg = json.loads(raw)\n"
+        "    mid = msg.get('id')\n"
+        "    method = msg.get('method')\n"
+        "    with open(LOG, 'a', encoding='utf-8') as fh:\n"
+        "        fh.write(json.dumps({'pid': os.getpid(), 'method': method}) + '\\n')\n"
+        "    if method == HANG_METHOD:\n"
+        "        if bump_hang_counter() <= HANG_COUNT:\n"
+        "            time.sleep(30)\n"
+        "            continue\n"
+        "    if method == 'initialize':\n"
+        "        emit({'jsonrpc': '2.0', 'id': mid, 'result': {\n"
+        "            'protocolVersion': 1,\n"
+        "            'agentCapabilities': {'sessionCapabilities': {'resume': {}}},\n"
+        "        }})\n"
+        "    elif method in {'session/new', 'session/resume', 'session/load'}:\n"
+        "        sid = (msg.get('params') or {}).get('sessionId') or 'agy-timeout-ok'\n"
+        "        emit({'jsonrpc': '2.0', 'id': mid, 'result': {\n"
+        "            'sessionId': sid,\n"
+        "            'models': {\n"
+        "                'currentModelId': 'gemini-4-carbon-medium',\n"
+        "                'availableModels': [{\n"
+        "                    'modelId': 'gemini-4-carbon-medium',\n"
+        "                    'name': 'Gemini 4 Carbon',\n"
+        "                }],\n"
+        "            },\n"
+        "        }})\n"
+        "    elif method in {'session/set_model', 'session/set_config_option', 'session/close'}:\n"
+        "        emit({'jsonrpc': '2.0', 'id': mid, 'result': {}})\n"
+        "    elif method == 'session/prompt':\n"
+        "        sid = (msg.get('params') or {}).get('sessionId') or 'agy-timeout-ok'\n"
+        "        emit({'jsonrpc': '2.0', 'method': 'session/update', 'params': {\n"
+        "            'sessionId': sid,\n"
+        "            'update': {\n"
+        "                'sessionUpdate': 'agent_message_chunk',\n"
+        "                'content': {'type': 'text', 'text': 'ok-after-timeout'},\n"
+        "            },\n"
+        "        }})\n"
+        "        emit({'jsonrpc': '2.0', 'id': mid, 'result': {'stopReason': 'end_turn'}})\n",
+        encoding="utf-8",
+    )
+    script.chmod(script.stat().st_mode | stat.S_IEXEC)
+    return script, log_file
+
+
+@pytest.mark.parametrize("hang_method", ["session/resume", "session/new", "session/set_model"])
+async def test_setup_rpc_timeout_closes_wedged_subprocess_and_recovers_on_retry(
+    tmp_path: Path,
+    hang_method: str,
+) -> None:
+    """Verify timed-out setup RPC closes the hung subprocess and recovers once on a fresh child."""
+    script, log_file = _write_fake_setup_timeout_agy(
+        tmp_path,
+        hang_method=hang_method,
+        hang_count=1,
+    )
+    async with AgyAcpClientProvider(
+        bin_path=script,
+        state_store=SqliteStateStoreProvider(tmp_path / "state"),
+        rpc_timeout=1.0,
+    ) as client:
+        outcome = await client.stream_prompt(
+            cwd=str(tmp_path),
+            session_id="sess-timeout-recover",
+            agy_session_id="agy-existing" if hang_method == "session/resume" else None,
+            model="gemini-4-carbon-medium",
+            prompt="hello",
+        )
+        active_pid = client.worker_pid
+
+    assert outcome.error == ""
+    assert outcome.response == "ok-after-timeout"
+    entries = [json.loads(line) for line in log_file.read_text(encoding="utf-8").splitlines()]
+    pids = list(dict.fromkeys(entry["pid"] for entry in entries))
+    assert len(pids) >= 2, f"Expected fresh subprocess after {hang_method} timeout, got {entries}"
+    assert active_pid == pids[-1]
+    assert active_pid != pids[0]
+
+
+@pytest.mark.parametrize("hang_method", ["session/resume", "session/new", "session/set_model"])
+async def test_setup_rpc_timeout_exhaustion_returns_structured_error_and_evicts_conn(
+    tmp_path: Path,
+    hang_method: str,
+) -> None:
+    """Verify repeated setup RPC timeouts evict wedged child and return PromptOutcome.error."""
+    script, log_file = _write_fake_setup_timeout_agy(
+        tmp_path,
+        hang_method=hang_method,
+        hang_count=10,
+    )
+    async with AgyAcpClientProvider(
+        bin_path=script,
+        state_store=SqliteStateStoreProvider(tmp_path / "state"),
+        rpc_timeout=1.0,
+    ) as client:
+        outcome = await client.stream_prompt(
+            cwd=str(tmp_path),
+            session_id="sess-timeout-exhaust",
+            agy_session_id="agy-existing" if hang_method == "session/resume" else None,
+            model="gemini-4-carbon-medium",
+            prompt="hello",
+        )
+        assert client.worker_pid is None
+
+    assert outcome.error
+    assert f"Timed out waiting for agy acp '{hang_method}' response" in outcome.error
+    entries = [json.loads(line) for line in log_file.read_text(encoding="utf-8").splitlines()]
+    pids = list(dict.fromkeys(entry["pid"] for entry in entries))
+    assert len(pids) >= 2, f"Expected retry on fresh subprocess for {hang_method}, got {entries}"

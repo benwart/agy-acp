@@ -1160,6 +1160,8 @@ class _AcpSubprocessConnection:
                 await slot.event.wait()
         except TimeoutError as exc:
             rpc_status = "timeout"
+            with contextlib.suppress(BaseException):
+                await self.close()
             raise TimeoutError(f"Timed out waiting for agy acp '{method}' response") from exc
         except BaseException:
             rpc_status = "error"
@@ -1668,6 +1670,12 @@ class AgyAcpClientProvider:
             self._conns[profile_key] = conn
             return conn
 
+    async def _close_profile_connection(self, profile_key: str) -> None:
+        conn = self._conns.pop(profile_key, None)
+        if conn is not None:
+            with contextlib.suppress(BaseException):
+                await conn.close()
+
     async def _rpc_with_reconnect(
         self,
         method: str,
@@ -1678,17 +1686,25 @@ class AgyAcpClientProvider:
         profile_key: str = "",
         lazy_mcp_config: Mapping[str, Any] | None = None,
     ) -> tuple[_AcpSubprocessConnection, dict[str, Any]]:
-        """Execute a JSON-RPC call on `agy acp`, reconnecting once if transport broke."""
+        """Execute a JSON-RPC call on `agy acp`, reconnecting once on disconnect or timeout."""
         conn = await self._ensure_connection(
             profile_key=profile_key,
             lazy_mcp_config=lazy_mcp_config,
         )
         try:
             return conn, await conn.request(method, params, timeout=timeout)
-        except AgyAcpTransportError:
+        except (AgyAcpTransportError, TimeoutError) as exc:
+            is_timeout = isinstance(exc, TimeoutError)
+            if is_timeout:
+                if self._conns.get(profile_key) is conn:
+                    self._conns.pop(profile_key, None)
+                with contextlib.suppress(BaseException):
+                    await conn.close()
             if not retry_on_disconnect:
                 raise
-            get_telemetry(self._store.db_path).record_backend_reconnect(reason="transport_error")
+            get_telemetry(self._store.db_path).record_backend_reconnect(
+                reason="rpc_timeout" if is_timeout else "transport_error"
+            )
             conn = await self._ensure_connection(
                 profile_key=profile_key,
                 lazy_mcp_config=lazy_mcp_config,
@@ -1835,59 +1851,72 @@ class AgyAcpClientProvider:
             for entry in available_models
             if isinstance(entry, Mapping) and entry.get("modelId")
         }
-        if is_auto and DEFAULT_MODEL_ID in known_ids:
-            candidate = (
-                resolve_model_for_effort(DEFAULT_MODEL_ID, effort, available_models)
-                or DEFAULT_MODEL_ID
-            )
-            with contextlib.suppress(AgyAcpRpcError):
-                await conn.request(
-                    "session/set_model",
-                    {"sessionId": agy_sid, "modelId": candidate},
-                    timeout=self._rpc_timeout,
+        try:
+            if is_auto and DEFAULT_MODEL_ID in known_ids:
+                candidate = (
+                    resolve_model_for_effort(DEFAULT_MODEL_ID, effort, available_models)
+                    or DEFAULT_MODEL_ID
                 )
-                resolved_model = candidate
-        elif not is_auto:
-            candidate = resolve_model_for_effort(clean_model, effort, available_models) or (
-                clean_model
-            )
-            try:
-                await conn.request(
-                    "session/set_model",
-                    {"sessionId": agy_sid, "modelId": candidate},
-                    timeout=self._rpc_timeout,
+                with contextlib.suppress(AgyAcpRpcError):
+                    await conn.request(
+                        "session/set_model",
+                        {"sessionId": agy_sid, "modelId": candidate},
+                        timeout=self._rpc_timeout,
+                    )
+                    resolved_model = candidate
+            elif not is_auto:
+                candidate = resolve_model_for_effort(clean_model, effort, available_models) or (
+                    clean_model
                 )
-                resolved_model = candidate
-            except AgyAcpRpcError:
-                fallback_from_model = clean_model
+                try:
+                    await conn.request(
+                        "session/set_model",
+                        {"sessionId": agy_sid, "modelId": candidate},
+                        timeout=self._rpc_timeout,
+                    )
+                    resolved_model = candidate
+                except AgyAcpRpcError:
+                    fallback_from_model = clean_model
 
-        effective_config_options: Any = session_result.get("configOptions")
-        target_agy_mode = "plan" if mode in {"read-only", "plan"} else "default"
-        with contextlib.suppress(AgyAcpRpcError):
-            mode_res = await conn.request(
-                "session/set_config_option",
-                {"sessionId": agy_sid, "configId": "mode", "value": target_agy_mode},
-                timeout=self._rpc_timeout,
-            )
-            refreshed_opts = mode_res.get("configOptions")
-            if isinstance(refreshed_opts, list) and refreshed_opts:
-                effective_config_options = refreshed_opts
-                if agy_sid in conn.session_results:
-                    conn.session_results[agy_sid]["configOptions"] = list(refreshed_opts)
-
-        parsed_model_effort = _split_model_effort_suffix(resolved_model)
-        target_thought = _resolve_supported_thought_level(
-            effort,
-            effective_config_options,
-            model_effort_hint=parsed_model_effort[1] if parsed_model_effort is not None else None,
-        )
-        if target_thought is not None:
+            effective_config_options: Any = session_result.get("configOptions")
+            target_agy_mode = "plan" if mode in {"read-only", "plan"} else "default"
             with contextlib.suppress(AgyAcpRpcError):
-                await conn.request(
+                mode_res = await conn.request(
                     "session/set_config_option",
-                    {"sessionId": agy_sid, "configId": "thought_level", "value": target_thought},
+                    {"sessionId": agy_sid, "configId": "mode", "value": target_agy_mode},
                     timeout=self._rpc_timeout,
                 )
+                refreshed_opts = mode_res.get("configOptions")
+                if isinstance(refreshed_opts, list) and refreshed_opts:
+                    effective_config_options = refreshed_opts
+                    if agy_sid in conn.session_results:
+                        conn.session_results[agy_sid]["configOptions"] = list(refreshed_opts)
+
+            parsed_model_effort = _split_model_effort_suffix(resolved_model)
+            target_thought = _resolve_supported_thought_level(
+                effort,
+                effective_config_options,
+                model_effort_hint=(
+                    parsed_model_effort[1] if parsed_model_effort is not None else None
+                ),
+            )
+            if target_thought is not None:
+                with contextlib.suppress(AgyAcpRpcError):
+                    await conn.request(
+                        "session/set_config_option",
+                        {
+                            "sessionId": agy_sid,
+                            "configId": "thought_level",
+                            "value": target_thought,
+                        },
+                        timeout=self._rpc_timeout,
+                    )
+        except TimeoutError as exc:
+            if self._conns.get(conn.profile_key) is conn:
+                self._conns.pop(conn.profile_key, None)
+            with contextlib.suppress(BaseException):
+                await conn.close()
+            raise AgyAcpTransportError(str(exc)) from exc
         return resolved_model, fallback_from_model
 
     @staticmethod
@@ -2786,6 +2815,7 @@ class AgyAcpClientProvider:
         policy_recovered_once = False
 
         self._active_turns.add(sid)
+        profile_key, _ = self._compute_mcp_profile(effective_mcp, env)
         try:
             while True:
                 try:
@@ -2802,8 +2832,19 @@ class AgyAcpClientProvider:
                     )
                     resolved_model = new_model or resolved_model
                     fallback_from_model = new_fb or fallback_from_model
-                except AgyAcpError as exc:
-                    outcome_error = str(exc)
+                except (AgyAcpError, TimeoutError, OSError) as exc:
+                    if (
+                        isinstance(exc, (AgyAcpTransportError, TimeoutError, OSError))
+                        and not recovered_once
+                        and not collected_texts
+                    ):
+                        await self._close_profile_connection(profile_key)
+                        recovered_once = True
+                        get_telemetry(self._store.db_path).record_backend_reconnect(
+                            reason="turn_recovery"
+                        )
+                        continue
+                    outcome_error = str(exc) or f"{type(exc).__name__} during backend session setup"
                     break
 
                 await conn.wait_idle(resolved_agy_sid)

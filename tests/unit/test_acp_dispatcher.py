@@ -4972,3 +4972,100 @@ async def test_kiro_3_4_0_strict_session_load_and_additional_directories_lifecyc
 
     await dispatcher.aclose()
     await mgr.close()
+
+
+async def test_handle_session_prompt_catches_direct_timeout_and_transport_exceptions(
+    tmp_path: Path,
+) -> None:
+    """Verify direct TimeoutError / AgyAcpError / OSError from prompt return structured -32603."""
+    from agy_acp.logic.acp_dispatcher import _classify_turn_error_type
+    from agy_acp.logic.wire import create_wire_adapter
+    from agy_acp.providers.agy_acp_client import AgyAcpClientProvider, AgyAcpTransportError
+    from agy_acp.providers.state_store import SqliteStateStoreProvider
+
+    next_exc: BaseException | None = None
+
+    class _RaisingCliProvider(AgyAcpClientProvider):
+        async def stream_prompt(self, **kwargs: Any) -> Any:
+            _ = kwargs
+            assert next_exc is not None
+            raise next_exc
+
+    store = SqliteStateStoreProvider(tmp_path / "state.db")
+    adapter = create_wire_adapter("v3")
+    mgr = SessionManager(
+        state_store=store,
+        cli_provider=_RaisingCliProvider(state_store=store),
+        wire_adapter=adapter,
+    )
+    dispatcher = AcpDispatcher(session_manager=mgr, wire_adapter=adapter)
+    try:
+        new_resp = await dispatcher.handle_message(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "session/new",
+                    "params": {"cwd": str(tmp_path), "mcpServers": []},
+                }
+            )
+        )
+        assert new_resp is not None and "result" in new_resp
+        sid = new_resp["result"]["sessionId"]
+
+        cases: list[tuple[BaseException, str, str]] = [
+            (
+                TimeoutError("Timed out waiting for agy acp 'session/resume' response"),
+                "Timed out waiting for agy acp 'session/resume' response",
+                "ServiceUnavailableException",
+            ),
+            (
+                TimeoutError(),
+                "TimeoutError during session/prompt",
+                "ServiceUnavailableException",
+            ),
+            (
+                AgyAcpTransportError("connection reset by peer"),
+                "connection reset by peer",
+                "ServiceUnavailableException",
+            ),
+            (
+                OSError("EPIPE while writing to backend"),
+                "EPIPE while writing to backend",
+                "ServiceUnavailableException",
+            ),
+            (
+                OSError("unexpected local io failure"),
+                "unexpected local io failure",
+                "ProviderError",
+            ),
+        ]
+        for req_id, (exc_obj, expected_msg, expected_type) in enumerate(cases, start=10):
+            next_exc = exc_obj
+            resp = await dispatcher.handle_message(
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "method": "session/prompt",
+                        "params": {
+                            "sessionId": sid,
+                            "prompt": [{"type": "text", "text": "hello"}],
+                        },
+                    }
+                )
+            )
+            assert resp is not None and "error" in resp
+            assert resp["error"]["code"] == -32603
+            assert resp["error"]["message"] == expected_msg
+            assert resp["error"]["data"] == {"errorType": expected_type}
+
+        # Precedence: quota / throttle / sign-in checks stay above timeout fallback
+        assert _classify_turn_error_type("Monthly usage limit timeout") == "MonthlyLimitError"
+        assert _classify_turn_error_type("429 rate limit timeout") == "ThrottlingException"
+        assert (
+            _classify_turn_error_type("UNAUTHENTICATED request timed out") == "SignInRequiredError"
+        )
+    finally:
+        await dispatcher.aclose()
+        await mgr.close()
