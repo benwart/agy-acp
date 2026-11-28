@@ -1474,6 +1474,67 @@ async def test_kas_v3_initialize_session_new_set_mode_load_replay_and_reset_serv
     assert mgr.state_store.get_session(sid) is None
     assert mgr.state_store.get_session_turns(sid) == []
 
+    # Standard ACP `session/delete` (kiro-cli 3.7.0 / KAS 0.66.144) also wipes persisted state
+    created_2 = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "session/new",
+                "params": {"cwd": str(tmp_path), "mcpServers": []},
+            }
+        )
+    )
+    assert created_2 is not None and "result" in created_2
+    sid_2 = created_2["result"]["sessionId"]
+    std_del = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 12,
+                "method": "session/delete",
+                "params": {"sessionId": sid_2},
+            }
+        )
+    )
+    assert std_del is not None and std_del["result"] == {}
+    assert mgr.state_store.get_session(sid_2) is None
+    assert mgr.state_store.get_session_turns(sid_2) == []
+
+    missing_del = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 13,
+                "method": "session/delete",
+                "params": {"sessionId": "nonexistent-session"},
+            }
+        )
+    )
+    assert missing_del is not None and missing_del["error"]["code"] == -32002
+
+    init_v3 = await dispatcher.handle_message(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 14,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": 1,
+                    "clientCapabilities": {
+                        "_meta": {"kiro": {"checksAutoApprovals": True, "approveForMeOption": True}}
+                    },
+                },
+            }
+        )
+    )
+    assert init_v3 is not None and "result" in init_v3
+    caps = init_v3["result"]["agentCapabilities"]
+    assert caps["sessionCapabilities"]["delete"] == {}
+    assert caps["sessionCapabilities"]["fork"] == {"_meta": {"kiro": {"messageId": True}}}
+    assert caps["_meta"]["kiro"]["replayMarking"] is True
+    assert caps["_meta"]["kiro"]["modelFallbackReporting"] is True
+
 
 async def test_kas_v3_tool_permissions_allow_deny_ask_subagents_steer_and_compact(
     tmp_path: Path,

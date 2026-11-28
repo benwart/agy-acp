@@ -51,6 +51,8 @@ class V3KasWireAdapter(EngineWireAdapter):
             "mcpServerOAuth": True,
             "mcpRegistryPointers": True,
             "strictSessionLoad": True,
+            "replayMarking": True,
+            "modelFallbackReporting": True,
         }
         capabilities["_meta"] = {"kiro": kiro_meta}
 

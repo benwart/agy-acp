@@ -63,6 +63,8 @@ def test_initialize_result_protocol_version_and_kas_capabilities() -> None:
         "mcpServerOAuth": True,
         "mcpRegistryPointers": True,
         "strictSessionLoad": True,
+        "replayMarking": True,
+        "modelFallbackReporting": True,
     }
 
 
