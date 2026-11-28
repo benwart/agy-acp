@@ -1,3 +1,10 @@
+## [1.12.0](https://github.com/benwart/agy-acp/compare/v1.11.1...v1.12.0) (2026-11-28)
+
+### Features
+
+* **compat:** sync kiro-cli 3.7.0 and KAS 0.66.144 wire capabilities ([e1f18b3](https://github.com/benwart/agy-acp/commit/e1f18b38fc82a11f7cb6df0d145ee3ebca9a9b45))
+* **compat:** sync kiro-cli 3.7.0 and KAS 0.66.144 wire capabilities ([#24](https://github.com/benwart/agy-acp/issues/24)) ([6dcc66c](https://github.com/benwart/agy-acp/commit/6dcc66c1f0f37af821219eed46d8947a7a23b8f7))
+
 ## [1.11.1](https://github.com/benwart/agy-acp/compare/v1.11.0...v1.11.1) (2026-11-26)
 
 ### Bug Fixes
