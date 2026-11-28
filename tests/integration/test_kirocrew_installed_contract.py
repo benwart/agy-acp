@@ -264,13 +264,13 @@ def test_installed_kirocrew_version_floors_and_cli_version_probe(
     installed_contract: InstalledKiroCrewContract,
     run_cli: Callable[[list[str]], CliResult],
 ) -> None:
-    """Verify `agy-acp --version` reports kiro-cli 3.6.2 and satisfies all KiroCrew floors."""
-    assert KIRO_CLI_COMPAT_VERSION == "3.6.2"
+    """Verify `agy-acp --version` reports kiro-cli 3.7.0 and satisfies all KiroCrew floors."""
+    assert KIRO_CLI_COMPAT_VERSION == "3.7.0"
     res = run_cli(["--version"])
     assert res.exit_code == 0
 
     parsed = _parse_kiro_cli_version_token(res.stdout)
-    assert parsed == (3, 6, 2), f"Unexpected version output: {res.stdout!r}"
+    assert parsed == (3, 7, 0), f"Unexpected version output: {res.stdout!r}"
 
     for floor_name, floor_tuple in installed_contract.version_floors.items():
         assert parsed >= floor_tuple, f"{parsed} < {floor_name} ({floor_tuple})"
@@ -380,7 +380,7 @@ async def test_installed_kirocrew_v2_and_v3_initialize_and_extension_methods(
     )
     assert "result" in v2_init, f"KiroHarness v2 initialize rejected: {v2_init}"
     assert v2_init["result"]["protocolVersion"] == 1
-    assert v2_init["result"]["agentInfo"]["version"] == "3.6.2"
+    assert v2_init["result"]["agentInfo"]["version"] == "3.7.0"
     assert v2_init["result"]["agentCapabilities"]["loadSession"] is True
     assert v2_init["result"]["agentCapabilities"]["promptCapabilities"]["image"] is True
 
@@ -408,9 +408,14 @@ async def test_installed_kirocrew_v2_and_v3_initialize_and_extension_methods(
     )
     assert "result" in v3_init, f"KasHarness v3 initialize rejected: {v3_init}"
     assert v3_init["result"]["protocolVersion"] == 1
-    assert v3_init["result"]["agentInfo"]["version"] == "3.6.2"
+    assert v3_init["result"]["agentInfo"]["version"] == "3.7.0"
+    v3_session_caps = v3_init["result"]["agentCapabilities"]["sessionCapabilities"]
+    assert isinstance(v3_session_caps.get("delete"), dict)
+    assert v3_session_caps["fork"]["_meta"]["kiro"]["messageId"] is True
     kiro_meta = v3_init["result"]["agentCapabilities"]["_meta"]["kiro"]
     assert kiro_meta["strictSessionLoad"] is True
+    assert kiro_meta["replayMarking"] is True
+    assert kiro_meta["modelFallbackReporting"] is True
     for cap_key in installed_contract.kas_capabilities:
         assert kiro_meta.get(cap_key) is True, f"Missing KAS capability {cap_key!r}"
     assert set(installed_contract.kas_extension_methods).issubset(
@@ -550,6 +555,15 @@ async def test_installed_kirocrew_wire_methods_tool_mappings_and_kas_discriminan
     ]["sessionId"]
     dispatcher.pop_post_response_notifications()
     assert "result" in await _rpc(methods["METHOD_KAS_SESSION_DELETE"], {"sessionId": sid_del})
+
+    # Verify standard ACP `session/delete` (kiro-cli 3.7.0 / KAS 0.66.144) wipes persisted record
+    sid_std_del = (
+        await _rpc(methods["METHOD_SESSION_NEW"], {"cwd": str(tmp_path), "mcpServers": []})
+    )["result"]["sessionId"]
+    dispatcher.pop_post_response_notifications()
+    std_del_resp = await _rpc(methods["METHOD_SESSION_DELETE"], {"sessionId": sid_std_del})
+    assert std_del_resp["result"] == {}
+    assert store.get_session(sid_std_del) is None
     await mgr.close()
 
     # Verify V2-only `_kiro.dev/*` verbs (`commands/execute`, `session/terminate`)
@@ -1385,5 +1399,77 @@ async def test_installed_kirocrew_turn_error_classification_contract(
                 f"{err_text!r}: expected _is_transient_raw_error={expected_transient}, "
                 f"got {transient}"
             )
+    finally:
+        await mgr.close()
+
+
+async def test_installed_kirocrew_3_7_0_approve_for_me_invariants(
+    installed_contract: InstalledKiroCrewContract,
+    tmp_path: Path,
+) -> None:
+    """Verify `kiro-cli 3.7.0` `checksAutoApprovals` handshake and no `trustClassifierApproved`."""
+    import importlib
+
+    pkg_dir = _resolve_kirocrew_pkg_dir()
+    site_packages = str(pkg_dir.parent)
+    if site_packages not in sys.path:
+        sys.path.append(site_packages)
+    kas_afm = importlib.import_module("kiro_crew.acp.kas_approve_for_me")
+
+    store = SqliteStateStoreProvider(tmp_path / "afm_contract.db")
+    v3_adapter = V3KasWireAdapter()
+    mgr = SessionManager(state_store=store, wire_adapter=v3_adapter)
+    dispatcher = AcpDispatcher(session_manager=mgr, wire_adapter=v3_adapter)
+    try:
+        init_resp = await dispatcher.handle_message(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": installed_contract.kas_v3_protocol_version,
+                        "clientCapabilities": {
+                            "_meta": {
+                                "kiro": {
+                                    "checksAutoApprovals": True,
+                                    "approveForMeOption": True,
+                                }
+                            }
+                        },
+                    },
+                }
+            )
+        )
+        assert init_resp is not None and "result" in init_resp
+
+        new_resp = await dispatcher.handle_message(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "session/new",
+                    "params": {"cwd": str(tmp_path), "mcpServers": []},
+                }
+            )
+        )
+        assert new_resp is not None and "result" in new_resp
+        assert kas_afm.option_value(new_resp["result"]["configOptions"]) is None
+
+        _, _, tc_event = _build_tool_event_from_record(
+            "tc-afm-1",
+            {
+                "toolCallId": "tc-afm-1",
+                "name": "run_command",
+                "kind": "execute",
+                "raw_args": {"CommandLine": "echo ok"},
+            },
+            known_mcp_servers=(),
+        )
+        tc_frame = v3_adapter.build_tool_call_update(
+            new_resp["result"]["sessionId"],
+            _to_normalized_tool_event(tc_event),
+        )
+        assert kas_afm.classifier_approved(tc_frame["params"]["update"]) is False
     finally:
         await mgr.close()

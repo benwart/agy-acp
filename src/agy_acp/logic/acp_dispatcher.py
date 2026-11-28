@@ -2581,7 +2581,8 @@ class AcpDispatcher:
             "sessionCapabilities": {
                 "additionalDirectories": {},
                 "close": {},
-                "fork": {},
+                "delete": {},
+                "fork": {"_meta": {"kiro": {"messageId": True}}},
                 "list": {},
                 "resume": {},
             },
@@ -2689,11 +2690,16 @@ class AcpDispatcher:
                 params,
                 is_request=is_request,
             )
-        if method in {"session/close", "_kiro.dev/session/terminate", "_kiro/session/delete"}:
+        if method in {
+            "session/close",
+            "session/delete",
+            "_kiro.dev/session/terminate",
+            "_kiro/session/delete",
+        }:
             session_id, err = self._require_existing_session(msg_id, params)
             if err is not None or session_id is None:
                 return err or _jsonrpc_error(msg_id, -32602, "Invalid params")
-            is_delete = method == "_kiro/session/delete"
+            is_delete = method in {"session/delete", "_kiro/session/delete"}
             res = (
                 await self._session_manager.evict_session(session_id=session_id)
                 if method == "session/close"
